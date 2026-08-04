@@ -790,11 +790,20 @@ Resources:
                   - lakeformation:RevokePermissions
                   - lakeformation:GetDataAccess
                 Resource: "*"
+              # GetCatalog on a nested federated catalog id
+              # ("<account>:s3tablescatalog/aws-s3") is authorized by Glue
+              # against the bare account-root catalog ARN, not only against the
+              # child catalog ARNs — the observed AccessDeniedException names
+              # "arn:aws:glue:<region>:<account>:catalog" as the resource. The
+              # root ARN is a single fixed resource per account, not a
+              # wildcard. ExecutionRole's GlueFederatedS3TablesCatalog
+              # statement already includes it for the same reason.
               - Sid: LFGranterGlueCatalog
                 Effect: Allow
                 Action:
                   - glue:GetCatalog
                 Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
                   - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog"
                   - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/aws-s3"
               - Sid: LFGranterS3Tables

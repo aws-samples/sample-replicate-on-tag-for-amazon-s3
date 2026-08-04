@@ -246,12 +246,13 @@
     },
     {
       "Sid": "LFGranterGlueCatalog",
-      "_comment": "Applies to LFGranterRole. glue:GetCatalog scoped to the federated s3tablescatalog catalog ARN (change-access-lf-to-iam.html's documented federated shape).",
+      "_comment": "Applies to LFGranterRole. glue:GetCatalog scoped to the federated s3tablescatalog catalog ARN (change-access-lf-to-iam.html's documented federated shape) plus the bare account-root catalog ARN. GetCatalog on a nested federated catalog id is authorized by Glue against the root catalog ARN, not only the child ARNs — the observed AccessDeniedException names arn:aws:glue:REGION:ACCOUNT_ID:catalog as the resource. The root ARN is a single fixed resource per account, not a wildcard; the ExecutionRole's GlueFederatedS3TablesCatalog statement includes it for the same reason.",
       "Effect": "Allow",
       "Action": [
         "glue:GetCatalog"
       ],
       "Resource": [
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog",
         "arn:aws:glue:REGION:ACCOUNT_ID:catalog/s3tablescatalog",
         "arn:aws:glue:REGION:ACCOUNT_ID:catalog/s3tablescatalog/aws-s3"
       ]
