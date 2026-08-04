@@ -15,7 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest==9.0.3",
+    "pytest==9.1.1",
     "pytest-cov==4.1.0",
     "hypothesis==6.98.0",
     # Required by tests/test_template.py and the two inline-Lambda test modules,

@@ -821,7 +821,7 @@ class TestLFGranterRole:
                     services.append(svc)
                 elif isinstance(svc, list):
                     services.extend(svc)
-        assert any("lambda.amazonaws.com" in s for s in services), (
+        assert "lambda.amazonaws.com" in services, (
             "LFGranterRole trust policy must allow lambda.amazonaws.com"
         )
 
