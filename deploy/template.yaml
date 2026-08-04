@@ -770,7 +770,7 @@ Resources:
             Version: "2012-10-17"
             Statement:
               # lakeformation:GetDataLakeSettings/PutDataLakeSettings/
-              # GrantPermissions/RevokePermissions genuinely have no
+              # GrantPermissions/RevokePermissions/GetDataAccess genuinely have no
               # resource-level ARN — confirmed against the AWS Service
               # Authorization Reference (list_lakeformation.html): "AWS Lake
               # Formation does not support specifying a resource ARN in the
@@ -788,6 +788,7 @@ Resources:
                   - lakeformation:PutDataLakeSettings
                   - lakeformation:GrantPermissions
                   - lakeformation:RevokePermissions
+                  - lakeformation:GetDataAccess
                 Resource: "*"
               - Sid: LFGranterGlueCatalog
                 Effect: Allow

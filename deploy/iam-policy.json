@@ -233,13 +233,14 @@
     },
     {
       "Sid": "LFGranterRolePolicy",
-      "_comment": "Applies to LFGranterRole (the CloudFormation-provisioned LF Granter Lambda role), NOT the ExecutionRole. lakeformation:PutDataLakeSettings and lakeformation:GetDataLakeSettings (needed only for the CreateOwnLFAdmin path, when LFAdminRoleArn is not supplied) and GrantPermissions/RevokePermissions genuinely have no resource-level ARN — confirmed against the AWS Service Authorization Reference (list_lakeformation.html): 'AWS Lake Formation does not support specifying a resource ARN in the Resource element of an IAM policy statement', for every action in the service. glue:GetCatalog (detects whether the s3tablescatalog/aws-s3 catalog is in IAM or LF mode) and the s3tables actions (issue or revoke Lake Formation grants on journal namespaces for the ExecutionRole) DO have resource-level ARNs and are scoped in the two statements below — the prior comment claiming these were unscopable management-plane APIs was incorrect. (Requirements: 3.2)",
+      "_comment": "Applies to LFGranterRole (the CloudFormation-provisioned LF Granter Lambda role), NOT the ExecutionRole. lakeformation:PutDataLakeSettings and lakeformation:GetDataLakeSettings (needed only for the CreateOwnLFAdmin path, when LFAdminRoleArn is not supplied) and GrantPermissions/RevokePermissions/GetDataAccess genuinely have no resource-level ARN — confirmed against the AWS Service Authorization Reference (list_lakeformation.html): 'AWS Lake Formation does not support specifying a resource ARN in the Resource element of an IAM policy statement', for every action in the service. GetDataAccess is required because glue:GetCatalog on the s3tablescatalog federated catalog triggers LF credential vending, which checks the caller has lakeformation:GetDataAccess. glue:GetCatalog and the s3tables actions below DO have resource-level ARNs and are scoped in the two statements below. (Requirements: 3.2)",
       "Effect": "Allow",
       "Action": [
         "lakeformation:GetDataLakeSettings",
         "lakeformation:PutDataLakeSettings",
         "lakeformation:GrantPermissions",
-        "lakeformation:RevokePermissions"
+        "lakeformation:RevokePermissions",
+        "lakeformation:GetDataAccess"
       ],
       "Resource": ["*"]
     },
