@@ -19,7 +19,7 @@ The Solution operates entirely on the source side. It never accesses the destina
 
 Complete the [Prerequisites](#prerequisites), then per source account and region:
 
-1. Download `template.yaml`, `package.zip`, and `package.zip.sha256` from the project's Releases page.
+1. Download `template.yaml`, `package.zip`, and `package.zip.sha256` from the project's [Releases](https://github.com/aws-samples/sample-replicate-on-tag-for-amazon-s3/releases) page.
 2. Verify `package.zip` against `package.zip.sha256`.
 3. Upload `package.zip` to an S3 bucket in the same region as the stack. Its S3 URI, for example `s3://my-code-bucket/package.zip`, is the `CodeLocation` parameter.
 4. Create the CloudFormation stack from `template.yaml`, set the parameters, and acknowledge `CAPABILITY_IAM`. Use the console, or the AWS CLI with the template staged in S3 (see [`deploy/README.md`](deploy/README.md#4-create-the-stack)).

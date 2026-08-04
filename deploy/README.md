@@ -204,8 +204,7 @@ The `Solution_Config` `processing_interval` is not a parameter — it is derived
 
 ## 1. Download Release Artifacts
 
-Download all three files from the project [release](../releases) (GitLab Releases for internal
-releases; GitHub Releases for public distribution):
+Download all three files from the project [Releases](https://github.com/aws-samples/sample-replicate-on-tag-for-amazon-s3/releases) page:
 
 - `template.yaml` — the CloudFormation template
 - `package.zip` — the Lambda code package
