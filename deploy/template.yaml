@@ -1,0 +1,1698 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Automatic replication after tagging for Amazon S3 — provisions the Lambda
+  function, EventBridge Scheduler schedule, State_Bucket, Athena workgroup, and
+  least-privilege IAM roles.
+
+# Parameters — full descriptions live in deploy/README.md (Parameter Reference).
+Parameters:
+  CodeLocation:
+    Type: String
+    Description: S3 URI of the Lambda code package zip (see deploy/README.md).
+    AllowedPattern: "^s3://[a-z0-9.-]{3,63}/.+\\.zip$"
+    ConstraintDescription: Must be an s3:// URI to a .zip object.
+
+  SourceBucketNames:
+    Type: CommaDelimitedList
+    Description: Comma-separated source S3 bucket names monitored by the Solution.
+    # Without this, a blank value is accepted: CloudFormation passes an empty
+    # string for a CommaDelimitedList as a single-element list containing "",
+    # which reaches ExecutionRole as the malformed ARN "arn:aws:s3:::" and the
+    # granters as an empty bucket name, failing after resources are created with
+    # a message that does not name the real mistake. AllowedPattern on a
+    # CommaDelimitedList is matched against every element, so an empty element
+    # is rejected at submit time (parameters-section-structure.html).
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: >-
+      SourceBucketNames must list at least one bucket, and each name must be a
+      valid S3 bucket name: 3-63 characters, lowercase letters, numbers, dots
+      and hyphens, beginning and ending with a letter or number.
+
+  CheckFrequencyMinutes:
+    Type: Number
+    Default: 15
+    MinValue: 15
+    MaxValue: 1440
+    Description: How often the Solution runs, in minutes (see deploy/README.md).
+
+  LifecycleExpirationDays:
+    Type: Number
+    Default: 30
+    Description: Days before manifest/Athena/completion-report objects expire.
+
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >-
+      (Optional) Customer-managed KMS key ARN for state objects and Athena
+      results (see deploy/README.md KMS Key Setup).
+
+  SnsKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >-
+      (Optional) Customer-managed KMS key ARN for server-side encryption of the
+      completion-report and batch-job-failure SNS topics. Leave empty for
+      unencrypted topics. SNS has no keyless SSE option, so encryption requires
+      a key. The key's own key policy must allow sns.amazonaws.com to call
+      kms:Decrypt and kms:GenerateDataKey, or every publish fails — see
+      deploy/README.md SNS Topic Encryption.
+
+  JournalKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >-
+      (Optional) Customer-managed KMS key ARN for the S3 Metadata journal
+      (see deploy/README.md KMS Key Setup).
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MaxValue: 900
+    Description: Lambda function timeout in seconds (max 900).
+
+  LambdaMemoryMB:
+    Type: Number
+    Default: 2048
+    AllowedValues: [1024, 2048, 3072, 4096, 6144, 8192, 10240]
+    Description: ReplicationLambda memory in MiB (see deploy/README.md).
+
+  CompletionCheckMemoryMB:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048]
+    Description: CompletionReportCheckLambda memory in MiB (see deploy/README.md).
+
+  VpcId:
+    Type: String
+    Default: ""
+    Description: >-
+      (Optional) VPC ID for the Lambda. Requires SubnetIds/SecurityGroupIds
+      (see deploy/README.md).
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: (Required when VpcId is set) Subnet IDs for the Lambda.
+
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: (Required when VpcId is set) Security group IDs for the Lambda.
+
+  JournalLookbackSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 0
+    Description: Seconds to re-scan the journal watermark (see deploy/README.md).
+
+  MetricsNamespace:
+    Type: String
+    Default: ""
+    Description: (Optional) CloudWatch metrics namespace; empty disables metrics.
+
+  MetricsDeploymentId:
+    Type: String
+    Default: ""
+    Description: (Optional) Deployment dimension label on published metrics.
+
+  JournalReadRowCap:
+    Type: Number
+    Default: 500000
+    MinValue: 1
+    Description: >-
+      (Optional) Max journal rows read in one interval. A single-interval
+      tagging burst above this is processed in bounded partial reads across
+      multiple intervals instead of risking the Lambda timeout
+      (see deploy/README.md).
+
+  MaxBatchJobFailures:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: >-
+      Consecutive job failures before disabling a bucket
+      (see deploy/README.md).
+
+  ReinvocationChainLimit:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    Description: >-
+      (Optional) Max consecutive self-reinvocations draining a capped run's
+      backlog before deferring to the next scheduled trigger
+      (see deploy/README.md).
+
+  LFAdminRoleArn:
+    Type: String
+    Default: ""
+    Description: (Optional) Existing LF admin role ARN (see deploy/README.md LF Mode).
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: >-
+      (Optional) Email for batch job failure alerts; requires CloudTrail
+      (see deploy/README.md Prerequisites).
+
+  CompletionNotificationEmail:
+    Type: String
+    Default: ""
+    Description: >-
+      (Optional) Email for per-object replication tracking and completion
+      email reports. The completion report CSV is always written; this
+      parameter gates the per-object status checks and SNS email only
+      (see deploy/README.md Completion Tracking).
+
+  CompletionCheckBatchSize:
+    Type: Number
+    Default: 2000
+    Description: (Optional) Max Source_Status_Check calls issued per invocation.
+
+  CompletionItemTtlHours:
+    Type: Number
+    Default: 168
+    MinValue: 24
+    Description: >-
+      (Optional) Hours a tracked object may await replication confirmation
+      before it is abandoned as EXPIRED. A backstop that bounds state growth;
+      must exceed real replication time and several run intervals.
+
+# Conditions
+Conditions:
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, ""]]
+  HasSnsKmsKey: !Not [!Equals [!Ref SnsKmsKeyArn, ""]]
+  HasJournalKmsKey: !Not [!Equals [!Ref JournalKmsKeyArn, ""]]
+  HasMetricsNamespace: !Not [!Equals [!Ref MetricsNamespace, ""]]
+  HasMetricsDeploymentId: !Not [!Equals [!Ref MetricsDeploymentId, ""]]
+  HasVpc: !Not [!Equals [!Ref VpcId, ""]]
+  HasLFAdminRole: !Not [!Equals [!Ref LFAdminRoleArn, ""]]
+  CreateOwnLFAdmin: !Not [Condition: HasLFAdminRole]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  HasCompletionNotificationEmail: !Not [!Equals [!Ref CompletionNotificationEmail, ""]]
+
+# Resources
+Resources:
+
+  # State_Bucket
+  StateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketNamePrefix: !Sub "${AWS::StackName}-solution"
+      BucketNamespace: account-regional
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-manifests
+            Status: Enabled
+            Prefix: "manifests/"
+            ExpirationInDays: !Ref LifecycleExpirationDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: "athena-results/"
+            ExpirationInDays: !Ref LifecycleExpirationDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: expire-completion-reports
+            Status: Enabled
+            Prefix: "completion-reports/"
+            ExpirationInDays: !Ref LifecycleExpirationDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # Athena WorkGroup
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-workgroup"
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${StateBucket}/athena-results/"
+          EncryptionConfiguration: !If
+            - HasKmsKey
+            - EncryptionOption: SSE_KMS
+              KmsKey: !Ref KmsKeyArn
+            - EncryptionOption: SSE_S3
+
+  # Execution Role
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReplicationSolutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSourceBucketReplicationConfig
+                Effect: Allow
+                Action:
+                  - s3:GetReplicationConfiguration
+                  # ListBucket is required so that the completion-tracking
+                  # Source_Status_Check's HeadObject on a deleted object
+                  # version returns 404 rather than 403 — S3 masks object
+                  # existence from a caller without ListBucket. A 403 is
+                  # indistinguishable from a transient access failure, so such
+                  # an object would be re-checked every run forever and its
+                  # Tracked_Object would never leave the state object. Same
+                  # reasoning as the ScratchBucketReadWrite grant in
+                  # deploy/iam-policy.json.
+                  - s3:ListBucket
+                Resource: !Split
+                  - ","
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !Join [",arn:aws:s3:::", !Ref SourceBucketNames]
+
+              # Sid retained for continuity; this statement no longer grants
+              # tagging actions. It covers exactly one call: the
+              # completion-tracking Source_Status_Check's HeadObject on a source
+              # object version (both actions are needed, because S3 evaluates a
+              # version-qualified HeadObject against GetObjectVersion and an
+              # unqualified one against GetObject).
+              #
+              # s3:GetObjectTagging and s3:InitiateReplication were removed as
+              # unreachable. Nothing in src/ calls GetObjectTagging -- object
+              # tags reach this Solution through the S3 Metadata journal via
+              # Athena, never by reading tags off the object. InitiateReplication
+              # belongs to the S3 Batch Replication job role -- BatchOperationsRole
+              # below, passed as create_job's RoleArn -- not to this role, which
+              # only submits the job (s3-batch-replication-policies.html).
+              - Sid: ReadSourceObjectTags
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Split
+                  - ","
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !Join ["/*,arn:aws:s3:::", !Ref SourceBucketNames]
+
+              - Sid: AthenaJournalQuery
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:GetDataCatalog
+                Resource:
+                  - !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
+                  - !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/s3tablescatalog"
+
+              # Scoped to the AWS-managed "aws-s3" S3 Tables bucket that every S3
+              # Metadata journal lives in, per the AWS Service Authorization
+              # Reference (list_s3tables.html): every action here accepts a
+              # TableBucket or Table resource — none genuinely requires "*"
+              # (security-scan-remediation Requirement 9.1, Decision 6). The
+              # Table ARN has no namespace segment (namespace is a resource
+              # attribute filtered by the s3tables:namespace condition key,
+              # not part of the ARN path), so this is bucket-scoped rather
+              # than scoped to each SourceBucketNames entry's own
+              # b_<bucket> namespace.
+              - Sid: S3TablesJournalRead
+                Effect: Allow
+                Action:
+                  - s3tables:GetTableBucket
+                  - s3tables:GetNamespace
+                  - s3tables:ListNamespaces
+                  - s3tables:GetTable
+                  - s3tables:ListTables
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:GetTableData
+                Resource:
+                  - !Sub "arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3"
+                  - !Sub "arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
+
+              # lakeformation:GetDataAccess has no resource-level ARN at all —
+              # confirmed against the AWS Service Authorization Reference
+              # (list_lakeformation.html): "AWS Lake Formation does not
+              # support specifying a resource ARN in the Resource element of
+              # an IAM policy statement", for every action in the service.
+              # Kept on its own statement so the s3tables scoping above is
+              # never diluted by an action that has no ARN to scope.
+              - Sid: LakeFormationDataAccess
+                Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+
+              # Athena resolves s3tablescatalog/aws-s3 (federated) through Glue.
+              # Scoped to the federated s3tablescatalog catalog and the aws-s3
+              # table bucket's databases/tables, per the AWS Lake Formation
+              # IAM-to-LF migration guide's documented federated ARN shapes
+              # (change-access-lf-to-iam.html) — the "does not match standard
+              # Glue ARN patterns" comment this replaces was describing the
+              # documented federated shape itself, not an exception to it
+              # (security-scan-remediation Requirement 9.2, Decision 6).
+              # GetCatalogs additionally needs the bare account-root catalog
+              # ARN (rootcatalog) to enumerate catalogs — a single fixed
+              # resource per account, not a wildcard.
+              - Sid: GlueFederatedS3TablesCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                  - glue:GetCatalog
+                  - glue:GetCatalogs
+                  - glue:SearchTables
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/aws-s3"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/s3tablescatalog/aws-s3/*"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/s3tablescatalog/aws-s3/*"
+
+              - Sid: ScratchBucketReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketAcl
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !GetAtt StateBucket.Arn
+                  - !Sub "${StateBucket.Arn}/*"
+
+              - Sid: S3BatchOperationsCreateJob
+                Effect: Allow
+                Action:
+                  - s3:CreateJob
+                  - s3:PutJobTagging
+                  - s3:DescribeJob
+                Resource:
+                  - !Sub "arn:aws:s3:${AWS::Region}:${AWS::AccountId}:job/*"
+
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+
+  # S3 Batch Operations job role (solution-owned).
+  #
+  # This is the role passed as create_job's RoleArn. It is a different role
+  # from each source bucket's replication configuration role: this one only
+  # initiates replication and reads the manifest, while the bucket's own
+  # replication role performs the delivery. See
+  # .kiro/specs/solution-owned-batchops-role/requirements.md.
+  BatchOperationsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batchoperations.s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BatchReplicationJobPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InitiateReplicationOnSourceBuckets
+                Effect: Allow
+                Action: s3:InitiateReplication
+                Resource: !Split
+                  - ","
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !Join ["/*,arn:aws:s3:::", !Ref SourceBucketNames]
+
+              # s3:GetObjectVersion is deliberately absent: the manifest is
+              # referenced by ObjectArn and ETag with no version id, so the
+              # read is authorized against s3:GetObject even when the operator
+              # enables the State_Bucket versioning hardening option. One
+              # grant covers both parts of the inventory manifest -- the
+              # manifest.json envelope and the data/ CSV files it references
+              # both sit under manifests/<config-id>/.
+              - Sid: ReadManifest
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${StateBucket.Arn}/manifests/*"
+
+              - Sid: WriteCompletionReport
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${StateBucket.Arn}/completion-reports/*"
+
+  # iam:PassRole for the job role above, as a standalone policy so that neither
+  # role depends on the other: folding this statement into ExecutionRole's own
+  # Policies block would make ExecutionRole depend on BatchOperationsRole.
+  #
+  # iam:PassedToService is deliberately absent -- s3control:CreateJob does not
+  # populate that context key, so a statement carrying it always denies. See
+  # .holmes/accepted-risks.md AR8.
+  PassBatchOperationsRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: PassBatchOperationsRole
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PassBatchOperationsRole
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt BatchOperationsRole.Arn
+
+  # Lets the job role decrypt an SSE-KMS manifest. A separate policy so the
+  # role itself stays unconditional.
+  BatchOperationsRoleKmsPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasKmsKey
+    Properties:
+      PolicyName: BatchOperationsRoleKmsAccess
+      Roles:
+        - !Ref BatchOperationsRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DecryptManifest
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !Ref KmsKeyArn
+
+  # KMS Key Policy (conditional)
+  KmsKeyPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasKmsKey
+    Properties:
+      PolicyName: KmsKeyAccess
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OptionalCustomerManagedKmsKey
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource:
+              - !Ref KmsKeyArn
+
+  # SNS KMS Key Policy (conditional) — lets the Lambda publish to an encrypted
+  # topic. Publishing to an SSE-enabled topic requires the publisher to hold
+  # kms:GenerateDataKey and kms:Decrypt on the topic's key, in addition to the
+  # key's own key policy allowing sns.amazonaws.com (which is the deploying
+  # account's responsibility — see deploy/README.md SNS Topic Encryption).
+  SnsKmsKeyPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasSnsKmsKey
+    Properties:
+      PolicyName: SnsKmsKeyAccess
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublishToEncryptedSnsTopics
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource:
+              - !Ref SnsKmsKeyArn
+
+  # Journal KMS Key Policy (conditional)
+  KmsJournalKeyPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasJournalKmsKey
+    Properties:
+      PolicyName: KmsJournalKeyAccess
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: JournalTableKmsKey
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource:
+              - !Ref JournalKmsKeyArn
+
+  # Metrics Policy (conditional)
+  MetricsPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasMetricsNamespace
+    Properties:
+      PolicyName: MetricsAccess
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OptionalCloudWatchMetrics
+            Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            Resource: "*"
+            Condition:
+              StringEquals:
+                cloudwatch:namespace: !Ref MetricsNamespace
+
+  # Completion Report Topic (conditional)
+  # Report bodies carry object keys and version IDs (see README "Completion
+  # Reporting"), so this topic is the one that most warrants encryption when the
+  # deployment supplies a key.
+  CompletionReportTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasCompletionNotificationEmail
+    Properties:
+      KmsMasterKeyId: !If [HasSnsKmsKey, !Ref SnsKmsKeyArn, !Ref "AWS::NoValue"]
+
+  CompletionReportSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasCompletionNotificationEmail
+    Properties:
+      TopicArn: !Ref CompletionReportTopic
+      Protocol: email
+      Endpoint: !Ref CompletionNotificationEmail
+
+  # Completion Report Policy (conditional)
+  CompletionReportPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasCompletionNotificationEmail
+    Properties:
+      PolicyName: CompletionReportAccess
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublishCompletionReport
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Ref CompletionReportTopic
+
+  # Grants sns:Publish on BatchJobFailureTopic, for the report-missing alert
+  # (design.md Decision 9, source-status-completion-tracking) and the
+  # bucket-disabled alert (recovery-instructions email on circuit-breaker /
+  # InlineHashCeiling disable). Scoped to HasAlarmEmail alone (not also
+  # HasCompletionNotificationEmail) since ReplicationLambda's disable path
+  # needs this regardless of whether completion tracking is configured, and
+  # BatchJobFailureTopic itself only exists under HasAlarmEmail.
+  BatchJobFailureAlertPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasAlarmEmail
+    Properties:
+      PolicyName: BatchJobFailureAlertAccess
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublishBatchJobFailureAlert
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Ref BatchJobFailureTopic
+
+  # Grants log-write access to BatchJobFailureLogGroup, unconditionally —
+  # both check_report_handler's report-missing alert and the
+  # ReplicationLambda's bucket-disabled alert always write this log group
+  # regardless of whether AlarmEmail (SNS) is configured, mirroring
+  # Requirement 8.4's "alert is visible even when AlarmEmail is not
+  # configured" guarantee. BatchJobFailureLogGroup itself is created
+  # unconditionally (no Condition on that resource), so this permission
+  # must not be gated either.
+  BatchJobFailureLogWritePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: BatchJobFailureLogWriteAccess
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WriteBatchJobFailureLogGroup
+            Effect: Allow
+            Action:
+              - logs:PutLogEvents
+              - logs:CreateLogStream
+            Resource:
+              - !GetAtt BatchJobFailureLogGroup.Arn
+
+  # LFGranterRole
+  LFGranterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LFGranterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # lakeformation:GetDataLakeSettings/PutDataLakeSettings/
+              # GrantPermissions/RevokePermissions/GetDataAccess genuinely have no
+              # resource-level ARN — confirmed against the AWS Service
+              # Authorization Reference (list_lakeformation.html): "AWS Lake
+              # Formation does not support specifying a resource ARN in the
+              # Resource element of an IAM policy statement", for every
+              # action in the service. glue:GetCatalog and the s3tables
+              # actions below DO have resource-level ARNs and are scoped to
+              # them (security-scan-remediation Requirement 9.4, Decision 6);
+              # the original comment claiming otherwise for all of these was
+              # incorrect. sts:AssumeRole is kept in a separate, scoped
+              # statement below so it is never on Resource: "*".
+              - Sid: LFOperations
+                Effect: Allow
+                Action:
+                  - lakeformation:GetDataLakeSettings
+                  - lakeformation:PutDataLakeSettings
+                  - lakeformation:GrantPermissions
+                  - lakeformation:RevokePermissions
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+              # GetCatalog on a nested federated catalog id
+              # ("<account>:s3tablescatalog/aws-s3") is authorized by Glue
+              # against the bare account-root catalog ARN, not only against the
+              # child catalog ARNs — the observed AccessDeniedException names
+              # "arn:aws:glue:<region>:<account>:catalog" as the resource. The
+              # root ARN is a single fixed resource per account, not a
+              # wildcard. ExecutionRole's GlueFederatedS3TablesCatalog
+              # statement already includes it for the same reason.
+              #
+              # GetDatabase and GetTable are required to issue the grants, not
+              # to read data. Every principal that grants or revokes Lake
+              # Formation permissions by the named-resource method needs
+              # glue:GetDatabase on the database, or glue:GetTable on the table,
+              # that the grant names -- data lake administrators included, so
+              # the LFAdminGranterSetup admin registration does not substitute
+              # for them (required-permissions-for-grant.html). Without them
+              # GrantPermissions fails with "Insufficient Glue permissions to
+              # access database b_<bucket>". The granter grants on a Database
+              # resource and a Table resource per source bucket, and revokes the
+              # same two on stack delete, so both actions are needed. Scoped by
+              # wildcard within the single AWS-managed aws-s3 table bucket,
+              # matching the ARN shapes ExecutionRole already uses.
+              - Sid: LFGranterGlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetCatalog
+                  - glue:GetDatabase
+                  - glue:GetTable
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/aws-s3"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/s3tablescatalog/aws-s3/*"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/s3tablescatalog/aws-s3/*"
+              # glue:GetCatalog on the federated s3tablescatalog/aws-s3
+              # catalog is authorized by Glue only after Glue itself calls the
+              # S3 Tables federation source as this principal — observed
+              # directly in a fresh IAM-mode account: GetCatalog fails with
+              # "AccessDeniedException ... From federation source ... is not
+              # authorized to perform: s3tables:GetTableBucket", naming this
+              # role, not a Lake-Formation-vended identity. The previous
+              # comment's premise (credential vending makes S3 Tables IAM
+              # permissions unnecessary for the caller) does not hold for this
+              # call in IAM mode, so mode-detection — which every deploy
+              # performs, LF mode or not — fails without this grant. Scoped
+              # to the single AWS-managed aws-s3 table bucket, matching the
+              # ARN shapes ExecutionRole's S3TablesJournalRead statement uses.
+              - Sid: LFGranterS3TablesRead
+                Effect: Allow
+                Action:
+                  - s3tables:GetTableBucket
+                  - s3tables:GetNamespace
+                  - s3tables:ListNamespaces
+                  - s3tables:GetTable
+                  - s3tables:ListTables
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:GetTableData
+                Resource:
+                  - !Sub "arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3"
+                  - !Sub "arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
+              - Sid: AssumeLFAdminRole
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                # Scoped to LFAdminRoleArn when set; otherwise a dummy ARN
+                # (CreateOwnLFAdmin path), so this is never Resource: "*".
+                Resource: !If
+                  - HasLFAdminRole
+                  - !Ref LFAdminRoleArn
+                  - "arn:aws:iam::000000000000:role/NoLFAdminRoleConfigured"
+              - Sid: LFGranterLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+
+  # LFAdminGranterFunction (Condition: CreateOwnLFAdmin)
+  LFAdminGranterFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateOwnLFAdmin
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LFGranterRole.Arn
+      Timeout: 300
+      Architectures: [arm64]
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          import random
+          import time
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          lf = boto3.client("lakeformation")
+
+
+          def put_with_retry(new_settings, max_attempts=10):
+              for attempt in range(max_attempts):
+                  try:
+                      lf.put_data_lake_settings(**new_settings)
+                      return
+                  except lf.exceptions.ConcurrentModificationException:
+                      if attempt == max_attempts - 1:
+                          raise
+                      time.sleep(2 ** attempt + random.uniform(0, 1))
+
+
+          def append_admin(principal_arn):
+              response = lf.get_data_lake_settings()
+              settings = response["DataLakeSettings"]
+              admins = settings.get("DataLakeAdmins", [])
+              if not any(
+                  a.get("DataLakePrincipalIdentifier") == principal_arn for a in admins
+              ):
+                  admins.append({"DataLakePrincipalIdentifier": principal_arn})
+              settings["DataLakeAdmins"] = admins
+              logger.info("Adding %s as data lake admin", principal_arn)
+              put_with_retry({"DataLakeSettings": settings})
+
+
+          def remove_admin(principal_arn):
+              response = lf.get_data_lake_settings()
+              settings = response["DataLakeSettings"]
+              admins = settings.get("DataLakeAdmins", [])
+              settings["DataLakeAdmins"] = [
+                  a for a in admins
+                  if a.get("DataLakePrincipalIdentifier") != principal_arn
+              ]
+              logger.info("Removing %s from data lake admins", principal_arn)
+              put_with_retry({"DataLakeSettings": settings})
+
+
+          def handler(event, context):
+              try:
+                  principal_arn = event["ResourceProperties"]["PrincipalArn"]
+                  request_type = event.get("RequestType")
+                  logger.info("LFAdminGranter: %s principal=%s", request_type, principal_arn)
+                  if request_type == "Create":
+                      append_admin(principal_arn)
+                  elif request_type == "Delete":
+                      try:
+                          remove_admin(principal_arn)
+                      except Exception as exc:
+                          logger.warning("Remove admin best-effort failed: %s", exc)
+                  cfnresponse.send(
+                      event, context, cfnresponse.SUCCESS,
+                      {"PrincipalArn": principal_arn},
+                  )
+              except Exception as exc:
+                  logger.error("LFAdminGranter failed: %s", exc)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
+
+  # Log group for LFAdminGranterFunction; conditional matches the function.
+  LFAdminGranterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateOwnLFAdmin
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LFAdminGranterFunction}"
+      RetentionInDays: 90
+
+  # LFAdminGranterResource (Condition: CreateOwnLFAdmin)
+  LFAdminGranterResource:
+    Type: Custom::LFAdminGranter
+    Condition: CreateOwnLFAdmin
+    DependsOn: LFAdminGranterLogGroup
+    Properties:
+      ServiceToken: !GetAtt LFAdminGranterFunction.Arn
+      PrincipalArn: !GetAtt LFGranterRole.Arn
+
+  # LFPermissionsGranterFunction
+  LFPermissionsGranterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LFGranterRole.Arn
+      Timeout: 300
+      Architectures: [arm64]
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import time
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+
+          def get_clients(lf_admin_role_arn):
+              # The mode check and the grants must run as the same principal.
+              # A check made as the Lambda's own role can be denied while the
+              # grant path (the LF admin role) is unaffected, so the two
+              # clients are always built from one set of credentials.
+              if lf_admin_role_arn:
+                  logger.info("Assuming LF admin role: %s", lf_admin_role_arn)
+                  sts = boto3.client("sts")
+                  creds = sts.assume_role(
+                      RoleArn=lf_admin_role_arn, RoleSessionName="LFGranter"
+                  )["Credentials"]
+                  kwargs = {
+                      "aws_access_key_id": creds["AccessKeyId"],
+                      "aws_secret_access_key": creds["SecretAccessKey"],
+                      "aws_session_token": creds["SessionToken"],
+                  }
+              else:
+                  kwargs = {}
+              return (
+                  boto3.client("lakeformation", **kwargs),
+                  boto3.client("glue", **kwargs),
+              )
+
+
+          def detect_mode(glue, account_id):
+              # Never assume a mode when GetCatalog fails. Defaulting to LF
+              # turns a failed check into a failed grant; defaulting to IAM
+              # would silently deploy an execution role that cannot read the
+              # journal. Retry to absorb IAM propagation on a freshly created
+              # role, then surface the real error.
+              last_exc = None
+              for attempt in range(5):
+                  try:
+                      cat = glue.get_catalog(
+                          CatalogId=f"{account_id}:s3tablescatalog/aws-s3"
+                      )
+                      principals = [
+                          p["Principal"]["DataLakePrincipalIdentifier"]
+                          for p in cat["Catalog"].get("CreateTableDefaultPermissions", [])
+                      ]
+                      return "IAM" if "IAM_ALLOWED_PRINCIPALS" in principals else "LF"
+                  except Exception as exc:
+                      last_exc = exc
+                      logger.warning("GetCatalog attempt %d failed: %s", attempt + 1, exc)
+                      if attempt < 4:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(
+                  "Cannot determine whether %s:s3tablescatalog/aws-s3 is in IAM or "
+                  "LF mode; last GetCatalog error: %s" % (account_id, last_exc)
+              )
+
+
+          def handler(event, context):
+              physical_id = event.get("PhysicalResourceId", "lf-grants")
+              try:
+                  props = event["ResourceProperties"]
+                  request_type = event.get("RequestType")
+                  logger.info("LFPermissionsGranter: %s account=%s", request_type, props.get("AccountId"))
+                  if request_type in ("Create", "Update"):
+                      lf, glue = get_clients(props.get("LFAdminRoleArn", ""))
+                      mode = detect_mode(glue, props["AccountId"])
+                      logger.info("LFPermissionsGranter: catalog mode=%s", mode)
+                      if mode == "IAM":
+                          logger.info("LFPermissionsGranter: IAM mode, no grants needed")
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+                          return
+                      grants = []
+                      execution_role_arn = props["ExecutionRoleArn"]
+                      account_id = props["AccountId"]
+                      catalog_id = f"{account_id}:s3tablescatalog/aws-s3"
+                      for bucket in props["SourceBucketNames"].split(","):
+                          namespace = "b_" + bucket.strip().replace(".", "_")
+                          lf.grant_permissions(
+                              Principal={"DataLakePrincipalIdentifier": execution_role_arn},
+                              Resource={"Database": {"CatalogId": catalog_id, "Name": namespace}},
+                              Permissions=["DESCRIBE"],
+                          )
+                          lf.grant_permissions(
+                              Principal={"DataLakePrincipalIdentifier": execution_role_arn},
+                              Resource={
+                                  "Table": {
+                                      "CatalogId": catalog_id,
+                                      "DatabaseName": namespace,
+                                      "TableWildcard": {},
+                                  }
+                              },
+                              Permissions=["SELECT", "DESCRIBE"],
+                          )
+                          grants.append(
+                              {"principal": execution_role_arn, "catalog_id": catalog_id, "namespace": namespace}
+                          )
+                      physical_id = json.dumps({"grants": grants})
+                      logger.info("LFPermissionsGranter: granted permissions for %d bucket(s)", len(grants))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+                  elif request_type == "Delete":
+                      try:
+                          grant_data = json.loads(physical_id)
+                          lf, _ = get_clients(props.get("LFAdminRoleArn", ""))
+                          for grant in grant_data.get("grants", []):
+                              try:
+                                  lf.revoke_permissions(
+                                      Principal={"DataLakePrincipalIdentifier": grant["principal"]},
+                                      Resource={
+                                          "Database": {
+                                              "CatalogId": grant["catalog_id"],
+                                              "Name": grant["namespace"],
+                                          }
+                                      },
+                                      Permissions=["DESCRIBE"],
+                                  )
+                              except Exception as exc:
+                                  logger.warning("Revoke database DESCRIBE failed (best-effort): %s", exc)
+                              try:
+                                  lf.revoke_permissions(
+                                      Principal={"DataLakePrincipalIdentifier": grant["principal"]},
+                                      Resource={
+                                          "Table": {
+                                              "CatalogId": grant["catalog_id"],
+                                              "DatabaseName": grant["namespace"],
+                                              "TableWildcard": {},
+                                          }
+                                      },
+                                      Permissions=["SELECT", "DESCRIBE"],
+                                  )
+                              except Exception as exc:
+                                  logger.warning("Revoke table SELECT+DESCRIBE failed (best-effort): %s", exc)
+                      except Exception as exc:
+                          logger.warning("LFPermissionsGranter delete best-effort failed: %s", exc)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+              except Exception as exc:
+                  logger.error("LFPermissionsGranter failed: %s", exc)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
+
+  # Log group for LFPermissionsGranterFunction; always created (no Condition).
+  LFPermissionsGranterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LFPermissionsGranterFunction}"
+      RetentionInDays: 90
+
+  # ExecuteLFPermissionsGranter
+  ExecuteLFPermissionsGranter:
+    Type: Custom::LFPermissionsGranter
+    DependsOn:
+      - ExecutionRole
+      - LFPermissionsGranterLogGroup
+    Properties:
+      ServiceToken: !GetAtt LFPermissionsGranterFunction.Arn
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      SourceBucketNames: !Join [",", !Ref SourceBucketNames]
+      AccountId: !Ref AWS::AccountId
+      LFAdminRoleArn: !If [HasLFAdminRole, !Ref LFAdminRoleArn, ""]
+      # Implicit DependsOn LFAdminGranterResource via the !GetAtt reference below.
+      LFAdminGranterDependency: !If
+        - CreateOwnLFAdmin
+        - !GetAtt LFAdminGranterResource.PrincipalArn
+        - "n/a"
+
+  # Config Custom Resource: writes Solution_Config to State_Bucket
+  # (see .kiro/specs/.complete/console-deployment/design.md)
+  # ConfigResourceRole
+  ConfigResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ConfigWriterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteSolutionConfigObject
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${StateBucket.Arn}/config/solution-config.json"
+              - Sid: ConfigResourceLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+              # kms:GenerateDataKey is required when the customer provides a KMS key
+              # so that config writes can use SSE-KMS.  Omitted when KmsKeyArn is "".
+              - !If
+                - HasKmsKey
+                - Sid: KmsForConfigWrite
+                  Effect: Allow
+                  Action:
+                    - kms:GenerateDataKey
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: !Ref KmsKeyArn
+                - !Ref "AWS::NoValue"
+
+  # ConfigResourceFunction
+  ConfigResourceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ConfigResourceRole.Arn
+      Timeout: 300
+      Architectures: [arm64]
+      Code:
+        ZipFile: |
+          """Config-writing custom resource handler (deploy/template.yaml ConfigResourceFunction).
+
+          Source of truth for the inline Lambda Code.ZipFile; tests/test_template.py
+          asserts they match and that this file is < 4096 bytes.
+
+          CREATE/UPDATE: writes Solution_Config JSON to State_Bucket. DELETE: removes it.
+          """
+          import json
+
+          import boto3
+          import cfnresponse  # auto-provided for inline ZipFile Lambdas; do not bundle
+
+          s3 = boto3.client("s3")
+
+
+          def _interval_from_minutes(minutes):
+              """Derive the processing_interval duration string from a check frequency
+              expressed in minutes (e.g. 60 -> "1h", 30 -> "30m")."""
+              n = int(minutes)
+              if n % 60 == 0:
+                  return f"{n // 60}h"
+              return f"{n}m"
+
+
+          def handler(event, context):
+              props = event.get("ResourceProperties", {})
+              bucket = props["StateBucket"]
+              key = props["ConfigKey"]
+              try:
+                  if event["RequestType"] == "Delete":
+                      s3.delete_object(Bucket=bucket, Key=key)  # idempotent: 204 even if absent
+                  else:  # Create or Update
+                      region = props["Region"]
+                      names = props["Buckets"]  # list from CommaDelimitedList parameter
+                      # Omits any runtime "disabled" flag (see lambda_handler.py).
+                      config = {
+                          "buckets": [{"name": n, "region": region} for n in names],
+                          "processing_interval": _interval_from_minutes(props["CheckFrequencyMinutes"]),
+                      }
+                      put_kwargs = {
+                          "Bucket": bucket,
+                          "Key": key,
+                          "Body": json.dumps(config).encode("utf-8"),
+                          "ContentType": "application/json",
+                      }
+                      kms_key_arn = props.get("KmsKeyArn", "").strip()
+                      if kms_key_arn:
+                          put_kwargs["ServerSideEncryption"] = "aws:kms"
+                          put_kwargs["SSEKMSKeyId"] = kms_key_arn
+                      s3.put_object(**put_kwargs)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId=key)
+              except Exception as exc:  # signal failure so the stack fails fast (Req 7.6)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
+                  raise
+
+  # Log group for ConfigResourceFunction.
+  ConfigResourceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ConfigResourceFunction}"
+      RetentionInDays: 90
+
+  # SolutionConfig (Custom::SolutionConfig)
+  SolutionConfig:
+    Type: Custom::SolutionConfig
+    DependsOn:
+      - StateBucket
+      - ConfigResourceLogGroup
+    Properties:
+      ServiceToken: !GetAtt ConfigResourceFunction.Arn
+      StateBucket: !Ref StateBucket
+      ConfigKey: config/solution-config.json
+      Buckets: !Ref SourceBucketNames
+      Region: !Ref AWS::Region
+      CheckFrequencyMinutes: !Ref CheckFrequencyMinutes
+      KmsKeyArn: !If [HasKmsKey, !Ref KmsKeyArn, ""]
+
+  # Parses s3://bucket/key CodeLocation (robust for keys with prefixes,
+  # which intrinsics can't extract). Pure string parsing — logs only.
+  CodeLocationParserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeLocationParserLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+
+  CodeLocationParserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CodeLocationParserRole.Arn
+      Timeout: 30
+      Architectures: [arm64]
+      Code:
+        ZipFile: |
+          from urllib.parse import urlparse
+
+          import cfnresponse  # auto-provided for inline ZipFile Lambdas; do not bundle
+
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId="codeloc")
+                      return
+                  loc = event["ResourceProperties"]["CodeLocation"]
+                  parts = urlparse(loc)
+                  bucket = parts.netloc
+                  key = parts.path.lstrip("/")
+                  if parts.scheme != "s3" or not bucket or not key:
+                      raise Exception("CodeLocation must be s3://bucket/key, got: " + loc)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Bucket": bucket, "Key": key}, physicalResourceId="codeloc")
+              except Exception as exc:  # signal failure so the stack fails fast
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
+                  raise
+
+  # Log group for CodeLocationParserFunction.
+  CodeLocationParserLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CodeLocationParserFunction}"
+      RetentionInDays: 90
+
+  ExecuteCodeLocationParser:
+    Type: Custom::CodeLocationParser
+    DependsOn: CodeLocationParserLogGroup
+    Properties:
+      ServiceToken: !GetAtt CodeLocationParserFunction.Arn
+      CodeLocation: !Ref CodeLocation
+
+  # Lambda Function
+  ReplicationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: src.lambda_handler.handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: !Ref LambdaTimeoutSeconds
+      MemorySize: !Ref LambdaMemoryMB
+      Architectures: [arm64]
+      # Never run two invocations of this function concurrently. Each
+      # invocation processes every configured bucket sequentially (no
+      # in-process concurrency), so there is no throughput reason to allow
+      # more than one — and preventing a second invocation from starting at
+      # all is a stronger guarantee than relying solely on the per-bucket
+      # lease's conditional write to arbitrate a genuine overlap (e.g. a
+      # run that is still in flight when the next ScheduleExpression trigger
+      # fires). A throttled EventBridge Scheduler invocation is retried by
+      # Scheduler itself, so this does not cause missed runs in normal
+      # operation — see code-review-remediation verification-notes.md,
+      # "concurrent-lease-contention" section.
+      ReservedConcurrentExecutions: 1
+      Code:
+        # bucket/key are parsed from CodeLocation by the CodeLocationParser
+        # custom resource (robust for keys with prefixes).
+        S3Bucket: !GetAtt ExecuteCodeLocationParser.Bucket
+        S3Key: !GetAtt ExecuteCodeLocationParser.Key
+      VpcConfig: !If
+        - HasVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !Ref SecurityGroupIds
+        - !Ref "AWS::NoValue"
+      Environment:
+        Variables:
+          STATE_BUCKET: !Ref StateBucket
+          ATHENA_WORKGROUP: !Ref AthenaWorkGroup
+          ATHENA_OUTPUT_LOCATION: !Sub "s3://${StateBucket}/athena-results/"
+          ACCOUNT_ID: !Ref AWS::AccountId
+          BATCH_OPERATIONS_ROLE_ARN: !GetAtt BatchOperationsRole.Arn
+          SOLUTION_CONFIG_KEY: config/solution-config.json
+          KMS_KEY_ARN: !If [HasKmsKey, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
+          JOURNAL_LOOKBACK_SECONDS: !Ref JournalLookbackSeconds
+          METRICS_NAMESPACE: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Ref "AWS::NoValue"]
+          METRICS_DEPLOYMENT_ID: !If [HasMetricsDeploymentId, !Ref MetricsDeploymentId, !Ref "AWS::NoValue"]
+          JOURNAL_READ_ROW_CAP: !Ref JournalReadRowCap
+          REINVOCATION_CHAIN_LIMIT: !Ref ReinvocationChainLimit
+          MAX_BATCH_JOB_FAILURES: !Ref MaxBatchJobFailures
+          COMPLETION_REPORT_TOPIC_ARN: !If [HasCompletionNotificationEmail, !Ref CompletionReportTopic, !Ref "AWS::NoValue"]
+          COMPLETION_CHECK_BATCH_SIZE: !Ref CompletionCheckBatchSize
+          COMPLETION_ITEM_TTL_HOURS: !Ref CompletionItemTtlHours
+          BATCH_JOB_FAILURE_TOPIC_ARN: !If [HasAlarmEmail, !Ref BatchJobFailureTopic, !Ref "AWS::NoValue"]
+          BATCH_JOB_FAILURE_LOG_GROUP: !Ref BatchJobFailureLogGroup
+
+  # Self-reinvocation permission (Requirements 4.1, 5.1) — unconditional, since
+  # Self_Reinvocation is always available regardless of any other optional
+  # feature being configured. Declared as a standalone AWS::IAM::Policy (not
+  # part of ExecutionRole's own inline Policies list) because ReplicationLambda
+  # depends on ExecutionRole (via its Role property); a statement inside
+  # ExecutionRole's inline policy referencing !GetAtt ReplicationLambda.Arn
+  # would create a circular dependency (ExecutionRole -> ReplicationLambda ->
+  # ExecutionRole). A separate resource can depend on both without either of
+  # them depending on each other, mirroring the MetricsPolicy /
+  # BatchJobFailureLogWritePolicy pattern used elsewhere in this template.
+  ReinvocationSelfInvokePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ReinvocationSelfInvokeAccess
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SelfInvokeForReinvocation
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt ReplicationLambda.Arn
+
+  # Log group for ReplicationLambda (main function). The scheduler invokes this
+  # after deployment, so the log group will exist before first invocation.
+  ReplicationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ReplicationLambda}"
+      RetentionInDays: 90
+
+  # Disables async-invoke function-error retries for the self-reinvocation
+  # (design.md "Self-invoke async retry is disabled" decision): a
+  # function-error retry would re-run a crashed reinvocation up to two more
+  # times, duplicating a run and confusing Reinvocation_Chain depth
+  # accounting. The scheduled EventBridge trigger remains the fallback, so a
+  # dropped reinvocation is self-healing without retries. This does not
+  # affect the throttling re-queue that lets the async event wait for the
+  # ReservedConcurrentExecutions = 1 slot to free — that is the mechanism
+  # Self_Reinvocation relies on. No DestinationConfig/DLQ is configured (not
+  # required, per the resolved decision), and MaximumEventAgeInSeconds is
+  # left at its default.
+  ReplicationLambdaEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ReplicationLambda
+      Qualifier: "$LATEST"
+      MaximumRetryAttempts: 0
+
+  # Schedule Role
+  # Also invokes CompletionReportCheckLambda when HasCompletionNotificationEmail.
+  ScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ReplicationLambda.Arn
+                  - !If
+                    - HasCompletionNotificationEmail
+                    - !GetAtt CompletionReportCheckLambda.Arn
+                    - !Ref "AWS::NoValue"
+
+  # EventBridge Scheduler Schedule
+  ReplicationSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: !Sub "rate(${CheckFrequencyMinutes} minutes)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt ReplicationLambda.Arn
+        RoleArn: !GetAtt ScheduleRole.Arn
+
+  # Completion Report Check Lambda / Schedule (conditional)
+  # Report-missing detection, on its own 5-minute schedule, only when
+  # CompletionNotificationEmail is set. See design.md Decision 9 under
+  # .kiro/specs/.complete/source-status-completion-tracking/.
+  CompletionReportCheckLambda:
+    Type: AWS::Lambda::Function
+    Condition: HasCompletionNotificationEmail
+    Properties:
+      Runtime: python3.12
+      Handler: src.lambda_handler.check_report_handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 60
+      MemorySize: !Ref CompletionCheckMemoryMB
+      Architectures: [arm64]
+      Code:
+        S3Bucket: !GetAtt ExecuteCodeLocationParser.Bucket
+        S3Key: !GetAtt ExecuteCodeLocationParser.Key
+      VpcConfig: !If
+        - HasVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !Ref SecurityGroupIds
+        - !Ref "AWS::NoValue"
+      Environment:
+        Variables:
+          STATE_BUCKET: !Ref StateBucket
+          ACCOUNT_ID: !Ref AWS::AccountId
+          BATCH_OPERATIONS_ROLE_ARN: !GetAtt BatchOperationsRole.Arn
+          SOLUTION_CONFIG_KEY: config/solution-config.json
+          # This handler writes the same state objects as ReplicationLambda, so
+          # it needs the same key or its writes downgrade them to SSE-S3.
+          KMS_KEY_ARN: !If [HasKmsKey, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
+          BATCH_JOB_FAILURE_TOPIC_ARN: !If [HasAlarmEmail, !Ref BatchJobFailureTopic, !Ref "AWS::NoValue"]
+          BATCH_JOB_FAILURE_LOG_GROUP: !Ref BatchJobFailureLogGroup
+
+  CompletionReportCheckLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasCompletionNotificationEmail
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CompletionReportCheckLambda}"
+      RetentionInDays: 90
+
+  CompletionReportCheckSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: HasCompletionNotificationEmail
+    Properties:
+      ScheduleExpression: "rate(5 minutes)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt CompletionReportCheckLambda.Arn
+        RoleArn: !GetAtt ScheduleRole.Arn
+
+  # Batch job failure monitoring: captures S3 Batch Operations job status
+  # changes via CloudTrail (requires an active trail, see deploy/README.md).
+  # SNS topic/subscription conditional on AlarmEmail.
+  BatchJobFailureLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/s3-replicate-on-tag/${AWS::StackName}/batch-job-failures"
+      RetentionInDays: 90
+
+  # Resource policy granting EventBridge permission to write to the log group.
+  BatchJobFailureResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-BatchJobFailureLogDelivery"
+      PolicyDocument: !Sub >-
+        {"Version":"2012-10-17","Statement":[{"Sid":"EventBridgeLogDelivery",
+        "Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},
+        "Action":["logs:CreateLogStream","logs:PutLogEvents"],
+        "Resource":"${BatchJobFailureLogGroup.Arn}:*"}]}
+
+  # SNS topic for email notifications (conditional on AlarmEmail).
+  BatchJobFailureTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      KmsMasterKeyId: !If [HasSnsKmsKey, !Ref SnsKmsKeyArn, !Ref "AWS::NoValue"]
+
+  BatchJobFailureSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref BatchJobFailureTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # EventBridge rule: S3 Batch Operations job status → Failed or Cancelled.
+  # Targets the log group always (raw event, for full detail/debugging);
+  # a notifier Lambda when AlarmEmail is set, which calls sns:Publish with
+  # a meaningful subject line so the email is identifiable without opening it.
+  BatchJobFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: >-
+        Captures S3 Batch Operations job status changes to Failed or Cancelled
+        via CloudTrail and delivers them to a CloudWatch log group (and
+        optionally to a Lambda that publishes a readable email notification
+        with a meaningful subject line).
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "AWS Service Event via CloudTrail"
+        detail:
+          eventName:
+            - JobStatusChanged
+          serviceEventDetails:
+            status:
+              - Failed
+              - Cancelled
+      State: ENABLED
+      Targets:
+        - Id: BatchJobFailureLogTarget
+          Arn: !GetAtt BatchJobFailureLogGroup.Arn
+        - !If
+          - HasAlarmEmail
+          - Id: BatchJobFailureLambdaTarget
+            Arn: !GetAtt BatchJobFailureNotifierFunction.Arn
+          - !Ref "AWS::NoValue"
+
+  # Permission for EventBridge to invoke the notifier Lambda.
+  BatchJobFailureNotifierPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasAlarmEmail
+    Properties:
+      FunctionName: !Ref BatchJobFailureNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BatchJobFailureRule.Arn
+
+  # Inline Lambda that receives the EventBridge event and publishes to SNS
+  # with a subject line that identifies the stack and bucket in the inbox
+  # without opening the email. EventBridge's direct-to-SNS target does not
+  # support a Subject field, which made every failure email arrive as
+  # "A replication job did not finish successfully..." — unidentifiable in
+  # an inbox with multiple stacks or buckets.
+  BatchJobFailureNotifierFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasAlarmEmail
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 30
+      Architectures: [arm64]
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref BatchJobFailureTopic
+          STACK_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          sns = boto3.client("sns")
+
+          def handler(event, context):
+              topic_arn = os.environ["TOPIC_ARN"]
+              stack_name = os.environ["STACK_NAME"]
+              detail = event.get("detail", {}).get("serviceEventDetails", {})
+              status = detail.get("status", "Unknown")
+              job_id = detail.get("jobId", "unknown")
+              region = event.get("region", "unknown")
+              account = event.get("account", "unknown")
+
+              subject = f"Batch job {status}: {stack_name} ({region})"
+              # SNS subject max 100 chars
+              if len(subject) > 100:
+                  subject = subject[:97] + "..."
+
+              message = (
+                  f"An S3 Batch Operations replication job {status.lower()} "
+                  f"in stack {stack_name} (account {account}, region {region}).\n\n"
+                  f"Job ID: {job_id}\n"
+                  f"See the job: https://{region}.console.aws.amazon.com/s3/jobs?region={region}\n\n"
+                  f"What to do: open the job above to see which objects failed "
+                  f"and why. The full event is in the {stack_name} "
+                  f"BatchJobFailureLogGroup log group in CloudWatch Logs.\n\n"
+                  f"If the job's failure reason is 'Reading the manifest is "
+                  f"forbidden' then no objects were processed, and the cause is "
+                  f"a permission gap rather than a replication problem. Batch "
+                  f"Operations reads the manifest as the job's own IAM role, "
+                  f"which this stack creates and grants s3:GetObject on the "
+                  f"State_Bucket's manifests/ prefix. This reason therefore "
+                  f"means that grant did not apply, which is a defect in the "
+                  f"deployment rather than a condition in your account: "
+                  f"compare the policy on the role named by the "
+                  f"BatchOperationsRoleArn stack output against the Batch "
+                  f"Operations job role table in docs/permissions.md. Nothing "
+                  f"about a role you own is involved.\n\n"
+                  f"The Solution retries automatically on its next run, so a "
+                  f"single failure often needs no action. If the same bucket's "
+                  f"jobs keep failing, it is paused automatically and you will "
+                  f"receive a separate email explaining how to resume it."
+              )
+
+              sns.publish(TopicArn=topic_arn, Subject=subject, Message=message)
+              return {"statusCode": 200}
+
+  # Metric filter: every event delivered to the log group counts as one failure.
+  BatchJobFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref BatchJobFailureLogGroup
+      FilterPattern: ""
+      MetricTransformations:
+        - MetricName: FailedBatchJobs
+          MetricNamespace: !Sub "${AWS::StackName}/BatchJobs"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  # Alarm: fires when sum of FailedBatchJobs > 0 in a 5-minute window.
+  # Console/dashboard visibility only — no AlarmActions (no SNS) here.
+  # BatchJobFailureRule's own SNS target (via its InputTransformer) is the
+  # actual email notification for this same underlying event; giving the
+  # alarm its own AlarmActions would send a second, less readable email
+  # (CloudWatch's generic "Threshold Crossed: 1 datapoint..." format, with
+  # no job ID or bucket name) for every failure the rule already covers.
+  BatchJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub >-
+        S3 Batch Operations job failed or cancelled in stack ${AWS::StackName}.
+        See the BatchJobFailureLogGroup CloudWatch Logs log group for the
+        full event, or the email notification (if AlarmEmail is configured)
+        for a summary with the job ID and a console link.
+      MetricName: FailedBatchJobs
+      Namespace: !Sub "${AWS::StackName}/BatchJobs"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+# Outputs
+Outputs:
+  StateBucketName:
+    Description: Name of the State_Bucket (CloudFormation-generated).
+    Value: !Ref StateBucket
+
+  SolutionConfigUri:
+    Description: S3 URI of the Solution_Config object.
+    Value: !Sub "s3://${StateBucket}/config/solution-config.json"
+
+  AthenaWorkGroupName:
+    Description: Athena workgroup used for journal queries.
+    Value: !Ref AthenaWorkGroup
+
+  ReplicationLambdaName:
+    Description: Name of the replication Lambda function.
+    Value: !Ref ReplicationLambda
+
+  ExecutionRoleArn:
+    Description: ARN of the Lambda execution role.
+    Value: !GetAtt ExecutionRole.Arn
+
+  BatchOperationsRoleArn:
+    Description: >-
+      ARN of the S3 Batch Operations job role this stack creates and passes as
+      each job's RoleArn. Name this principal in a customer-managed KMS key
+      policy when one is used (see docs/kms.md).
+    Value: !GetAtt BatchOperationsRole.Arn
+
+  BatchJobFailureAlarmArn:
+    Description: >-
+      ARN of the CloudWatch alarm for S3 Batch Operations job failures.
+      The alarm fires when a Failed or Cancelled job event is detected in a
+      5-minute window.
+    Value: !GetAtt BatchJobFailureAlarm.Arn

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools==83.0.0", "wheel==0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s3-replicate-on-tag"
+version = "1.0.0"
+description = "Backfills Amazon S3 replication for objects tagged after creation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT-0" }
+dependencies = [
+    "boto3==1.35.84",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==4.1.0",
+    "hypothesis==6.98.0",
+    # Required by tests/test_template.py and the two inline-Lambda test modules,
+    # which parse deploy/template.yaml with a SafeLoader subclass. Previously
+    # absent: the suite only collected because developer machines happened to
+    # have PyYAML installed, so a clean environment failed at import.
+    "PyYAML==6.0.3",
+    # Required by tests/test_orchestrator_window_population.py, which asserts on
+    # the persisted processed_window through a real StateStore over a
+    # moto-backed S3. Same omission as PyYAML above, repeated: the module was
+    # added without declaring the dependency, so it collected on developer
+    # machines that happened to have moto installed and failed at import in CI.
+    # No extras needed — the tests use only basic S3 operations plus conditional
+    # writes, which moto's core S3 backend covers.
+    "moto==5.1.22",
+    "ruff==0.11.13",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "ARG", "ERA", "UP"]

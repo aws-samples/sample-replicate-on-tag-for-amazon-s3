@@ -1,0 +1,273 @@
+{
+  "_comment": [
+    "Least-privilege IAM policy for the tag-based S3 replication backfill Solution.",
+    "Replace every UPPER_SNAKE_CASE placeholder with the actual value for your deployment.",
+    "Add one 'arn:aws:s3:::SOURCE_BUCKET_NAME' entry per Monitored_Bucket in your Bucket_Set.",
+    "Requirements: 12.1, 12.2, 13.1",
+    "",
+    "Placeholders used in this document:",
+    "  ACCOUNT_ID              – your 12-digit AWS account ID",
+    "  REGION                  – AWS region where the Solution runs (e.g. us-east-1)",
+    "  SOURCE_BUCKET_NAME      – name of each source S3 bucket in your Bucket_Set",
+    "  SCRATCH_BUCKET_NAME     – name of the source-side scratch/state bucket",
+    "                            (holds per-bucket state objects, manifests, and Athena results)",
+    "  ATHENA_WORKGROUP_NAME   – Athena workgroup used for journal queries (default: primary)",
+    "  BATCH_OPERATIONS_ROLE_NAME – name of the S3 Batch Operations job role the stack creates,",
+    "                            published as the BatchOperationsRoleArn stack output. One role",
+    "                            covers every source bucket, so PassBatchOperationsRole carries",
+    "                            exactly one resource entry. You do not create or edit this role.",
+    "  LF_ADMIN_ROLE_NAME      – (optional) name of an existing Lake Formation data lake",
+    "                            administrator role. Include the AssumeLFAdminRole statement only",
+    "                            when this role exists and is supplied as LFAdminRoleArn in the",
+    "                            template. When the solution self-elevates (LFAdminRoleArn is",
+    "                            empty), omit the AssumeLFAdminRole statement entirely.",
+    "  KMS_KEY_ARN             – (optional) ARN of a customer-managed KMS key used to encrypt",
+    "                            state objects and Athena query results. Only needed when",
+    "                            runtime_config.kms_key_arn is set; otherwise remove the",
+    "                            OptionalCustomerManagedKmsKey statement and rely on SSE-S3.",
+    "  JOURNAL_KMS_KEY_ARN     – (optional) ARN of a customer-managed KMS key encrypting the",
+    "                            S3 Metadata journal tables. Only needed when the journal tables",
+    "                            use SSE-KMS with a customer-managed key; otherwise omit the",
+    "                            JournalTableKmsKey statement entirely.",
+    "  METRICS_NAMESPACE       – (optional) CloudWatch namespace for custom metrics. Only needed",
+    "                            when metric publishing is enabled; otherwise remove the",
+    "                            OptionalCloudWatchMetrics statement entirely.",
+    "",
+    "  Completion tracking (per-object-version replication confirmation via the source object's",
+    "  native x-amz-replication-status header) never accesses the destination account or region —",
+    "  no sts:AssumeRole or destination-account statement is present anywhere in this policy.",
+    "  Every job writes its completion report under completion-reports/ in SCRATCH_BUCKET_NAME as",
+    "  the Batch Operations job role (BATCH_OPERATIONS_ROLE_NAME), which the stack grants",
+    "  s3:PutObject on that prefix in the role's own identity policy. That is not a grant on this",
+    "  ExecutionRole and needs no bucket policy. The ExecutionRole reads the report back via the",
+    "  existing ScratchBucketReadWrite statement below (s3:GetObject/s3:ListBucket already cover",
+    "  it); no additional ExecutionRole statement is needed to read the report.",
+    "",
+    "  Inventory-report manifests (the sole manifest generation path — In_Memory_Generation)",
+    "  are written to SCRATCH_BUCKET_NAME under the manifests/ prefix — the same bucket already",
+    "  granted in ScratchBucketReadWrite. S3 Batch Operations reads the inventory manifest.json",
+    "  as the job role (BATCH_OPERATIONS_ROLE_NAME), which the stack grants s3:GetObject on the",
+    "  manifests/ prefix and, when KMS_KEY_ARN is set, kms:Decrypt / kms:GenerateDataKey /",
+    "  kms:DescribeKey on that key. Both grants are stack-owned; there is nothing to add here.",
+    "",
+    "NO DynamoDB actions are present — state is stored in the scratch/state S3 bucket.",
+    "NO destination-account or destination-region access is present — delivery is performed",
+    "by the source bucket's existing replication configuration."
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadSourceBucketReplicationConfig",
+      "_comment": "Required for Rule_Deriver: reads each source bucket's existing Replication_Configuration to derive tag-scoped rules. (Requirement 3.1, 12.1) ListBucket is required so that the completion-tracking Source_Status_Check's HeadObject on a deleted object version returns 404 rather than AccessDenied (403): S3 masks object existence from a caller without ListBucket, and a 403 is indistinguishable from a transient access failure, so the object would be re-checked every run forever and its Tracked_Object would never leave the state object. (Requirement 3.7)",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetReplicationConfiguration",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::SOURCE_BUCKET_NAME"
+      ]
+    },
+    {
+      "Sid": "ReadSourceObjectTags",
+      "_comment": "Sid retained for continuity; this statement no longer grants tagging actions. It covers exactly one call: the completion-tracking Source_Status_Check's HeadObject against a source object version. Both actions are needed because S3 evaluates a version-qualified HeadObject (VersionId set) against GetObjectVersion and an unqualified one against GetObject. s3:GetObjectTagging and s3:InitiateReplication were removed as unreachable: nothing in src/ calls GetObjectTagging, because object tags reach this Solution through the S3 Metadata journal via Athena rather than by reading tags off the object; and InitiateReplication belongs to the S3 Batch Replication job role, which is the stack-created role passed as create_job's RoleArn, not to this role, which only submits the job (s3-batch-replication-policies.html). (Requirement 12.1, 12.4; replication-completion-tracking 3.1)",
+      "Effect": "Allow",
+      "Action": [
+
+        "s3:GetObject",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": [
+        "arn:aws:s3:::SOURCE_BUCKET_NAME/*"
+      ]
+    },
+    {
+      "Sid": "AthenaJournalQuery",
+      "_comment": "Required for Journal_Monitor: submit and retrieve Athena queries against the S3 Metadata journal table. (Requirement 4.1, 12.1, 12.3)",
+      "Effect": "Allow",
+      "Action": [
+        "athena:StartQueryExecution",
+        "athena:GetQueryExecution",
+        "athena:GetQueryResults",
+        "athena:GetDataCatalog"
+      ],
+      "Resource": [
+        "arn:aws:athena:REGION:ACCOUNT_ID:workgroup/ATHENA_WORKGROUP_NAME",
+        "arn:aws:athena:REGION:ACCOUNT_ID:datacatalog/s3tablescatalog"
+      ]
+    },
+    {
+      "Sid": "S3TablesJournalRead",
+      "_comment": "Required for Athena to resolve and query the S3 Metadata journal via the s3tablescatalog connector. Scoped to the AWS-managed table bucket (aws-s3): confirmed against the AWS Service Authorization Reference (list_s3tables.html) that GetTableBucket/GetNamespace/ListNamespaces/GetTable/ListTables/GetTableMetadataLocation/GetTableData all accept a TableBucket or Table resource-level ARN. The Table ARN has no namespace segment (namespace is a resource attribute filtered by the s3tables:namespace condition key, not part of the ARN path), so this is bucket-scoped rather than per-source-bucket-namespace scoped.",
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:GetTableBucket",
+        "s3tables:GetNamespace",
+        "s3tables:ListNamespaces",
+        "s3tables:GetTable",
+        "s3tables:ListTables",
+        "s3tables:GetTableMetadataLocation",
+        "s3tables:GetTableData"
+      ],
+      "Resource": [
+        "arn:aws:s3tables:REGION:ACCOUNT_ID:bucket/aws-s3",
+        "arn:aws:s3tables:REGION:ACCOUNT_ID:bucket/aws-s3/table/*"
+      ]
+    },
+    {
+      "Sid": "LakeFormationDataAccess",
+      "_comment": "lakeformation:GetDataAccess genuinely has no resource-level ARN — confirmed against the AWS Service Authorization Reference (list_lakeformation.html): 'AWS Lake Formation does not support specifying a resource ARN in the Resource element of an IAM policy statement', for every action in the service.",
+      "Effect": "Allow",
+      "Action": [
+        "lakeformation:GetDataAccess"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "GlueFederatedS3TablesCatalog",
+      "_comment": "Required for Athena to resolve s3tablescatalog/aws-s3. Scoped to the federated s3tablescatalog catalog and the aws-s3 table bucket's databases/tables, using the documented federated ARN shapes from the AWS Lake Formation IAM-to-LF migration guide (change-access-lf-to-iam.html: catalog/s3tablescatalog, database/s3tablescatalog/<table-bucket>/<namespace>, table/s3tablescatalog/<table-bucket>/<namespace>/*). The federated shape is documented, not an exception to standard Glue ARN patterns — the prior comment claiming the format 'does not match standard' patterns was incorrect. GetCatalogs additionally needs the bare account-root catalog ARN to enumerate catalogs.",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase",
+        "glue:GetDatabases",
+        "glue:GetTable",
+        "glue:GetTables",
+        "glue:GetPartitions",
+        "glue:GetCatalog",
+        "glue:GetCatalogs",
+        "glue:SearchTables"
+      ],
+      "Resource": [
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog",
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog/s3tablescatalog",
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog/s3tablescatalog/aws-s3",
+        "arn:aws:glue:REGION:ACCOUNT_ID:database/s3tablescatalog/aws-s3/*",
+        "arn:aws:glue:REGION:ACCOUNT_ID:table/s3tablescatalog/aws-s3/*"
+      ]
+    },
+    {
+      "Sid": "ScratchBucketReadWrite",
+      "_comment": "Required for: (1) State Store — conditional GetObject/PutObject (If-Match / If-None-Match) on per-bucket state objects at state/<bucket>.json; (2) Manifest_Generator — write and read manifest CSV objects; (3) Athena — write and read query result objects. ListBucket is required so that GetObject on a non-existent checkpoint key returns NoSuchKey (404) rather than AccessDenied (403). PutObject covers both unconditional and conditional (If-Match / If-None-Match) writes: S3 evaluates the conditional header server-side; no separate IAM action is required. (Requirements 4.3, 6.4, 9.1, 9.3, 9.4, 12.1)",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:GetBucketAcl",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": [
+        "arn:aws:s3:::SCRATCH_BUCKET_NAME",
+        "arn:aws:s3:::SCRATCH_BUCKET_NAME/*"
+      ]
+    },
+    {
+      "Sid": "S3BatchOperationsCreateJob",
+      "_comment": "Required for Batch_Job_Manager: CreateJob creates the Batch_Replication_Job. PutJobTagging is required when tags are attached to the job at creation time. DescribeJob is required for the failed-job recovery check (Req 4.1). Jobs are created with ConfirmationRequired=False so no UpdateJobStatus is needed.",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateJob",
+        "s3:PutJobTagging",
+        "s3:DescribeJob"
+      ],
+      "Resource": [
+        "arn:aws:s3:REGION:ACCOUNT_ID:job/*"
+      ]
+    },
+    {
+      "Sid": "PassBatchOperationsRole",
+      "_comment": "Required for Batch_Job_Manager: pass the stack-created S3 Batch Operations job role to the job. s3control:CreateJob authorizes this at create time and fails with AccessDenied on iam:PassRole without it, so the grant is load-bearing. Scoped to that one role ARN, which the template supplies with !GetAtt rather than discovering at deploy time, so no externally supplied ARN reaches iam:PassRole. The customer's replication role is never passed to a job. The iam:PassedToService condition is omitted because CreateJob does not populate that context key: a statement carrying the condition denies and job creation fails. Do NOT add it. Measured in the test account with assumed-role credentials — see .holmes/accepted-risks.md AR8 for the result table and the testing traps. In the deployed stack this statement is the standalone PassBatchOperationsRolePolicy resource, not part of the ExecutionRole inline policy, so that neither role depends on the other.",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::ACCOUNT_ID:role/BATCH_OPERATIONS_ROLE_NAME"
+      ]
+    },
+    {
+      "Sid": "OptionalCustomerManagedKmsKey",
+      "_comment": "OPTIONAL — include only when a customer-managed KMS key is configured (runtime_config.kms_key_arn). Required for the State Store to write/read SSE-KMS state objects, for Athena to encrypt query results with SSE-KMS, and for the inventory manifest.json + manifest.checksum written by the In_Memory_Generation path, which are also SSE-KMS under this key. The manifest encryption is NOT declared to s3control:CreateJob — JobManifestLocation has no such member — so S3 Batch Operations decrypts the manifest using the job's RoleArn, which means the Batch Operations job role also needs kms:Decrypt on this key; the stack grants that itself via BatchOperationsRoleKmsPolicy (see docs/kms.md). Verified end to end: a job whose manifest.json was SSE-KMS read it and completed. Remove this statement entirely if you rely on SSE-S3 / bucket-default encryption. (Requirements 4.3, 6.4, 7.1, 7.2, 9.1)",
+      "Effect": "Allow",
+      "Action": [
+        "kms:GenerateDataKey",
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Resource": [
+        "KMS_KEY_ARN"
+      ]
+    },
+    {
+      "Sid": "OptionalCloudWatchMetrics",
+      "_comment": "OPTIONAL — include only when metrics_namespace is configured (runtime_config.metrics_namespace / METRICS_NAMESPACE env var). cloudwatch:PutMetricData has no resource-level ARN, so Resource is '*' and the grant is scoped by the cloudwatch:namespace condition to the configured namespace. Remove this statement entirely when metrics are not enabled. (CloudWatch metrics feature, Requirements: 6.1, 6.2, 6.7)",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": ["*"],
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "METRICS_NAMESPACE"
+        }
+      }
+    },
+    {
+      "Sid": "JournalTableKmsKey",
+      "_comment": "Required only when the S3 Metadata journal tables are encrypted with a customer-managed KMS key. If SSE-S3 or an AWS-managed key is used, remove this statement. (Requirement 1.3)",
+      "Effect": "Allow",
+      "Action": [
+        "kms:GenerateDataKey",
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Resource": [
+        "arn:aws:kms:REGION:ACCOUNT_ID:key/JOURNAL_KMS_KEY_ARN"
+      ]
+    },
+    {
+      "Sid": "LFGranterRolePolicy",
+      "_comment": "Applies to LFGranterRole (the CloudFormation-provisioned LF Granter Lambda role), NOT the ExecutionRole. lakeformation:PutDataLakeSettings and lakeformation:GetDataLakeSettings (needed only for the CreateOwnLFAdmin path, when LFAdminRoleArn is not supplied) and GrantPermissions/RevokePermissions/GetDataAccess genuinely have no resource-level ARN — confirmed against the AWS Service Authorization Reference (list_lakeformation.html): 'AWS Lake Formation does not support specifying a resource ARN in the Resource element of an IAM policy statement', for every action in the service. GetDataAccess is required because glue:GetCatalog on the s3tablescatalog federated catalog triggers LF credential vending, which checks the caller has lakeformation:GetDataAccess. glue:GetCatalog and the s3tables actions below DO have resource-level ARNs and are scoped in the two statements below. (Requirements: 3.2)",
+      "Effect": "Allow",
+      "Action": [
+        "lakeformation:GetDataLakeSettings",
+        "lakeformation:PutDataLakeSettings",
+        "lakeformation:GrantPermissions",
+        "lakeformation:RevokePermissions",
+        "lakeformation:GetDataAccess"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "LFGranterGlueCatalog",
+      "_comment": "Applies to LFGranterRole. glue:GetCatalog scoped to the federated s3tablescatalog catalog ARN (change-access-lf-to-iam.html's documented federated shape) plus the bare account-root catalog ARN. GetCatalog on a nested federated catalog id is authorized by Glue against the root catalog ARN, not only the child ARNs — the observed AccessDeniedException names arn:aws:glue:REGION:ACCOUNT_ID:catalog as the resource. The root ARN is a single fixed resource per account, not a wildcard; the ExecutionRole's GlueFederatedS3TablesCatalog statement includes it for the same reason. glue:GetDatabase and glue:GetTable are required to issue the grants themselves, not to read data: every principal that grants or revokes Lake Formation permissions by the named-resource method needs glue:GetDatabase on the named database or glue:GetTable on the named table, data lake administrators included, so the LFAdminGranterSetup admin registration does not substitute for them (required-permissions-for-grant.html). Without them GrantPermissions fails with 'Insufficient Glue permissions to access database b_<bucket>'. The granter grants on a Database resource and a Table resource per source bucket and revokes the same two on stack delete, so both actions are needed. (Requirements: 3.2)",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetCatalog",
+        "glue:GetDatabase",
+        "glue:GetTable"
+      ],
+      "Resource": [
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog",
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog/s3tablescatalog",
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog/s3tablescatalog/aws-s3",
+        "arn:aws:glue:REGION:ACCOUNT_ID:database/s3tablescatalog/aws-s3/*",
+        "arn:aws:glue:REGION:ACCOUNT_ID:table/s3tablescatalog/aws-s3/*"
+      ]
+    },
+    {
+      "Sid": "AssumeLFAdminRole",
+      "_comment": "Optional — include only when an LFAdminRoleArn is supplied. When the solution self-elevates (LFAdminRoleArn is empty), this statement is omitted entirely. The ARN is the value supplied as the LFAdminRoleArn parameter in the CloudFormation template. (Requirement 2.3)",
+      "Effect": "Allow",
+      "Action": [
+        "sts:AssumeRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::ACCOUNT_ID:role/LF_ADMIN_ROLE_NAME"
+      ]
+    }
+  ]
+}
