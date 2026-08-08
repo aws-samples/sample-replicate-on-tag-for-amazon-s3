@@ -49,6 +49,7 @@ Per source account and Region. Everything here is a condition on your account or
 - **The S3 Tables analytics-services integration** enabled in the Region, which creates the `s3tablescatalog` Glue catalog that Athena reads the journal through. One-time per account and Region, via S3 console → Table buckets → Enable integration. [`deploy/README.md`](deploy/README.md#prerequisites) has the `aws glue create-catalog` equivalent.
 - **An active CloudTrail trail** capturing management events in the Region, required only if you set `AlarmEmail`. Batch Operations job-status events reach EventBridge through CloudTrail, so without a trail those alerts never fire. Replication itself is unaffected.
 - **Customer-managed KMS keys**, optional. See [Customer-Managed KMS Keys](docs/kms.md).
+- **VPC connectivity**, only when deploying the Lambda into a VPC. The subnets must route to S3, Athena, and CloudWatch (via gateway or interface VPC endpoints, or a NAT gateway). Leave the VPC parameters empty to deploy outside a VPC, which needs no additional networking setup.
 
 ## Getting Started
 
@@ -78,7 +79,7 @@ The role that each S3 Batch Operations job runs as is not a parameter. The stack
 |---|---|---|
 | `CheckFrequencyMinutes` | 15 | How often the Solution runs, in minutes (15–1440). Because S3 Batch Operations charges per job, smaller values can raise cost, most of all when tagging activity is spread over time rather than arriving in a single batch |
 | `CompletionNotificationEmail` | _(empty)_ | Email address for per-object replication tracking and completion email reports. The S3 Batch Operations completion report CSV is always written to the State Bucket; this parameter gates the per-object `x-amz-replication-status` tracking, the SNS email, and the report-missing alert only (see [Completion Reporting](#completion-reporting)) |
-| `AlarmEmail` | _(empty)_ | Email address for Batch Operations job-failure and bucket-disabled alerts. Leave empty to disable alerting; no SNS topic is provisioned (see [Monitoring](#monitoring)) |
+| `AlarmEmail` | _(empty)_ | Email address for run-failure, Batch Operations job-failure, and bucket-disabled alerts. Leave empty to disable alerting; no SNS topic is provisioned (see [Monitoring](#monitoring)) |
 | `MetricsNamespace` | _(empty)_ | CloudWatch namespace to publish metrics under, any name you choose, e.g. `S3ReplicateOnTag`. CloudWatch creates it on first publish; names starting with `AWS/` are reserved. Leave empty to disable metrics |
 | `KmsKeyArn` | _(empty)_ | Customer-managed KMS key ARN; leave empty for SSE-S3. See [Customer-Managed KMS Keys](docs/kms.md) |
 | `JournalReadRowCap` | 500,000 | Max tagging operations processed in one interval, and the single scale knob bounding in-memory manifest size. Raise it only alongside `LambdaMemoryMB` (see [Configuration](#configuration)) |
@@ -183,11 +184,17 @@ Set `MetricsNamespace` and the Solution publishes six per-bucket and run-level c
 
 Some are withheld for an idle bucket rather than published as a zero, to avoid paying for a flat series (see [CloudWatch metric charges](docs/cost.md#cloudwatch-metric-charges)), so a missing data point carries meaning. [Monitoring Reference](docs/monitoring.md#cloudwatch-metrics) has each metric's dimension and publish condition, followed by the alarm recipes that depend on them, including how to catch a bucket that silently stopped being processed.
 
+### Run failure alerts
+
+A `ReplicationLambdaErrorAlarm` alarm covers the run itself failing, as opposed to a job failing after a run submitted it. It watches the function's CloudWatch `Errors` metric, so it catches an unhandled exception, a timeout, and an init failure such as a code package with the wrong layout. While it is in alarm, no tagging activity is being processed at all.
+
+The alarm is always created, and emails the `AlarmEmail` address when one is set, including when the runs recover. It reads the native Lambda metric rather than the Solution's own log entries, because an init failure produces none: the module never imports. Its ARN is the `ReplicationLambdaErrorAlarmArn` output.
+
 ### Batch job failure alerts
 
 Set `AlarmEmail` to be notified when an S3 Batch Operations job fails or is cancelled. The stack creates an SNS topic, an email subscription, and an EventBridge rule that sends one readable email per failed or cancelled job, carrying the job ID, its status, and a console link. This requires an active CloudTrail trail capturing management events in the stack's Region (see [Verifying the CloudTrail trail](deploy/README.md#verifying-the-cloudtrail-trail)). Leave `AlarmEmail` empty to disable alerting; no SNS topic is provisioned. A CloudWatch alarm on the same event exists for console and dashboard visibility and does not send its own email.
 
-Two other alerts go to the same address. The bucket-disabled notification names the bucket, the cause, and the exact recovery step. The submission-failure alert names the bucket, the operation (`CreateJob`), and the validation error; it fires once per episode and is suppressed while the same failure persists, and a successful submission clears the suppression so a recurrence after a fix is reported again. Both are always written to the `BatchJobFailureLogGroup` CloudWatch log group even when `AlarmEmail` is not set.
+Three other alerts go to the same address. The run failure alarm above is one. The bucket-disabled notification names the bucket, the cause, and the exact recovery step. The submission-failure alert names the bucket, the operation (`CreateJob`), and the validation error; it fires once per episode and is suppressed while the same failure persists, and a successful submission clears the suppression so a recurrence after a fix is reported again. Both are always written to the `BatchJobFailureLogGroup` CloudWatch log group even when `AlarmEmail` is not set.
 
 ### Diagnosing task failures
 

@@ -4,6 +4,58 @@ Description: >-
   function, EventBridge Scheduler schedule, State_Bucket, Athena workgroup, and
   least-privilege IAM roles.
 
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required
+        Parameters:
+          - CodeLocation
+          - SourceBucketNames
+      - Label:
+          default: Recommended — observability
+        Parameters:
+          - MetricsNamespace
+          - MetricsDeploymentId
+          - AlarmEmail
+          - CompletionNotificationEmail
+      - Label:
+          default: Processing
+        Parameters:
+          - CheckFrequencyMinutes
+          - LifecycleExpirationDays
+          - JournalLookbackSeconds
+      - Label:
+          default: Scale and performance
+        Parameters:
+          - LambdaMemoryMB
+          - LambdaTimeoutSeconds
+          - JournalReadRowCap
+          - ReinvocationChainLimit
+          - CompletionCheckMemoryMB
+      - Label:
+          default: Resilience
+        Parameters:
+          - MaxBatchJobFailures
+          - CompletionCheckBatchSize
+          - CompletionItemTtlHours
+      - Label:
+          default: Encryption
+        Parameters:
+          - KmsKeyArn
+          - JournalKmsKeyArn
+          - SnsKmsKeyArn
+      - Label:
+          default: Networking (VPC)
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - SecurityGroupIds
+      - Label:
+          default: Lake Formation
+        Parameters:
+          - LFAdminRoleArn
+
 # Parameters — full descriptions live in deploy/README.md (Parameter Reference).
 Parameters:
   CodeLocation:
@@ -256,6 +308,10 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns: !If
+        - HasVpc
+        - - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Ref "AWS::NoValue"
       Policies:
         - PolicyName: ReplicationSolutionPolicy
           PolicyDocument:
@@ -1205,7 +1261,8 @@ Resources:
       KmsKeyArn: !If [HasKmsKey, !Ref KmsKeyArn, ""]
 
   # Parses s3://bucket/key CodeLocation (robust for keys with prefixes,
-  # which intrinsics can't extract). Pure string parsing — logs only.
+  # which intrinsics can't extract) and checks the referenced zip has this
+  # Solution's expected layout before the stack builds a Lambda around it.
   CodeLocationParserRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1227,7 +1284,48 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+        # Read-only, and scoped to the one bucket CodeLocation names rather
+        # than to *. The bucket is extractable with intrinsics even though the
+        # key is not: AllowedPattern on CodeLocation guarantees the value is
+        # s3://<bucket>/<key>.zip, so element 2 of a "/" split is always the
+        # bucket. Object-level scoping is deliberately not attempted here,
+        # because reproducing the key parse in a static policy is the fragile
+        # part, and a mis-parse would surface as an opaque AccessDenied.
+        - PolicyName: CodeLocationParserReadPackage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - "arn:aws:s3:::${CodeBucket}/*"
+                  - CodeBucket: !Select [2, !Split ["/", !Ref CodeLocation]]
 
+  # Two failure modes are treated differently on purpose.
+  #
+  # A zip that is readable and demonstrably wrong fails the stack, because the
+  # alternative is what this check exists to prevent: CREATE_COMPLETE on all
+  # resources, every output populated, and a Lambda that raises
+  # ImportModuleError on every scheduled run forever. The common cause is
+  # uploading GitHub's auto-generated "Source code (zip)" asset, which nests
+  # the tree under <repo>-<version>/ so src.lambda_handler is unimportable,
+  # instead of the release's package-<version>.zip.
+  #
+  # A zip that cannot be read is a warning, and the stack proceeds. The role
+  # holds no kms:Decrypt (there is no parameter naming the code bucket's key),
+  # so an SSE-KMS code bucket, a restrictive bucket policy, or a cross-account
+  # code bucket all yield AccessDenied here. Failing closed on those would turn
+  # this guard into a deploy blocker for configurations that work fine, so the
+  # rule is: fail on proven wrong, skip on cannot determine.
+  #
+  # This is a misconfiguration guard, not an integrity control. It shows the
+  # package is shaped like this Solution's, not that it is authentic. Anyone
+  # who can write to the code bucket can satisfy it. Authenticity remains the
+  # published .sha256 and the verification step in deploy/README.md.
+  #
+  # Object contents are never logged or returned in the response Data, which
+  # is visible in stack events; only the marker verdict and, at most, a single
+  # shared top-level prefix are reported.
   CodeLocationParserFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -1235,12 +1333,50 @@ Resources:
       Handler: index.handler
       Role: !GetAtt CodeLocationParserRole.Arn
       Timeout: 30
+      # Holds the raw zip in memory to read its central directory. 512 MiB
+      # gives headroom over the MAX_BYTES read ceiling below; the default
+      # 128 MiB would not. Runs only during stack create/update.
+      MemorySize: 512
       Architectures: [arm64]
       Code:
         ZipFile: |
+          import io
+          import zipfile
           from urllib.parse import urlparse
 
+          import boto3
           import cfnresponse  # auto-provided for inline ZipFile Lambdas; do not bundle
+
+          MARKER = "src/lambda_handler.py"
+          MAX_BYTES = 67108864  # bound the in-memory read; a real package is ~200 KiB
+
+
+          def describe(names):
+              tops = {n.split("/")[0] for n in names if n.strip("/")}
+              if len(tops) == 1:
+                  return (
+                      "every entry is nested under '%s/'. That is GitHub's auto-generated"
+                      " 'Source code' archive, not the release's package-<version>.zip."
+                      % tops.pop()
+                  )
+              return "it has no %s at its root." % MARKER
+
+
+          def find_problem(bucket, key):
+              """Describe why the zip is unusable, or return None if it is fine.
+
+              Raises on failure to read the object, which the caller treats as
+              'cannot determine' rather than as a problem with the package.
+              """
+              s3 = boto3.client("s3")
+              if s3.head_object(Bucket=bucket, Key=key)["ContentLength"] > MAX_BYTES:
+                  return None
+              body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+              try:
+                  names = zipfile.ZipFile(io.BytesIO(body)).namelist()
+              except zipfile.BadZipFile:
+                  return "it is not a valid zip archive."
+              return None if MARKER in names else describe(names)
 
 
           def handler(event, context):
@@ -1254,9 +1390,20 @@ Resources:
                   key = parts.path.lstrip("/")
                   if parts.scheme != "s3" or not bucket or not key:
                       raise Exception("CodeLocation must be s3://bucket/key, got: " + loc)
+                  try:
+                      problem = find_problem(bucket, key)
+                  except Exception as exc:
+                      print("WARN cannot read %s, skipping layout check: %s" % (loc, exc))
+                      problem = None
+                  if problem:
+                      raise Exception(
+                          "%s is not a usable Lambda code package: %s Download"
+                          " package-<version>.zip from the project's Releases page and"
+                          " upload that instead." % (loc, problem)
+                      )
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Bucket": bucket, "Key": key}, physicalResourceId="codeloc")
               except Exception as exc:  # signal failure so the stack fails fast
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, physicalResourceId="codeloc", reason=str(exc)[:900])
                   raise
 
   # Log group for CodeLocationParserFunction.
@@ -1661,6 +1808,68 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  # Alarm: ReplicationLambda itself failed to complete a run.
+  #
+  # Distinct from BatchJobFailureAlarm above, which reports a batch job that
+  # failed after a run submitted it successfully. This one covers the run never
+  # working at all: an unhandled exception, a timeout, or an init failure such
+  # as Runtime.ImportModuleError from a code package with the wrong layout.
+  # Nothing else in the stack observes that. Without this alarm the Solution can
+  # fail on every scheduled invocation indefinitely while every resource reports
+  # healthy, which is only visible by opening CloudWatch Logs.
+  #
+  # Uses the native AWS/Lambda Errors metric rather than a log metric filter,
+  # because an init failure never reaches the Solution's own logging: the module
+  # does not import, so no structured entry is ever emitted. Errors counts it.
+  #
+  # Unlike BatchJobFailureAlarm this alarm does set AlarmActions. That alarm is
+  # visibility-only because BatchJobFailureRule already emails a more readable
+  # version of the same event. There is no equivalent path for a Lambda failure,
+  # so leaving the actions off would reproduce the gap being closed here.
+  #
+  # TreatMissingData is missing, not notBreaching. Invocations are sparse: at
+  # the default CheckFrequencyMinutes of 15 only one 5-minute period in three
+  # carries a datapoint, so notBreaching would read each empty period as a
+  # recovery and re-alarm on the next failing run, emailing on every cycle.
+  # Retaining state across the gaps yields one notification when runs start
+  # failing and one when they recover, at any CheckFrequencyMinutes.
+  #
+  # Throttles are deliberately not alarmed on: ReservedConcurrentExecutions is 1
+  # by design, so a throttle means a scheduled trigger arrived while the
+  # previous run was still going, which the next trigger resolves.
+  ReplicationLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub >-
+        ReplicationLambda failed to complete a run in stack ${AWS::StackName}.
+        No tagging activity is being processed while this persists. Check the
+        function's CloudWatch Logs log group for the failure. A
+        Runtime.ImportModuleError means the CodeLocation zip has the wrong
+        layout: it must contain src/lambda_handler.py at its root, which the
+        release's package-<version>.zip provides and the auto-generated Source
+        code archive does not.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReplicationLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: !If
+        - HasAlarmEmail
+        - [!Ref BatchJobFailureTopic]
+        - !Ref "AWS::NoValue"
+      # Recovery is worth an email for an alarm that means nothing is being
+      # replicated, and TreatMissingData: missing keeps it to one.
+      OKActions: !If
+        - HasAlarmEmail
+        - [!Ref BatchJobFailureTopic]
+        - !Ref "AWS::NoValue"
+
 # Outputs
 Outputs:
   StateBucketName:
@@ -1696,3 +1905,11 @@ Outputs:
       The alarm fires when a Failed or Cancelled job event is detected in a
       5-minute window.
     Value: !GetAtt BatchJobFailureAlarm.Arn
+
+  ReplicationLambdaErrorAlarmArn:
+    Description: >-
+      ARN of the CloudWatch alarm for ReplicationLambda run failures. The alarm
+      fires when the function records an invocation error, meaning a scheduled
+      run did not complete and no tagging activity was processed. Notifies the
+      AlarmEmail address when one is set.
+    Value: !GetAtt ReplicationLambdaErrorAlarm.Arn

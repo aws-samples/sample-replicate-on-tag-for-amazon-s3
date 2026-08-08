@@ -52,6 +52,40 @@ and means this role's manifest grant did not apply. Since the stack owns the
 grant, that is a defect in the deployment rather than a condition in your
 account.
 
+## Code package validation role
+
+Before the stack builds a Lambda around the zip that `CodeLocation` names, a
+custom resource reads that zip and checks it contains `src/lambda_handler.py` at
+its root. A package missing that entry fails the stack, rather than reaching
+`CREATE_COMPLETE` with a Lambda that raises `ImportModuleError` on every
+scheduled run. The usual cause is uploading the auto-generated
+**Source code (zip)** asset from the Releases page, which nests everything under
+a version directory, instead of `package-<version>.zip`.
+
+| Grant | Resource | Needed for |
+|---|---|---|
+| `s3:GetObject` | The bucket named in `CodeLocation` | Reading the package to check its layout |
+
+This role runs only during stack create and update, and holds nothing else
+beyond writing its own logs.
+
+The check is skipped, and the stack proceeds, whenever the object cannot be
+read. The role carries no `kms:Decrypt`, because no parameter names the code
+bucket's key, so a code bucket encrypted with a customer-managed key returns
+`AccessDenied` here. A cross-account code bucket or a restrictive bucket policy
+does the same. Failing the deployment in those cases would block configurations
+that work correctly, so the rule is to fail on a package proven wrong and skip
+when the layout cannot be determined. A skip is recorded as a `WARN` line in the
+custom resource's own log group and does not appear in stack events, so on a
+deployment using an encrypted or cross-account code bucket, treat the package as
+unverified and rely on the checksum step in
+[Verify the Checksum](../deploy/README.md#2-verify-the-checksum).
+
+This is a guard against the wrong file, not an integrity control. It shows the
+package is shaped like this Solution's, not that it is authentic. Anyone who can
+write to the code bucket can satisfy it. Authenticity remains the published
+`.sha256` asset and that same verification step.
+
 ## Lake Formation accounts
 
 When the `s3tablescatalog/aws-s3` Glue catalog is governed by AWS Lake Formation

@@ -21,6 +21,8 @@ The Solution emits structured JSON log entries. All entries include a `timestamp
 | `submission_failure_permanent` | `CreateJob` is rejected before the request is sent: `source_bucket`, `operation`, `cause` |
 | `completion_report_missing` | A terminal job's completion report never appeared: `source_bucket`, `replication_config_id`, `job_id`, `cause` |
 
+A run that fails before the handler executes emits none of these. An init failure such as `Runtime.ImportModuleError` from a code package with the wrong layout appears only as a Lambda runtime error in the log group, with no structured entry, so the absence of `interval_summary` is the signal. `ReplicationLambdaErrorAlarm` covers that case (see [Run failure alerts](../README.md#run-failure-alerts)).
+
 ## Audit actions
 
 Every `audit` log entry carries an `action` naming what happened, a `source_bucket`, and action-specific fields.

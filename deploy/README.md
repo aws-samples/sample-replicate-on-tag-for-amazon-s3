@@ -76,8 +76,9 @@ Required only when `AlarmEmail` is set. The `BatchJobFailureRule` EventBridge ru
 captures S3 Batch Operations job status changes delivered via CloudTrail (`AWS
 Service Event via CloudTrail`, `eventName: JobStatusChanged`). Those events reach
 the default event bus only when a trail recording management events is active in
-the same Region as the stack, so without one the alerts never fire even though
-batch jobs are failing. Replication processing is unaffected either way.
+the same Region as the stack, so without one those alerts never fire even though
+batch jobs are failing. Replication processing is unaffected either way, and the
+run-failure alarm needs no trail because it reads a CloudWatch metric.
 
 Check in the CloudTrail console: **Trails → select trail → Management events →
 All**. If no trail exists, create one scoped to the stack Region.
@@ -172,7 +173,7 @@ When either KMS parameter is set, the key policy must grant the `ExecutionRole` 
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `AlarmEmail` | _(empty)_ | Email address for S3 Batch Operations job failure notifications. When set, creates an SNS topic and an email subscription; a failed or cancelled batch job sends one readable email with the job ID, status, and a console link. A CloudWatch alarm on the same event exists for console/dashboard visibility but does not itself send email. Requires an active CloudTrail trail in the stack Region (see [Verifying the CloudTrail trail](#verifying-the-cloudtrail-trail)) |
+| `AlarmEmail` | _(empty)_ | Email address for run-failure and S3 Batch Operations job-failure notifications. When set, creates an SNS topic and an email subscription; a failed or cancelled batch job sends one readable email with the job ID, status, and a console link. A CloudWatch alarm on the same event exists for console/dashboard visibility but does not itself send email. The separate `ReplicationLambdaErrorAlarm` does email this address when a scheduled run fails outright, and again when runs recover. Requires an active CloudTrail trail in the stack Region for the batch job events only (see [Verifying the CloudTrail trail](#verifying-the-cloudtrail-trail)) |
 | `MaxBatchJobFailures` | `4` | Consecutive S3 Batch Operations job failures (`Failed` or `Cancelled`) for a bucket's job before the Solution disables that bucket in `solution-config.json`. Prevents runaway per-job costs from a bucket whose job keeps failing; the failure counter resets on the first successful (`Complete`) job |
 
 **Completion tracking**
@@ -391,13 +392,13 @@ parameter and deploy a stack update. The custom resource rewrites the
 - **Why the code is in S3, not embedded in the template:** the Lambda code is
   delivered as an S3 zip referenced by `CodeLocation`, not inlined in
   `template.yaml`. CloudFormation's only inline-code mechanism,
-  `AWS::Lambda::Function` `Code.ZipFile`, is capped at 4,096 characters and a
-  single file, so a multi-module package cannot be inlined. Staging the template
-  in S3 raises the template size limit to 1 MiB but does not change this: inline
-  code is still limited to one 4,096-character file. The template uses `ZipFile`
-  only for the small single-file custom-resource Lambdas. Keeping the application
-  code in S3 also lets you update or version it independently of the template and
-  verify it against the release's `.sha256` asset.
+  `AWS::Lambda::Function` `Code.ZipFile`, places the source in a single file
+  named `index`, so a package split across modules cannot be inlined at any
+  size. Staging the template in S3 raises the template size limit from 51,200
+  bytes to 1 MiB but does not change that. The template uses `ZipFile` only for
+  the small single-file custom-resource Lambdas. Keeping the application code in
+  S3 also lets you update or version it independently of the template and verify
+  it against the release's `.sha256` asset.
 
 ## Multiple Accounts and Regions
 

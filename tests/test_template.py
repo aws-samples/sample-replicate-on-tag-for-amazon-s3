@@ -1311,7 +1311,15 @@ class TestCodeLocationParser:
             )
 
     def test_parser_role_has_no_broad_permissions(self, resources):
-        """The parser does pure string work — its role should grant only logs."""
+        """The parser writes logs and reads the one code package it validates.
+
+        s3:GetObject is the only non-logs action, and it is deliberate: the
+        parser checks the zip has src/lambda_handler.py at its root before the
+        stack builds a Lambda around it. Nothing else belongs on this role, so
+        any addition here should be a considered change rather than a drive-by.
+        See tests/test_code_location_parser.py for the scoping assertions.
+        """
+        allowed = {"s3:getobject"}
         role = resources.get("CodeLocationParserRole", {})
         actions = set()
         for policy in role.get("Properties", {}).get("Policies", []):
@@ -1320,9 +1328,29 @@ class TestCodeLocationParser:
                 if isinstance(acts, str):
                     acts = [acts]
                 actions.update(a.lower() for a in acts if isinstance(a, str))
-        assert actions and all(a.startswith("logs:") for a in actions), (
-            f"CodeLocationParserRole should grant only logs actions; got {actions}"
+        unexpected = {a for a in actions if not a.startswith("logs:")} - allowed
+        assert actions and not unexpected, (
+            f"CodeLocationParserRole grants unexpected actions: {unexpected}"
         )
+
+    def test_parser_role_read_grant_is_not_wildcarded(self, resources):
+        """The s3:GetObject grant must never widen to all buckets."""
+        role = resources.get("CodeLocationParserRole", {})
+        for policy in role.get("Properties", {}).get("Policies", []):
+            for stmt in policy.get("PolicyDocument", {}).get("Statement", []):
+                acts = stmt.get("Action", [])
+                if isinstance(acts, str):
+                    acts = [acts]
+                if not any(str(a).lower().startswith("s3:") for a in acts):
+                    continue
+                resource = stmt.get("Resource")
+                assert resource != "*", "s3 grant must not use Resource: *"
+                if isinstance(resource, _CfnTag) and resource.tag == "!Sub":
+                    arn = resource.value[0] if isinstance(resource.value, list) else resource.value
+                    assert arn != "arn:aws:s3:::*"
+                    assert "${CodeBucket}" in arn, (
+                        f"s3 grant must be scoped to the CodeLocation bucket, got {arn!r}"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -1546,6 +1574,114 @@ class TestBatchJobFailureMonitoring:
         """s3:DescribeJob must be in the S3BatchOperationsCreateJob statement."""
         all_actions = _extract_actions_from_statements(execution_role_policy_statements)
         assert "s3:describejob" in all_actions
+
+
+# ---------------------------------------------------------------------------
+# Tests: ReplicationLambda run-failure alarm
+#
+# Covers the run itself failing rather than a batch job failing after a run
+# submitted it. Nothing else in the stack observes an unhandled exception, a
+# timeout, or an init failure such as Runtime.ImportModuleError, so without
+# this alarm the Solution can fail on every invocation while every resource
+# reports healthy.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def lambda_error_alarm(resources) -> dict:
+    return resources.get("ReplicationLambdaErrorAlarm", {})
+
+
+class TestReplicationLambdaErrorAlarm:
+    def test_alarm_exists(self, lambda_error_alarm):
+        assert lambda_error_alarm.get("Type") == "AWS::CloudWatch::Alarm"
+
+    def test_alarm_is_unconditional(self, lambda_error_alarm):
+        """Console visibility must not depend on AlarmEmail being set."""
+        assert "Condition" not in lambda_error_alarm
+
+    def test_watches_native_lambda_errors_metric(self, lambda_error_alarm):
+        """An init failure emits no Solution log entry, so a log metric filter
+        would never see it. The native metric counts it."""
+        props = lambda_error_alarm.get("Properties", {})
+        assert props.get("Namespace") == "AWS/Lambda"
+        assert props.get("MetricName") == "Errors"
+        assert props.get("Statistic") == "Sum"
+
+    def test_scoped_to_the_replication_lambda(self, lambda_error_alarm):
+        props = lambda_error_alarm.get("Properties", {})
+        dimensions = props.get("Dimensions", [])
+        assert len(dimensions) == 1, "alarm must name exactly one function"
+        dim = dimensions[0]
+        assert dim.get("Name") == "FunctionName"
+        value = dim.get("Value")
+        assert isinstance(value, _CfnTag) and value.tag == "!Ref"
+        assert value.value == "ReplicationLambda"
+
+    def test_fires_on_a_single_error(self, lambda_error_alarm):
+        """One failed run means an interval's tagging went unprocessed."""
+        props = lambda_error_alarm.get("Properties", {})
+        assert props.get("Threshold") == 0
+        assert props.get("ComparisonOperator") == "GreaterThanThreshold"
+        assert props.get("EvaluationPeriods") == 1
+
+    def test_treat_missing_data_retains_state(self, lambda_error_alarm):
+        """Runs are sparse: at the default 15-minute schedule only one
+        5-minute period in three carries a datapoint. notBreaching would read
+        each empty period as a recovery and re-alarm on the next failing run,
+        emailing every cycle. Retaining state gives one alarm and one
+        recovery at any CheckFrequencyMinutes."""
+        props = lambda_error_alarm.get("Properties", {})
+        assert props.get("TreatMissingData") == "missing"
+
+    def test_notifies_on_alarm_when_email_is_set(self, lambda_error_alarm):
+        """Unlike BatchJobFailureAlarm this alarm must publish: no
+        EventBridge rule or notifier Lambda covers a Lambda failure, so
+        without AlarmActions the failure stays silent."""
+        props = lambda_error_alarm.get("Properties", {})
+        actions = props.get("AlarmActions")
+        assert isinstance(actions, _CfnTag) and actions.tag == "!If"
+        condition, when_set, when_unset = actions.value
+        assert condition == "HasAlarmEmail"
+        assert isinstance(when_set, list) and len(when_set) == 1
+        topic = when_set[0]
+        assert isinstance(topic, _CfnTag) and topic.tag == "!Ref"
+        assert topic.value == "BatchJobFailureTopic"
+        assert isinstance(when_unset, _CfnTag) and when_unset.tag == "!Ref"
+        assert when_unset.value == "AWS::NoValue"
+
+    def test_notifies_on_recovery(self, lambda_error_alarm):
+        props = lambda_error_alarm.get("Properties", {})
+        actions = props.get("OKActions")
+        assert isinstance(actions, _CfnTag) and actions.tag == "!If"
+        condition, when_set, _ = actions.value
+        assert condition == "HasAlarmEmail"
+        assert when_set[0].value == "BatchJobFailureTopic"
+
+    def test_description_points_at_the_import_error_cause(self, lambda_error_alarm):
+        """The highest-value diagnostic, since a wrong code package is the
+        one cause an operator can act on immediately."""
+        description = lambda_error_alarm.get("Properties", {}).get("AlarmDescription")
+        text = str(description.value if isinstance(description, _CfnTag) else description)
+        assert "src/lambda_handler.py" in text
+        assert "ImportModuleError" in text
+
+    def test_does_not_alarm_on_throttles(self, resources):
+        """ReservedConcurrentExecutions is 1 by design, so a throttle means a
+        trigger arrived mid-run and the next trigger resolves it."""
+        for name, res in resources.items():
+            if res.get("Type") != "AWS::CloudWatch::Alarm":
+                continue
+            assert res.get("Properties", {}).get("MetricName") != "Throttles", (
+                f"{name} alarms on Throttles, which is expected behavior here"
+            )
+
+    def test_alarm_arn_output_exists(self, template):
+        outputs = template.get("Outputs", {})
+        assert "ReplicationLambdaErrorAlarmArn" in outputs
+        value = outputs["ReplicationLambdaErrorAlarmArn"].get("Value")
+        assert isinstance(value, _CfnTag) and value.tag == "!GetAtt"
+        assert "ReplicationLambdaErrorAlarm" in str(value.value)
 
 
 # ---------------------------------------------------------------------------
