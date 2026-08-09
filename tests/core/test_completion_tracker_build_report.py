@@ -2,15 +2,10 @@
 
 Feature: source-status-completion-tracking.
 
-This REPLACES the superseded per-destination ``build_completion_report``
-test file entirely: there is now ONE aggregate ``outcome`` per item. The
-``confidence`` field and the ``DELETED_AT_DESTINATION`` outcome are gone.
-
-Each item reports ``source_bucket`` directly, and ``destinations`` names the
-buckets the object's matched replication rules target — it is NOT derived from
-``configs`` (which holds only the per-bucket sentinel) and is NOT keyed to
-``outcome``, since the source replication-status header is a single aggregate
-across every destination.
+This tests the v2 grouped completion report format. Per-object detail
+(object_key, version_id) is no longer in the report — items are aggregated
+into groups by (source_bucket, matched_rules, destinations). Each group
+carries count, outcome_counts, and optional datetime ranges.
 """
 from __future__ import annotations
 
@@ -52,6 +47,8 @@ def make_obj(
     replication_outcome: str = "COMPLETE",
     matched_rules: frozenset[str] = frozenset(),
     destinations: frozenset[str] = frozenset(),
+    tagged_at: datetime | None = None,
+    last_modified: datetime | None = None,
 ) -> TrackedObject:
     return TrackedObject(
         source_bucket=source_bucket,
@@ -64,7 +61,10 @@ def make_obj(
         replication_outcome=replication_outcome,
         matched_rules=matched_rules,
         destinations=destinations,
+        tagged_at=tagged_at,
+        last_modified=last_modified,
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +73,11 @@ def make_obj(
 
 
 class TestBuildCompletionReport:
+    def test_format_version_is_2(self):
+        obj = make_obj()
+        report = build_completion_report("my-bucket", [obj])
+        assert report["format_version"] == 2
+
     def test_source_bucket_copied_verbatim_from_parameter(self):
         obj = make_obj(source_bucket="item-bucket")
         report = build_completion_report("param-bucket", [obj])
@@ -91,12 +96,12 @@ class TestBuildCompletionReport:
         assert report["source_bucket"] == "example-source-bucket"
         assert report["item_count"] == 0
         assert report["outcome_counts"] == {}
-        assert report["items"] == []
+        assert report["groups"] == []
 
     def test_item_reports_its_source_bucket(self):
         obj = make_obj(source_bucket="src-bucket")
         report = build_completion_report("src-bucket", [obj])
-        assert report["items"][0]["source_bucket"] == "src-bucket"
+        assert report["groups"][0]["source_bucket"] == "src-bucket"
 
     def test_configs_are_never_reported_as_destinations(self):
         """`configs` holds the per-bucket sentinel, not a destination — it must
@@ -107,27 +112,27 @@ class TestBuildCompletionReport:
             destinations=frozenset({"dest-bucket"}),
         )
         report = build_completion_report("src-bucket", [obj])
-        assert report["items"][0]["destinations"] == ["dest-bucket"]
+        assert report["groups"][0]["destinations"] == ["dest-bucket"]
 
     def test_destinations_absent_when_unknown(self):
         obj = make_obj(destinations=frozenset())
         report = build_completion_report("my-bucket", [obj])
-        assert "destinations" not in report["items"][0]
+        assert report["groups"][0]["destinations"] == []
 
     def test_multi_destination_item_lists_every_destination_sorted(self):
         obj = make_obj(destinations=frozenset({"dest-b", "dest-a"}))
         report = build_completion_report("my-bucket", [obj])
-        assert report["items"][0]["destinations"] == ["dest-a", "dest-b"]
+        assert report["groups"][0]["destinations"] == ["dest-a", "dest-b"]
 
     def test_matched_rules_reported_sorted_when_present(self):
         obj = make_obj(matched_rules=frozenset({"rule-z", "rule-a"}))
         report = build_completion_report("my-bucket", [obj])
-        assert report["items"][0]["matched_rules"] == ["rule-a", "rule-z"]
+        assert report["groups"][0]["matched_rules"] == ["rule-a", "rule-z"]
 
     def test_matched_rules_absent_when_unknown(self):
         obj = make_obj(matched_rules=frozenset())
         report = build_completion_report("my-bucket", [obj])
-        assert "matched_rules" not in report["items"][0]
+        assert report["groups"][0]["matched_rules"] == []
 
     def test_aggregate_outcome_is_not_attributed_per_destination(self):
         """A FAILED item with two destinations reports one aggregate outcome,
@@ -137,15 +142,15 @@ class TestBuildCompletionReport:
             destinations=frozenset({"dest-a", "dest-b"}),
         )
         report = build_completion_report("my-bucket", [obj])
-        entry = report["items"][0]
-        assert entry["outcome"] == "FAILED"
-        assert entry["destinations"] == ["dest-a", "dest-b"]
+        group = report["groups"][0]
+        assert group["outcome_counts"] == {"FAILED": 1}
+        assert group["destinations"] == ["dest-a", "dest-b"]
         assert report["outcome_counts"] == {"FAILED": 1}
 
     def test_single_aggregate_outcome_per_item(self):
         obj = make_obj(replication_outcome="FAILED")
         report = build_completion_report("my-bucket", [obj])
-        assert report["items"][0]["outcome"] == "FAILED"
+        assert report["groups"][0]["outcome_counts"] == {"FAILED": 1}
 
     def test_outcome_counts_one_per_item_not_per_config(self):
         """One item with 2 routing configs still contributes 1 to
@@ -177,41 +182,122 @@ class TestBuildCompletionReport:
         assert "UNKNOWN" not in report["outcome_counts"]
         assert "FAILED" not in report["outcome_counts"]
 
-    def test_no_confidence_field_anywhere(self):
-        obj = make_obj()
-        report = build_completion_report("my-bucket", [obj])
-        assert "confidence" not in report["items"][0]
-
-    def test_object_key_and_version_id_including_none(self):
-        items = [
-            make_obj(object_key="a.txt", version_id="v1"),
-            make_obj(object_key="b.txt", version_id=None),
-        ]
-        report = build_completion_report("my-bucket", items)
-        assert report["items"][0]["object_key"] == "a.txt"
-        assert report["items"][0]["version_id"] == "v1"
-        assert report["items"][1]["object_key"] == "b.txt"
-        assert report["items"][1]["version_id"] is None
-
-    def test_items_preserve_input_order(self):
-        items = [make_obj(object_key=k) for k in ("z.txt", "a.txt", "m.txt")]
-        report = build_completion_report("my-bucket", items)
-        assert [entry["object_key"] for entry in report["items"]] == ["z.txt", "a.txt", "m.txt"]
-
-    def test_report_never_includes_item_outside_input_batch(self):
-        item_a = make_obj(object_key="a.txt")
-        report = build_completion_report("my-bucket", [item_a])
-        keys = {entry["object_key"] for entry in report["items"]}
-        assert keys == {"a.txt"}
-        assert "b.txt" not in keys
-
     def test_report_never_attributes_destinations_to_wrong_item(self):
+        """Items with different destinations land in different groups."""
         item_a = make_obj(object_key="a.txt", destinations=frozenset({"dest-a"}))
         item_b = make_obj(object_key="b.txt", destinations=frozenset({"dest-b"}))
         report = build_completion_report("my-bucket", [item_a, item_b])
-        by_key = {entry["object_key"]: entry["destinations"] for entry in report["items"]}
-        assert by_key["a.txt"] == ["dest-a"]
-        assert by_key["b.txt"] == ["dest-b"]
+        by_dest = {tuple(g["destinations"]): g for g in report["groups"]}
+        assert ("dest-a",) in by_dest
+        assert ("dest-b",) in by_dest
+        assert by_dest[("dest-a",)]["count"] == 1
+        assert by_dest[("dest-b",)]["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# report["groups"] — the aggregate structure that replaces per-object entries
+# ---------------------------------------------------------------------------
+
+
+class TestGroups:
+    def test_no_per_object_detail_reaches_the_report(self):
+        """Requirement 1.2: object keys and version IDs are not in the email.
+
+        Asserted against the serialized body rather than a field name, so a
+        reintroduced per-object entry is caught wherever it is nested.
+        """
+        items = [
+            make_obj(object_key="secret/project-x/report.pdf", version_id="ver-abc"),
+            make_obj(object_key="secret/project-y/notes.txt", version_id="ver-def"),
+        ]
+        body = json.dumps(build_completion_report("my-bucket", items))
+        assert "secret/project-x/report.pdf" not in body
+        assert "ver-abc" not in body
+        assert "object_key" not in body
+        assert "version_id" not in body
+        # Nor the per-object fields the flat format carried.
+        assert "confidence" not in body
+        assert '"outcome"' not in body
+
+    def test_items_sharing_a_key_collapse_to_one_group(self):
+        """The common case — one bucket, one rule, one destination — is a
+        single group carrying the whole batch's statistics."""
+        early = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        late = datetime(2024, 5, 3, tzinfo=timezone.utc)
+        items = [
+            make_obj(
+                object_key=f"{i}.txt",
+                matched_rules=frozenset({"rule-a"}),
+                destinations=frozenset({"dest-a"}),
+                tagged_at=ts,
+                last_modified=ts,
+            )
+            for i, ts in enumerate((late, early, late))
+        ]
+        report = build_completion_report("my-bucket", items)
+        assert len(report["groups"]) == 1
+        group = report["groups"][0]
+        assert group["count"] == 3
+        assert group["outcome_counts"] == {"COMPLETE": 3}
+        assert group["tagged_at_range"] == [early.isoformat(), late.isoformat()]
+        assert group["last_modified_range"] == [early.isoformat(), late.isoformat()]
+
+    def test_group_count_sums_to_item_count(self):
+        items = [
+            make_obj(object_key="a.txt", destinations=frozenset({"dest-a"})),
+            make_obj(object_key="b.txt", destinations=frozenset({"dest-b"})),
+            make_obj(object_key="c.txt", destinations=frozenset({"dest-b"})),
+        ]
+        report = build_completion_report("my-bucket", items)
+        assert len(report["groups"]) == 2
+        assert sum(g["count"] for g in report["groups"]) == report["item_count"]
+
+    def test_a_group_reports_its_mixed_outcomes(self):
+        """One rule can still produce different outcomes, so a failure inside
+        an otherwise-successful group stays visible without listing objects."""
+        items = [
+            make_obj(object_key="a.txt", matched_rules=frozenset({"rule-a"})),
+            make_obj(
+                object_key="b.txt",
+                matched_rules=frozenset({"rule-a"}),
+                replication_outcome="FAILED",
+            ),
+        ]
+        report = build_completion_report("my-bucket", items)
+        assert len(report["groups"]) == 1
+        assert report["groups"][0]["outcome_counts"] == {"COMPLETE": 1, "FAILED": 1}
+
+    def test_groups_follow_first_appearance_order(self):
+        """Group order is the order each key is first seen, so the same batch
+        always serializes to the same body."""
+        items = [
+            make_obj(object_key="z.txt", destinations=frozenset({"dest-z"})),
+            make_obj(object_key="a.txt", destinations=frozenset({"dest-a"})),
+            make_obj(object_key="m.txt", destinations=frozenset({"dest-z"})),
+        ]
+        report = build_completion_report("my-bucket", items)
+        assert [g["destinations"] for g in report["groups"]] == [["dest-z"], ["dest-a"]]
+
+    def test_datetime_ranges_omitted_when_no_object_holds_the_value(self):
+        report = build_completion_report("my-bucket", [make_obj()])
+        group = report["groups"][0]
+        assert "tagged_at_range" not in group
+        assert "last_modified_range" not in group
+
+    def test_range_spans_only_the_objects_holding_the_value(self):
+        """One object without a timestamp does not collapse or void the range
+        for the objects that have one."""
+        ts = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        items = [
+            make_obj(object_key="a.txt", tagged_at=ts),
+            make_obj(object_key="b.txt", tagged_at=None),
+        ]
+        group = build_completion_report("my-bucket", items)["groups"][0]
+        assert group["tagged_at_range"] == [ts.isoformat(), ts.isoformat()]
+
+    def test_group_is_absent_for_a_bucket_with_no_items(self):
+        report = build_completion_report("my-bucket", [])
+        assert report["groups"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +469,7 @@ class TestSummaryField:
         assert next(iter(restored.keys())) == "summary"
 
 
+
 # ---------------------------------------------------------------------------
 # The report is decoupled from `configs` (design.md D4): whatever shape the
 # configs dict has, it never reaches the reported destinations.
@@ -409,9 +496,9 @@ class TestReportIsDecoupledFromConfigs:
             destinations=frozenset({"dest-bucket"}),
         )
         report = build_completion_report(bucket_sentinel, [obj])
-        entry = report["items"][0]
-        assert entry["source_bucket"] == bucket_sentinel
-        assert entry["destinations"] == ["dest-bucket"]
+        group = report["groups"][0]
+        assert group["source_bucket"] == bucket_sentinel
+        assert group["destinations"] == ["dest-bucket"]
 
     def test_legacy_multi_config_keys_do_not_appear_as_destinations(self):
         """A legacy-shaped TrackedObject whose configs dict still carries
@@ -426,22 +513,22 @@ class TestReportIsDecoupledFromConfigs:
             destinations=frozenset({"dest-only"}),
         )
         report = build_completion_report("my-bucket", [obj])
-        assert report["items"][0]["destinations"] == ["dest-only"]
+        assert report["groups"][0]["destinations"] == ["dest-only"]
 
     def test_legacy_object_without_routing_omits_both_routing_fields(self):
         """An object tracked before matched_rules/destinations were recorded
-        reports neither field rather than an empty list or a null."""
+        reports empty lists rather than populated fields."""
         obj = make_obj(
             configs={"rule-a": make_config_context(replication_config_id="rule-a")},
         )
         report = build_completion_report("my-bucket", [obj])
-        entry = report["items"][0]
-        assert "destinations" not in entry
-        assert "matched_rules" not in entry
-        assert entry["source_bucket"] == "example-source-bucket"
+        group = report["groups"][0]
+        assert group["destinations"] == []
+        assert group["matched_rules"] == []
+        assert group["source_bucket"] == "example-source-bucket"
 
     def test_outcome_and_outcome_counts_unaffected_by_sentinel_collapse(self):
-        """Requirement 3.2: the aggregate outcome (per-item and in
+        """Requirement 3.2: the aggregate outcome (per-group and in
         outcome_counts) is unchanged by the configs-dict collapsing to a
         single sentinel entry — it is derived solely from
         obj.replication_outcome, independent of configs."""
@@ -461,9 +548,8 @@ class TestReportIsDecoupledFromConfigs:
             ),
         ]
         report = build_completion_report(bucket_sentinel, items)
-        assert report["items"][0]["outcome"] == "COMPLETE"
-        assert report["items"][1]["outcome"] == "FAILED"
         assert report["outcome_counts"] == {"COMPLETE": 1, "FAILED": 1}
+
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +584,23 @@ def _tracked_objects_with_mixed_configs(draw) -> list[TrackedObject]:
         num_destinations = draw(st.integers(min_value=0, max_value=3))
         destinations = frozenset(f"dest-{key}-{d}" for d in range(num_destinations))
         matched_rules = frozenset(f"rule-{key}-{d}" for d in range(num_destinations))
+        # Generate optional datetime fields for range testing.
+        tagged_at = draw(st.one_of(
+            st.none(),
+            st.datetimes(
+                min_value=datetime(2023, 1, 1),
+                max_value=datetime(2025, 1, 1),
+                timezones=st.just(timezone.utc),
+            ),
+        ))
+        last_modified = draw(st.one_of(
+            st.none(),
+            st.datetimes(
+                min_value=datetime(2023, 1, 1),
+                max_value=datetime(2025, 1, 1),
+                timezones=st.just(timezone.utc),
+            ),
+        ))
         items.append(
             TrackedObject(
                 source_bucket="my-bucket",
@@ -510,9 +613,12 @@ def _tracked_objects_with_mixed_configs(draw) -> list[TrackedObject]:
                 replication_outcome=outcome,
                 matched_rules=matched_rules,
                 destinations=destinations,
+                tagged_at=tagged_at,
+                last_modified=last_modified,
             )
         )
     return items
+
 
 
 class TestProperty9ReportGroupingAndContentMatchBatch:
@@ -526,28 +632,84 @@ class TestProperty9ReportGroupingAndContentMatchBatch:
         source_bucket=st.from_regex(r"^[a-z][a-z0-9\-]{2,20}$", fullmatch=True),
     )
     @settings(max_examples=100)
-    def test_report_matches_batch_identity_and_content(
+    def test_groups_aggregate_correctly_by_key(
         self,
         items: list[TrackedObject],
         source_bucket: str,
     ) -> None:
-        """# Feature: source-status-completion-tracking, Property 9: A published report's grouping and content exactly match the batch of Tracked_Objects it covers"""
+        """Items sharing (source_bucket, matched_rules, destinations) land in
+        one group with the correct count and outcome_counts."""
         report = build_completion_report(source_bucket, items)
 
         assert report["source_bucket"] == source_bucket
         assert report["item_count"] == len(items)
-        assert len(report["items"]) == len(items)
+        assert report["format_version"] == 2
 
-        for item, entry in zip(items, report["items"]):
-            assert entry["object_key"] == item.object_key
-            assert entry["version_id"] == item.version_id
-            assert entry["outcome"] == item.replication_outcome
-            assert entry["source_bucket"] == item.source_bucket
-            assert set(entry.get("destinations", [])) == set(item.destinations)
-            assert set(entry.get("matched_rules", [])) == set(item.matched_rules)
+        # Rebuild expected groups from items.
+        GroupKey = tuple[str, tuple[str, ...], tuple[str, ...]]
+        expected: dict[GroupKey, list[TrackedObject]] = {}
+        for obj in items:
+            key: GroupKey = (
+                obj.source_bucket,
+                tuple(sorted(obj.matched_rules)),
+                tuple(sorted(obj.destinations)),
+            )
+            expected.setdefault(key, []).append(obj)
+
+        assert len(report["groups"]) == len(expected)
+
+        # Build a lookup from group key to the reported group.
+        reported_by_key: dict[GroupKey, dict] = {}
+        for group in report["groups"]:
+            gk: GroupKey = (
+                group["source_bucket"],
+                tuple(group["matched_rules"]),
+                tuple(group["destinations"]),
+            )
+            reported_by_key[gk] = group
+
+        for key, group_items in expected.items():
+            assert key in reported_by_key, f"Missing group for key {key}"
+            group = reported_by_key[key]
+
+            # Count matches.
+            assert group["count"] == len(group_items)
+
+            # Outcome counts match.
+            exp_outcomes: dict[str, int] = {}
+            for obj in group_items:
+                exp_outcomes[obj.replication_outcome] = (
+                    exp_outcomes.get(obj.replication_outcome, 0) + 1
+                )
+            assert group["outcome_counts"] == exp_outcomes
+
             # The configs dict must never leak into the reported destinations.
-            assert set(entry.get("destinations", [])).isdisjoint(item.configs.keys())
+            for obj in group_items:
+                assert set(group["destinations"]).isdisjoint(obj.configs.keys())
 
+            # tagged_at_range correctness.
+            tagged_ats = [obj.tagged_at for obj in group_items if obj.tagged_at is not None]
+            if tagged_ats:
+                assert "tagged_at_range" in group
+                assert group["tagged_at_range"] == [
+                    min(tagged_ats).isoformat(),
+                    max(tagged_ats).isoformat(),
+                ]
+            else:
+                assert "tagged_at_range" not in group
+
+            # last_modified_range correctness.
+            last_mods = [obj.last_modified for obj in group_items if obj.last_modified is not None]
+            if last_mods:
+                assert "last_modified_range" in group
+                assert group["last_modified_range"] == [
+                    min(last_mods).isoformat(),
+                    max(last_mods).isoformat(),
+                ]
+            else:
+                assert "last_modified_range" not in group
+
+        # Top-level outcome_counts is the sum across all groups.
         expected_counts: dict[str, int] = {}
         for item in items:
             expected_counts[item.replication_outcome] = expected_counts.get(item.replication_outcome, 0) + 1
@@ -566,18 +728,49 @@ class TestProperty9ReportGroupingAndContentMatchBatch:
         """# Feature: source-status-completion-tracking, Property 9: A published report's grouping and content exactly match the batch of Tracked_Objects it covers"""
         report_a = build_completion_report("bucket-a", items_a)
 
-        keys_a = {item.object_key for item in items_a}
-        keys_b = {item.object_key for item in items_b}
-        report_keys = {entry["object_key"] for entry in report_a["items"]}
+        def group_keys(items: list[TrackedObject]) -> set[tuple]:
+            return {
+                (
+                    obj.source_bucket,
+                    tuple(sorted(obj.matched_rules)),
+                    tuple(sorted(obj.destinations)),
+                )
+                for obj in items
+            }
 
-        assert report_keys == keys_a
-        assert report_keys.isdisjoint(keys_b - keys_a)
+        reported = {
+            (
+                group["source_bucket"],
+                tuple(group["matched_rules"]),
+                tuple(group["destinations"]),
+            )
+            for group in report_a["groups"]
+        }
+        # The reported group set is exactly items_a's, not a superset or a
+        # subset, and carries nothing that only items_b would have produced.
+        assert reported == group_keys(items_a)
+        assert reported.isdisjoint(group_keys(items_b) - group_keys(items_a))
 
-        items_a_by_key = {item.object_key: item for item in items_a}
-        for entry in report_a["items"]:
-            own_item = items_a_by_key[entry["object_key"]]
-            assert set(entry.get("destinations", [])) == set(own_item.destinations)
-            assert set(entry.get("matched_rules", [])) == set(own_item.matched_rules)
+        # Every object in items_a is counted exactly once, in its own group.
+        assert sum(g["count"] for g in report_a["groups"]) == len(items_a)
+        for group in report_a["groups"]:
+            key = (
+                group["source_bucket"],
+                tuple(group["matched_rules"]),
+                tuple(group["destinations"]),
+            )
+            own = [
+                obj
+                for obj in items_a
+                if (
+                    obj.source_bucket,
+                    tuple(sorted(obj.matched_rules)),
+                    tuple(sorted(obj.destinations)),
+                )
+                == key
+            ]
+            assert group["count"] == len(own)
+
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +842,7 @@ class TestCompletionReportSubject:
         subject.encode("ascii")
 
 
+
 # ---------------------------------------------------------------------------
 # report["outstanding"] — how many Tracked_Objects for the bucket are still
 # awaiting a terminal answer after this report. A report covers only what
@@ -710,12 +904,13 @@ class TestOutstandingCount:
         report = build_completion_report("my-bucket", [make_obj()], outstanding=1)
         keys = list(report.keys())
         assert keys[0] == "summary"
-        assert keys.index("outstanding") < keys.index("items")
+        assert keys.index("outstanding") < keys.index("groups")
 
     def test_round_trips_through_json(self):
         report = build_completion_report("my-bucket", [make_obj()], outstanding=9)
         restored = json.loads(json.dumps(report))
         assert restored["outstanding"] == 9
+
 
 
 class TestOutstandingCountInSubject:

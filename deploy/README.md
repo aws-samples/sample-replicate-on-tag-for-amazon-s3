@@ -346,7 +346,9 @@ After the stack reaches `CREATE_COMPLETE`:
 
 To update the monitored bucket list, update the `SourceBucketNames` stack
 parameter and deploy a stack update. The custom resource rewrites the
-`solution-config.json` automatically.
+`solution-config.json` and seeds a checkpoint for each newly added bucket so
+processing starts from the update timestamp, not from the beginning of the
+journal.
 
 ## Operational Notes
 

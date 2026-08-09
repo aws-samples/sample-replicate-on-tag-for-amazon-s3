@@ -1,13 +1,13 @@
 # Completion Reporting
 
-Reference detail for the per-object replication reports summarised in [Completion Reporting](../README.md#completion-reporting). That section covers what is always written and what setting `CompletionNotificationEmail` turns on. This page covers the tracking mechanics, the outcomes an object can reach, and the fields each report entry carries.
+Reference detail for the replication reports summarised in [Completion Reporting](../README.md#completion-reporting). That section covers what is always written and what setting `CompletionNotificationEmail` turns on. This page covers the tracking mechanics, the outcomes an object can reach, and the fields each report group carries.
 
 Everything here applies only when `CompletionNotificationEmail` is set. Leave it empty and only the completion-report CSV diagnostic runs.
 
 ## What tracking does per run
 
 - Once a job's completion report confirms processing, each object version is tracked with one `x-amz-replication-status` check per run, capped at `CompletionCheckBatchSize` (default 2,000/run).
-- One SNS message per source bucket per run covers every object that resolved and passed the tag-quiescence check. Reports split across as many messages as needed to stay within SNS's 256 KB limit, so a bucket resolving tens of thousands of objects in one interval still reports. An object leaves tracking only once the message covering it publishes successfully.
+- One SNS message per source bucket per run covers every object that resolved and passed the tag-quiescence check. A report's length is set by how many rule and destination combinations the bucket has, not by how many objects replicated, so a bucket resolving tens of thousands of objects in one interval still reports in one message. A bucket with hundreds of combinations splits across as many messages as SNS's 256 KB limit requires, always between groups and never within one. An object leaves tracking only once the message covering it publishes successfully.
 - An alert fires if a job's completion report has not appeared within 1 hour of that job finishing.
 
 ## Outcomes
@@ -22,26 +22,66 @@ Every tracked object reaches a terminal outcome. `GONE` and `EXPIRED` exist so t
 | `GONE` | The object version no longer exists, so replication can never be confirmed |
 | `EXPIRED` | The object stayed unresolved past `CompletionItemTtlHours` and was abandoned |
 
-## Report entry fields
+## Report group fields
 
-An entry carries the following fields. Object keys and version IDs are not redacted in this report, unlike the structured logs described in [Monitoring](../README.md#monitoring).
+The report body is a `groups` list, declared by `format_version: 2`. Objects
+are aggregated by `(source_bucket, matched_rules, destinations)` rather than
+listed individually, so the three values every object in a group shares are
+stated once. Each group carries:
 
 | Field | Meaning |
 |---|---|
-| `object_key`, `version_id` | Identify the object version the entry covers |
-| `outcome` | One aggregate outcome from the table above |
-| `source_bucket` | The bucket the object was replicated from |
-| `outstanding` | Report-level, not per entry: how many of the bucket's objects still await an answer (see [Knowing when a batch has fully landed](#knowing-when-a-batch-has-fully-landed)) |
-| `tagged_at` | When the tag that matched the object was applied |
-| `last_modified` | The object version's last-modified time |
-| `matched_rules` | IDs of the replication rules that matched the object |
+| `source_bucket` | The bucket the objects in this group were replicated from |
+| `matched_rules` | IDs of the replication rules that matched these objects |
 | `destinations` | Buckets those rules replicate to |
+| `count` | Number of objects in this group |
+| `outcome_counts` | Breakdown of outcomes within the group |
+| `tagged_at_range` | `[earliest, latest]` timestamps of when these objects were tagged |
+| `last_modified_range` | `[earliest, latest]` last-modified times of these objects |
 
-`tagged_at`, `last_modified`, `matched_rules`, and `destinations` are omitted from an entry when the Solution does not hold that value for the object.
+`matched_rules` and `destinations` are empty lists when the Solution holds no
+routing for the objects in the group. A range is omitted entirely when no
+object in the group holds that timestamp, and spans only the objects that do.
+
+Object keys and version IDs are not in the email. A report of several hundred
+keys and version UUIDs cannot be read, and the per-object detail is in the S3
+Batch Operations completion report CSV on the state bucket under
+`completion-reports/`, which is where to look to find out which specific
+object failed.
+
+The top-level fields are `summary`, `format_version`, `source_bucket`,
+`item_count`, `outstanding`, and `outcome_counts`. `item_count` equals the sum
+of every group's `count`.
+
+### Example report
+
+A 563-object all-success batch to one destination produces:
+
+```json
+{
+  "summary": "egummett-fresh-eu-west-1: 563 objects replicated successfully. No action needed. No objects remain in tracking.",
+  "format_version": 2,
+  "source_bucket": "egummett-fresh-eu-west-1",
+  "item_count": 563,
+  "outstanding": 0,
+  "outcome_counts": {"COMPLETE": 563},
+  "groups": [
+    {
+      "source_bucket": "egummett-fresh-eu-west-1",
+      "matched_rules": ["tagtest-to-us-west-2"],
+      "destinations": ["egummett-fresh-us-west-2"],
+      "count": 563,
+      "outcome_counts": {"COMPLETE": 563},
+      "tagged_at_range": ["2026-08-08T21:24:28.335000+00:00", "2026-08-08T21:24:30.737000+00:00"],
+      "last_modified_range": ["2025-11-18T20:13:09+00:00", "2025-11-18T21:15:16+00:00"]
+    }
+  ]
+}
+```
 
 ## What a destination list does not tell you
 
-`destinations` names where an object was bound for, not what happened at each one. The `outcome` is a single aggregate across every destination: S3 reports `COMPLETED` only once replication to all destinations succeeds, and `FAILED` when one or more fail. So a `FAILED` entry listing two destinations means at least one of the two failed, not that both did. Determining which requires the destination buckets themselves, which this Solution does not read.
+`destinations` names where the objects in a group were bound for, not what happened at each destination. The `outcome_counts` is a single aggregate across every destination: S3 reports `COMPLETED` only once replication to all destinations succeeds, and `FAILED` when one or more fail. So a group with `outcome_counts: {"FAILED": 3}` listing two destinations means at least one of the two failed for each of those 3 objects, not that both did. Determining which requires the destination buckets themselves, which this Solution does not read.
 
 ## Report format and email subject
 

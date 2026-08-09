@@ -19,7 +19,7 @@ This README is the operator reference. Detail lives alongside it:
 | [Tagging Objects at Scale](docs/tagging-at-scale.md) | Applying a matching tag across objects that already exist |
 | [Backfilling After a Replication-Rule Change](docs/backfill.md) | The Athena query and Batch Operations recipe for a manual catch-up |
 | [Monitoring Reference](docs/monitoring.md) | Audit actions, metric semantics and alarm recipes, task-failure diagnosis |
-| [Completion Reporting](docs/completion-reporting.md) | Tracking mechanics, outcomes, and report entry fields |
+| [Completion Reporting](docs/completion-reporting.md) | Tracking mechanics, outcomes, and report group fields |
 | [Cost Detail](docs/cost.md) | A worked example, and what is excluded from it |
 | [Required AWS Permissions](docs/permissions.md) | What each grant is for, the Batch Operations job role, Lake Formation |
 | [Hardening Options](docs/hardening.md) | The three protections that are off by default |
@@ -108,13 +108,13 @@ Set `CompletionNotificationEmail` to turn it on. The Solution then polls each ta
 
 That closing count is the batch-level answer. A report covers what confirmed by the time it was sent, which is not the same as a set of objects you tagged together: if some replicate quickly and others lag, one tagging batch is reported across several emails. `No objects remain in tracking` means none are left awaiting confirmation for that bucket, so the wave has landed. A non-zero count means more reports are coming, and it appears in the email subject too, so an inbox can be triaged without opening anything.
 
-Object keys and version IDs appear in the report unredacted, unlike the structured logs described in [Monitoring](#monitoring).
+The report states counts, outcomes and time ranges per rule and destination, not individual objects. Object keys and version IDs are not in it. To find out which specific object failed, read the Batch Operations completion report CSV on the State Bucket under `completion-reports/`.
 
 Two limits on what a successful outcome means. It is one aggregate across every destination, so for an object bound for two buckets it means both succeeded, and a failure means at least one did not, without saying which. And it confirms S3 reported `COMPLETED` at the time of the check, not that the replica is still there now: per [AWS's S3 Batch Replication considerations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-batch-replication-batch.html#batch-replication-considerations), a destination version deleted by specifying its version ID is not re-replicated, and no check detects that.
 
 Leave `CompletionNotificationEmail` empty and none of the above runs. The Batch Operations completion report CSV is written to the State Bucket either way, and the Solution reads it either way to diagnose permission-shaped failures (`InitiateReplicationNotPermitted`, `AccessDenied`).
 
-[Completion Reporting](docs/completion-reporting.md) has the outcomes an object can reach, the fields each entry carries, and the tracking mechanics.
+[Completion Reporting](docs/completion-reporting.md) has the outcomes an object can reach, the fields each report group carries, and the tracking mechanics.
 
 ## Deleted-Version Filtering
 
@@ -162,6 +162,14 @@ Tagging an object again is a new tagging operation, whether or not the object ha
 | Two or more versions of the same key tagged inside one interval | One version per run, oldest tagging event first, until all are replicated. Each of those runs submits a job and is billed for its manifest entries. Versions still waiting must stay within `JournalLookbackSeconds` of the checkpoint, which they do unless newer tagging activity advances the watermark past them |
 | An object version permanently deleted at the destination | Not restored, by this or any other job (see [Completion Reporting](#completion-reporting)) |
 
+## Journal Start Point
+
+The Solution begins processing journal records from the time the stack is deployed, not from the beginning of the journal. On stack creation, the custom resource writes an initial checkpoint per source bucket with the watermark set to the deployment timestamp. The first Lambda invocation reads from `deployment_timestamp - JournalLookbackSeconds` forward.
+
+When a source bucket is added via stack update, it receives its own checkpoint at the update timestamp. Existing buckets are not affected.
+
+Objects tagged before `deployment_timestamp - JournalLookbackSeconds` are not picked up by the scheduled runs. To replicate those objects, use the manual catch-up recipe in [Backfilling After a Replication-Rule Change](docs/backfill.md).
+
 ## Backfilling After a Replication-Rule Change
 
 Adding or widening a tag-scoped rule does not replicate objects tagged before the change. [Backfilling After a Replication-Rule Change](docs/backfill.md) has the Athena query and Batch Operations recipe for a manual catch-up.
@@ -170,7 +178,7 @@ Adding or widening a tag-scoped rule does not replicate objects tagged before th
 
 Tells you whether the Solution is running, keeping up, and still covering every bucket you gave it. Each run emits a structured JSON `interval_summary`, plus an entry for anything that needed a decision or went wrong. Object keys are never logged; error messages reference a SHA-256 fingerprint instead. A per-bucket error is logged and the run continues for the remaining buckets, so one bad bucket does not stop the others.
 
-[Log entries](docs/monitoring.md#log-entries) lists every event type and the fields it carries, and [Audit actions](docs/monitoring.md#audit-actions) does the same for the nine `audit` actions.
+[Log entries](docs/monitoring.md#log-entries) lists every event type and the fields it carries, and [Audit actions](docs/monitoring.md#audit-actions) does the same for each `audit` action.
 
 **Auto-disable.** When consecutive Batch Operations job failures for a bucket reach `MaxBatchJobFailures` (default 4), the Solution sets that bucket's `disabled` flag to `true` in `solution-config.json` and clears its stored failure history. The other buckets keep running. This circuit breaker prevents runaway per-job costs from a bucket whose job keeps failing. When `AlarmEmail` is set, an email names the disabled bucket and the recovery step.
 
@@ -194,13 +202,32 @@ The alarm is always created, and emails the `AlarmEmail` address when one is set
 
 Set `AlarmEmail` to be notified when an S3 Batch Operations job fails or is cancelled. The stack creates an SNS topic, an email subscription, and an EventBridge rule that sends one readable email per failed or cancelled job, carrying the job ID, its status, and a console link. This requires an active CloudTrail trail capturing management events in the stack's Region (see [Verifying the CloudTrail trail](deploy/README.md#verifying-the-cloudtrail-trail)). Leave `AlarmEmail` empty to disable alerting; no SNS topic is provisioned. A CloudWatch alarm on the same event exists for console and dashboard visibility and does not send its own email.
 
-Three other alerts go to the same address. The run failure alarm above is one. The bucket-disabled notification names the bucket, the cause, and the exact recovery step. The submission-failure alert names the bucket, the operation (`CreateJob`), and the validation error; it fires once per episode and is suppressed while the same failure persists, and a successful submission clears the suppression so a recurrence after a fix is reported again. Both are always written to the `BatchJobFailureLogGroup` CloudWatch log group even when `AlarmEmail` is not set.
+Four other alerts go to the same address. The run failure alarm above is one. The bucket-disabled notification names the bucket, the cause, and the exact recovery step. The submission-failure alert names the bucket, the operation (`CreateJob`), and the validation error; it fires once per episode and is suppressed while the same failure persists, and a successful submission clears the suppression so a recurrence after a fix is reported again. The journal-unavailable alert names the bucket and the remedy when its S3 Metadata journal does not exist (see [A bucket replicates nothing and raises no alarm](#a-bucket-replicates-nothing-and-raises-no-alarm)); it repeats at most once a day while the journal is still missing. All are always written to the `BatchJobFailureLogGroup` CloudWatch log group even when `AlarmEmail` is not set.
 
 ### Diagnosing task failures
 
 A Batch Operations job can reach `Complete` while individual tasks in it failed, and the job's status does not reveal that. Every task failure in a job's completion report raises an `error` log entry naming the error code, how many tasks carried it, and the message S3 reported for it.
 
 [Diagnosing task failures](docs/monitoring.md#diagnosing-task-failures) covers the two permission-shaped failures, why the reported message matters more than the error code, and the two log signals that catch a job whose tasks all failed at either job size.
+
+### A bucket replicates nothing and raises no alarm
+
+A bucket the Solution cannot read the journal for is skipped, and the run still succeeds for the remaining buckets. Because the run succeeds, the Lambda `Errors` metric stays at zero and `ReplicationLambdaErrorAlarm` does not fire. The most common cause is the S3 Metadata journal not being enabled on that bucket, or the Region's S3 Tables integration never having been registered, both listed under [Prerequisites](#prerequisites).
+
+The Solution reads the journal and does not create it, so this condition persists until you act on it.
+
+| Signal | Where | Frequency |
+|---|---|---|
+| `journal_unavailable` audit entry | The function's log group | Every run |
+| `BucketErrors` at 1 for that bucket | CloudWatch, when `MetricsNamespace` is set | Every run |
+| `journal_unavailable` entry naming the remedy | `BatchJobFailureLogGroup` | At most once a day per bucket |
+| Email naming the bucket and the remedy | `AlarmEmail`, when set | At most once a day per bucket |
+
+The audit entry is written every run, so the condition is always queryable. The notification is limited to once a day so an unmet prerequisite stays visible without arriving every `CheckFrequencyMinutes`, and it stops as soon as the journal is readable.
+
+To resolve, enable the journal on the bucket (S3 console: select the bucket, **Metadata configuration**, **Create metadata configuration**), then confirm the `s3tablescatalog` Glue catalog exists in the Region. The bucket resumes on the next scheduled run. It is not disabled and its checkpoint has not moved, so no configuration change or state edit is part of the recovery, and no tagging operation is lost.
+
+A journal read that fails for any other reason, including throttling and a missing Lake Formation grant, raises an `error` entry instead. Those are not reported as a missing journal, because enabling one that already exists would not fix them.
 
 ## Checkpoint and Recovery
 

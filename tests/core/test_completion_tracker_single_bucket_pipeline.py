@@ -82,16 +82,18 @@ def test_single_confirming_job_flows_end_to_end_to_a_correct_report():
     assert quiescence_check(_MANIFEST_AT, quiescent_scan_state) is True
     assert should_publish(resolved_obj, scan_state_by_config) is True
 
-    # 4. build_completion_report produces a correct-outcome report item that
+    # 4. build_completion_report produces a correct-outcome grouped report that
     #    names its source bucket, not the sentinel-keyed config, as context.
     report = build_completion_report(_BUCKET_SENTINEL, [resolved_obj])
     assert report["source_bucket"] == _BUCKET_SENTINEL
     assert report["item_count"] == 1
     assert report["outcome_counts"] == {"COMPLETE": 1}
-    assert report["items"][0]["object_key"] == "key-a"
-    assert report["items"][0]["version_id"] == "v1"
-    assert report["items"][0]["outcome"] == "COMPLETE"
-    assert report["items"][0]["source_bucket"] == _BUCKET_SENTINEL
+    assert report["format_version"] == 2
+    assert len(report["groups"]) == 1
+    group = report["groups"][0]
+    assert group["source_bucket"] == _BUCKET_SENTINEL
+    assert group["count"] == 1
+    assert group["outcome_counts"] == {"COMPLETE": 1}
 
 
 def test_not_yet_quiescent_holds_the_publish_decision_before_reporting():

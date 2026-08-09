@@ -22,6 +22,12 @@ The lambda handler supplies this callback and uses it to write the
 ``disabled``/``disabled_reason``/``disabled_at`` fields back to
 ``solution-config.json``.
 
+When a bucket's S3 Metadata journal cannot be found at all, the orchestrator
+calls ``runtime_config['on_journal_unavailable'](bucket_name, cause)`` on the
+first interval the condition is seen, then skips that bucket. The bucket is
+left enabled: the remedy is in the operator's account, and the bucket resumes
+on the next interval once the journal exists.
+
 Requirements: 4.3, 6.1, 7.3, 8.1, 8.2, 8.3, 9.1, 9.3, 9.4, 11.1
 """
 from __future__ import annotations
@@ -100,6 +106,12 @@ _COMPONENT = "Orchestrator"
 # processed-operation window suppresses re-submission of records already
 # included in a job, so the lookback never causes redundant replication.
 DEFAULT_JOURNAL_LOOKBACK = timedelta(hours=1)
+
+# Minimum spacing between journal-unavailable alerts for the same bucket. The
+# condition recurs on every interval until the journal exists, so an unbounded
+# alert would arrive every CheckFrequencyMinutes indefinitely. A day keeps an
+# unmet prerequisite in view without burying it.
+JOURNAL_UNAVAILABLE_REALERT_INTERVAL = timedelta(hours=24)
 
 # ---------------------------------------------------------------------------
 # Completion-tracking interval defaults (design.md Decisions 3, 5)
@@ -481,6 +493,10 @@ class _BucketContext:
     max_batch_job_failures: int
     on_bucket_disable: Callable | None
     on_submission_failure: Callable | None
+    # Invoked on the first interval in which the bucket's S3 Metadata journal
+    # is found to be absent. Defaults to None so a library caller that does not
+    # supply it keeps the log-only behavior.
+    on_journal_unavailable: Callable | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +629,25 @@ class StateWriter:
             self._s3_client, self._state_bucket, self._source_bucket,
             bucket_name, current_etag=self._etag,
         )
+
+    def claim_journal_unavailable_alert(
+        self, bucket_name: str, now: datetime,
+    ) -> bool:
+        """Claim the right to alert that this bucket's journal is missing.
+
+        Returns True when the caller should send the alert. Writes only when
+        the claim succeeds, and is reached only on a path that abandons the
+        bucket for this run, so it never contributes a link to the ETag chain
+        used by a subsequent write.
+        """
+        should_alert, new_etag = self._store.claim_journal_unavailable_alert(
+            self._s3_client, self._state_bucket, self._source_bucket,
+            bucket_name, now=now,
+            min_interval=JOURNAL_UNAVAILABLE_REALERT_INTERVAL,
+            current_etag=self._etag,
+        )
+        self._etag = new_etag
+        return should_alert
 
     def mark_report_diagnosed(self, config_id: str) -> None:
         """Best-effort: set ``report_diagnosed = True`` on the submission record.
@@ -970,6 +1005,7 @@ def _read_journal_window(
     ctx: _BucketContext,
     checkpoint_watermark: str,
     result: _BucketResult,
+    writer: StateWriter,
 ) -> tuple[list, str | None, str | None] | None:
     """Steps d and d0: apply the row-count cap and read the journal window.
 
@@ -980,6 +1016,10 @@ def _read_journal_window(
     Returns (ops, since_timestamp, journal_until) on success, or None when a
     fatal journal error means this bucket should be skipped.  Sets result.capped
     as a side-effect when the row-count boundary fires.
+
+    *writer* is used only for the journal-unavailable streak counter, which
+    keeps the operator alert for an absent journal to one notification per
+    incident rather than one per interval.
     """
     bucket_name = ctx.bucket_name
     athena_client = ctx.athena_client
@@ -1046,6 +1086,24 @@ def _read_journal_window(
     fatal_errors = [e for e in journal_errors if e.is_fatal]
     if fatal_errors:
         result.errored = True
+
+        # An absent journal is an unmet prerequisite rather than a failure
+        # retrying resolves, so it is escalated to an operator instead of only
+        # being logged. Emitted unconditionally, and separately from the
+        # log_error above, so the condition is queryable by event name even
+        # when no alert destination is configured.
+        unavailable = next(
+            (e for e in fatal_errors if e.is_journal_unavailable), None
+        )
+        if unavailable is not None:
+            observability.emit(observability.log_audit(
+                action="journal_unavailable",
+                source_bucket=bucket_name,
+                details={"cause": unavailable.cause},
+            ))
+            _escalate_journal_unavailable(
+                ctx, writer, bucket_name, unavailable.cause,
+            )
         return None
 
     return ops, since_timestamp, journal_until
@@ -1385,6 +1443,57 @@ class _SubmissionOutcome:
     bucket_disabled: bool
 
 
+def _escalate_journal_unavailable(
+    ctx: _BucketContext,
+    writer: StateWriter,
+    bucket_name: str,
+    cause: str,
+) -> None:
+    """Escalate an absent S3 Metadata journal to an operator, rate-limited.
+
+    A missing journal fails identically on every subsequent interval, so
+    without rate limiting the alert would repeat for as long as the
+    prerequisite went unmet: every 15 minutes by default, indefinitely.
+    :meth:`StateWriter.claim_journal_unavailable_alert` bounds that to one
+    notification per :data:`JOURNAL_UNAVAILABLE_REALERT_INTERVAL`, which both
+    keeps an unmet prerequisite visible and stops it flooding an inbox.
+
+    Unlike :func:`_escalate_submission_failure`, this never disables the
+    bucket. A submission failure of that class is a defect in the Solution that
+    needs a new deployment, so continuing to retry is pointless; a missing
+    journal is fixable in the operator's own account, and the bucket starts
+    working on the next interval once it is. Disabling would add a manual
+    config edit to a recovery path that otherwise needs none.
+    """
+    if ctx.on_journal_unavailable is None:
+        return
+
+    try:
+        should_alert = writer.claim_journal_unavailable_alert(
+            bucket_name, now=datetime.now(tz=UTC),
+        )
+    except Exception as exc:  # noqa: BLE001
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=bucket_name,
+            cause=f"Failed to claim journal-unavailable alert: {exc}",
+        ))
+        # A duplicate notification is a smaller failure than a lost one.
+        should_alert = True
+
+    if not should_alert:
+        return
+
+    try:
+        ctx.on_journal_unavailable(bucket_name, cause)
+    except Exception as cb_exc:  # noqa: BLE001
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=bucket_name,
+            cause=f"Journal-unavailable alert callback failed: {cb_exc}",
+        ))
+
+
 def _escalate_submission_failure(
     ctx: _BucketContext,
     writer: StateWriter,
@@ -1720,6 +1829,12 @@ def run_interval(
     # bucket-disabled alert shape (submission-failure-visibility Req 3.1).
     on_submission_failure = runtime_config.get("on_submission_failure")
 
+    # Callback invoked on the first interval in which a bucket's S3 Metadata
+    # journal is found to be absent. The lambda handler wires this to the same
+    # BatchJobFailureLogGroup / BatchJobFailureTopic destinations as the two
+    # callbacks above; library callers may omit it.
+    on_journal_unavailable = runtime_config.get("on_journal_unavailable")
+
     # Maximum consecutive S3 Batch Operations job failures before the bucket
     # is disabled to prevent runaway per-job costs on a low-churn deployment.
     # Default 4 matches the CloudFormation parameter default.
@@ -1785,6 +1900,7 @@ def run_interval(
             lookback=lookback,
             on_bucket_disable=on_bucket_disable,
             on_submission_failure=on_submission_failure,
+            on_journal_unavailable=on_journal_unavailable,
             max_batch_job_failures=max_batch_job_failures,
             completion_report_topic_arn=completion_report_topic_arn,
             journal_read_row_cap=journal_read_row_cap,
@@ -2167,6 +2283,7 @@ def _process_bucket(
     lookback: timedelta = DEFAULT_JOURNAL_LOOKBACK,
     on_bucket_disable=None,
     on_submission_failure=None,
+    on_journal_unavailable=None,
     max_batch_job_failures: int = 4,
     completion_report_topic_arn: str = "",
     journal_read_row_cap: int = JOURNAL_READ_ROW_CAP_DEFAULT,
@@ -2201,6 +2318,7 @@ def _process_bucket(
         max_batch_job_failures=max_batch_job_failures,
         on_bucket_disable=on_bucket_disable,
         on_submission_failure=on_submission_failure,
+        on_journal_unavailable=on_journal_unavailable,
     )
 
     rules = _resolve_rules(ctx)
@@ -2215,7 +2333,8 @@ def _process_bucket(
     if prep is None:
         return result
     writer, checkpoint_watermark, tracking, bucket_consecutive_failures, state = prep
-    journal_result = _read_journal_window(ctx, checkpoint_watermark, result)
+    journal_result = _read_journal_window(
+        ctx, checkpoint_watermark, result, writer)
     if journal_result is None:
         return result
     ops, since_timestamp, journal_until = journal_result
@@ -2770,6 +2889,11 @@ def _run_completion_tracking_interval(
         # (Requirement 4.2), so this count is what tells an operator whether a
         # wave of tagged objects has fully landed: zero means nothing is left
         # in tracking for the bucket.
+        #
+        # all_items is the bucket's entire completion_items map, not a window:
+        # get_all_completion_items applies no filter and no bound, and every
+        # item covered by a previous report was deleted after that publish. So
+        # the difference is the full remaining population, not a per-run slice.
         #
         # The same value is carried by every chunk of one run's report rather
         # than being decremented across chunks: the chunks are one logical

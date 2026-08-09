@@ -35,11 +35,16 @@ def _run_handler(
 
     Returns (cfnresponse_mock, s3_mock) so callers can assert on both.
     """
+    from botocore.exceptions import ClientError as _BotocoreClientError
+
     cfnresponse_mock = MagicMock()
     cfnresponse_mock.SUCCESS = "SUCCESS"
     cfnresponse_mock.FAILED = "FAILED"
 
     s3_mock = s3_client if s3_client is not None else MagicMock()
+    # Wire s3_mock.exceptions.ClientError to the real botocore class so that
+    # `except s3.exceptions.ClientError` in the handler works correctly.
+    s3_mock.exceptions.ClientError = _BotocoreClientError
 
     def make_client(service, **kwargs):
         return s3_mock if service == "s3" else MagicMock()
@@ -81,10 +86,15 @@ def _create_event(
     }
 
 
-def _update_event(**kwargs) -> dict:
+def _update_event(*, old_buckets: list[str] | None = None, **kwargs) -> dict:
     ev = _create_event(**kwargs)
     ev["RequestType"] = "Update"
     ev["PhysicalResourceId"] = ev["ResourceProperties"]["ConfigKey"]
+    if old_buckets is not None:
+        ev["OldResourceProperties"] = {
+            **ev["ResourceProperties"],
+            "Buckets": old_buckets,
+        }
     return ev
 
 
@@ -115,8 +125,9 @@ class TestCreate:
         """Create invokes s3.put_object with StateBucket and ConfigKey (Req 7.2)."""
         s3_mock = MagicMock()
         _run_handler(_create_event(), s3_client=s3_mock)
-        s3_mock.put_object.assert_called_once()
-        kwargs = s3_mock.put_object.call_args[1]
+        # First put_object call is the config write.
+        config_call = s3_mock.put_object.call_args_list[0]
+        kwargs = config_call[1]
         assert kwargs["Bucket"] == "example-state-bucket"
         assert kwargs["Key"] == "config/solution-config.json"
 
@@ -131,7 +142,7 @@ class TestCreate:
             ),
             s3_client=s3_mock,
         )
-        body = json.loads(s3_mock.put_object.call_args[1]["Body"])
+        body = json.loads(s3_mock.put_object.call_args_list[0][1]["Body"])
         assert body == {
             "buckets": [
                 {"name": "bucket-a", "region": "us-west-2"},
@@ -146,6 +157,9 @@ class TestCreate:
         cfnr.send.assert_called_once()
         assert cfnr.send.call_args[0][2] == "SUCCESS"
         assert cfnr.send.call_args[1]["physicalResourceId"] == "config/solution-config.json"
+        # Data carries CheckFrequencySeconds for the alarm Period derivation.
+        data = cfnr.send.call_args[0][3]
+        assert data["CheckFrequencySeconds"] == "3600"
 
     def test_sets_content_type_json(self):
         """Create sets ContentType=application/json on the S3 object."""
@@ -160,7 +174,7 @@ class TestCreate:
             _create_event(buckets=["b1", "b2", "b3"], region="eu-central-1"),
             s3_client=s3_mock,
         )
-        body = json.loads(s3_mock.put_object.call_args[1]["Body"])
+        body = json.loads(s3_mock.put_object.call_args_list[0][1]["Body"])
         assert all(entry["region"] == "eu-central-1" for entry in body["buckets"])
 
 
@@ -173,7 +187,11 @@ class TestUpdate:
     def test_calls_put_object_not_delete(self):
         """Update invokes put_object (not delete_object) with the new config (Req 7.3)."""
         s3_mock = MagicMock()
-        _run_handler(_update_event(buckets=["new-bucket"]), s3_client=s3_mock)
+        _run_handler(
+            _update_event(buckets=["new-bucket"], old_buckets=["new-bucket"]),
+            s3_client=s3_mock,
+        )
+        # Only the config write — no seed because bucket list is unchanged.
         s3_mock.put_object.assert_called_once()
         s3_mock.delete_object.assert_not_called()
 
@@ -186,7 +204,10 @@ class TestUpdate:
     def test_writes_updated_config(self):
         """Update writes the new bucket list (Req 7.3)."""
         s3_mock = MagicMock()
-        _run_handler(_update_event(buckets=["only-bucket"], region="ap-east-1"), s3_client=s3_mock)
+        _run_handler(
+            _update_event(buckets=["only-bucket"], region="ap-east-1", old_buckets=["only-bucket"]),
+            s3_client=s3_mock,
+        )
         body = json.loads(s3_mock.put_object.call_args[1]["Body"])
         assert [e["name"] for e in body["buckets"]] == ["only-bucket"]
 
@@ -265,8 +286,11 @@ class TestFailureSignaling:
 
 
 def _raising_s3() -> MagicMock:
+    from botocore.exceptions import ClientError as _BotocoreClientError
+
     m = MagicMock()
     m.put_object.side_effect = RuntimeError("simulated failure")
+    m.exceptions.ClientError = _BotocoreClientError
     return m
 
 
@@ -293,7 +317,7 @@ class TestProcessingIntervalDerivation:
         """processing_interval is derived from CheckFrequencyMinutes."""
         s3_mock = MagicMock()
         _run_handler(_create_event(check_frequency_minutes=minutes), s3_client=s3_mock)
-        body = json.loads(s3_mock.put_object.call_args[1]["Body"])
+        body = json.loads(s3_mock.put_object.call_args_list[0][1]["Body"])
         assert body["processing_interval"] == expected
 
 
@@ -374,3 +398,189 @@ def test_config_construction_is_loader_accepted(
     # (b) processing_interval is present in the raw config (load_config doesn't consume it,
     # but the handler must write it for schema fidelity — Req 7.5)
     assert config["processing_interval"] == interval
+
+
+# ---------------------------------------------------------------------------
+# Tests: Checkpoint seeding on Create and Update
+# Feature: deploy-time-watermark-seed
+# Requirements: 1.1–1.5, 2.1–2.4
+# ---------------------------------------------------------------------------
+
+
+def _seed_put_calls(s3_mock: MagicMock) -> list[dict]:
+    """Return put_object call kwargs that target state/ keys (checkpoint seeds)."""
+    return [
+        call[1]
+        for call in s3_mock.put_object.call_args_list
+        if call[1].get("Key", "").startswith("state/")
+    ]
+
+
+class TestCheckpointSeedCreate:
+    """On Create, every source bucket gets a seeded checkpoint (Req 1.1–1.5)."""
+
+    def test_seeds_all_buckets_on_create(self):
+        """Create writes one state/<name>.json per bucket (Req 1.1)."""
+        s3_mock = MagicMock()
+        _run_handler(_create_event(buckets=["alpha", "beta"]), s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        assert len(seeds) == 2
+        keys = {s["Key"] for s in seeds}
+        assert keys == {"state/alpha.json", "state/beta.json"}
+
+    def test_seed_uses_canonical_watermark_format(self):
+        """Seeded watermark has format YYYY-MM-DDTHH:MM:SS.ffffffZ (Req 1.2)."""
+        import re
+
+        s3_mock = MagicMock()
+        _run_handler(_create_event(buckets=["my-bucket"]), s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        body = json.loads(seeds[0]["Body"])
+        wm = body["last_processed_watermark"]
+        assert re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$", wm), (
+            f"Watermark {wm!r} is not in canonical format"
+        )
+
+    def test_seed_checkpoint_schema(self):
+        """Seeded checkpoint has source_bucket, watermark, lease, processed_window (Req 1.3)."""
+        s3_mock = MagicMock()
+        _run_handler(_create_event(buckets=["src-bucket"]), s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        body = json.loads(seeds[0]["Body"])
+        assert body["source_bucket"] == "src-bucket"
+        assert body["lease"] is None
+        assert body["processed_window"] == []
+        assert "last_processed_watermark" in body
+
+    def test_seed_uses_conditional_put(self):
+        """Seed writes use IfNoneMatch=* to avoid overwriting (Req 1.4)."""
+        s3_mock = MagicMock()
+        _run_handler(_create_event(buckets=["b1"]), s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        assert seeds[0].get("IfNoneMatch") == "*"
+
+    def test_seed_respects_kms_key(self):
+        """Seed writes use SSE-KMS when KmsKeyArn is supplied."""
+        s3_mock = MagicMock()
+        event = _create_event(buckets=["b1"])
+        event["ResourceProperties"]["KmsKeyArn"] = "arn:aws:kms:us-east-1:123:key/abc"
+        _run_handler(event, s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        assert seeds[0]["ServerSideEncryption"] == "aws:kms"
+        assert seeds[0]["SSEKMSKeyId"] == "arn:aws:kms:us-east-1:123:key/abc"
+
+    def test_precondition_failed_is_swallowed(self):
+        """A 412 PreconditionFailed on the seed is silently skipped (Req 1.5)."""
+        from botocore.exceptions import ClientError as _CE
+
+        s3_mock = MagicMock()
+        call_count = {"n": 0}
+        original_put = s3_mock.put_object
+
+        def _side_effect(**kwargs):
+            call_count["n"] += 1
+            if kwargs.get("Key", "").startswith("state/"):
+                raise _CE(
+                    {"Error": {"Code": "PreconditionFailed", "Message": "exists"}},
+                    "PutObject",
+                )
+            return original_put(**kwargs)
+
+        s3_mock.put_object = MagicMock(side_effect=_side_effect)
+        s3_mock.exceptions.ClientError = _CE
+        cfnr, _ = _run_handler(_create_event(buckets=["b1"]), s3_client=s3_mock)
+        # Handler must still succeed overall.
+        assert cfnr.send.call_args[0][2] == "SUCCESS"
+
+    def test_conditional_request_conflict_is_swallowed(self):
+        """A ConditionalRequestConflict on the seed is silently skipped (Req 1.5)."""
+        from botocore.exceptions import ClientError as _CE
+
+        s3_mock = MagicMock()
+
+        def _side_effect(**kwargs):
+            if kwargs.get("Key", "").startswith("state/"):
+                raise _CE(
+                    {"Error": {"Code": "ConditionalRequestConflict", "Message": "conflict"}},
+                    "PutObject",
+                )
+
+        s3_mock.put_object = MagicMock(side_effect=_side_effect)
+        s3_mock.exceptions.ClientError = _CE
+        cfnr, _ = _run_handler(_create_event(buckets=["b1"]), s3_client=s3_mock)
+        assert cfnr.send.call_args[0][2] == "SUCCESS"
+
+    def test_unexpected_client_error_propagates(self):
+        """A non-412 ClientError on the seed propagates as FAILED (Req 1.5 inverse)."""
+        from botocore.exceptions import ClientError as _CE
+
+        s3_mock = MagicMock()
+
+        def _side_effect(**kwargs):
+            if kwargs.get("Key", "").startswith("state/"):
+                raise _CE(
+                    {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+                    "PutObject",
+                )
+
+        s3_mock.put_object = MagicMock(side_effect=_side_effect)
+        s3_mock.exceptions.ClientError = _CE
+        cfnr, _ = _run_handler(_create_event(buckets=["b1"]), s3_client=s3_mock)
+        assert cfnr.send.call_args[0][2] == "FAILED"
+
+
+class TestCheckpointSeedUpdate:
+    """On Update, only newly added buckets get a seed (Req 2.1–2.4)."""
+
+    def test_seeds_only_new_buckets(self):
+        """Update with one new bucket seeds only that bucket (Req 2.1, 2.2)."""
+        s3_mock = MagicMock()
+        event = _update_event(
+            buckets=["existing", "new-one"],
+            old_buckets=["existing"],
+        )
+        _run_handler(event, s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        assert len(seeds) == 1
+        assert seeds[0]["Key"] == "state/new-one.json"
+
+    def test_unchanged_buckets_not_seeded(self):
+        """Update with same bucket list writes no state objects (Req 2.3, 2.4)."""
+        s3_mock = MagicMock()
+        event = _update_event(
+            buckets=["alpha", "beta"],
+            old_buckets=["alpha", "beta"],
+        )
+        _run_handler(event, s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        assert seeds == []
+
+    def test_removed_bucket_not_seeded(self):
+        """A bucket removed from the list is not touched (Req 2.3)."""
+        s3_mock = MagicMock()
+        event = _update_event(
+            buckets=["beta"],
+            old_buckets=["alpha", "beta"],
+        )
+        _run_handler(event, s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        assert seeds == []
+
+    def test_no_old_resource_properties_seeds_all(self):
+        """If OldResourceProperties is absent (edge case), all are treated as new."""
+        s3_mock = MagicMock()
+        event = _update_event(buckets=["a", "b"])  # old_buckets=None -> no OldResourceProperties
+        _run_handler(event, s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        assert len(seeds) == 2
+
+
+class TestCheckpointSeedDelete:
+    """Delete does not touch state objects (Req 6.1)."""
+
+    def test_delete_does_not_write_state(self):
+        """Delete event writes no state/ objects."""
+        s3_mock = MagicMock()
+        _run_handler(_delete_event(), s3_client=s3_mock)
+        seeds = _seed_put_calls(s3_mock)
+        assert seeds == []

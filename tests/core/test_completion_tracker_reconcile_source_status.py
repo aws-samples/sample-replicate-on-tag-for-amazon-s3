@@ -31,6 +31,8 @@ def make_pending_obj(
     bops_confirmed: bool = True,
     object_key: str = "a.txt",
     version_id: str | None = "v1",
+    matched_rules: frozenset[str] = frozenset(),
+    destinations: frozenset[str] = frozenset(),
 ) -> TrackedObject:
     return TrackedObject(
         source_bucket="my-bucket",
@@ -45,6 +47,8 @@ def make_pending_obj(
             )
         },
         state=CompletionState.PENDING,
+        matched_rules=matched_rules,
+        destinations=destinations,
     )
 
 
@@ -352,14 +356,58 @@ class TestReportChunking:
             body = json.dumps(build_completion_report("my-bucket", batch), indent=2)
             assert len(body) < 262_144
 
-    def test_longer_keys_produce_more_batches(self):
-        """Sizing is measured per entry, not a fixed item count (Req 4.9)."""
-        short = chunk_items_for_report(self._objs(3000, key_len=10))
-        long = chunk_items_for_report(self._objs(3000, key_len=200))
-        assert len(long) > len(short)
+    def _group_objs(self, n_groups: int, per_group: int = 1, name_len: int = 20):
+        """``n_groups`` distinct rule/destination groups, ``per_group`` objects each."""
+        return [
+            make_pending_obj(
+                object_key=f"{g}-{i}.txt",
+                version_id=f"v{i}",
+                matched_rules=frozenset({f"rule-{g:0{name_len}d}"}),
+                destinations=frozenset({f"dest-{g:0{name_len}d}"}),
+            )
+            for g in range(n_groups)
+            for i in range(per_group)
+        ]
 
-    def test_single_oversized_item_still_emitted_alone(self):
-        """Stays total rather than looping or dropping the item."""
-        batches = chunk_items_for_report(self._objs(1), max_item_bytes=1)
+    def test_object_count_alone_never_splits_a_batch(self):
+        """Object count does not drive size — a group's cost is its header, so
+        one group of any size is one batch however long the keys are."""
+        assert len(chunk_items_for_report(self._objs(5000, key_len=10))) == 1
+        assert len(chunk_items_for_report(self._objs(5000, key_len=200))) == 1
+
+    def test_many_groups_split_into_multiple_batches(self):
+        """Group count is the axis that drives a split (Req 1.6)."""
+        objs = self._group_objs(n_groups=1200)
+        batches = chunk_items_for_report(objs)
+        assert len(batches) > 1
+        batched = [o for batch in batches for o in batch]
+        assert [id(o) for o in batched] == [id(o) for o in objs]
+
+    def test_many_groups_each_batch_fits_the_sns_message_limit(self):
+        """Req 1.6: the guard holds at the group count a 1,000-rule bucket
+        could reach, not only for the single-group common case."""
+        import json
+
+        from src.core.completion_tracker import build_completion_report
+
+        for batch in chunk_items_for_report(self._group_objs(n_groups=1200)):
+            body = json.dumps(build_completion_report("my-bucket", batch), indent=2)
+            assert len(body) < 262_144
+
+    def test_a_group_is_never_split_across_batches(self):
+        """A split between groups keeps each message internally consistent and
+        never repeats one group's header in two messages."""
+        objs = self._group_objs(n_groups=1200, per_group=3)
+        batches = chunk_items_for_report(objs)
+        assert len(batches) > 1
+        seen: set[tuple[str, ...]] = set()
+        for batch in batches:
+            keys = {tuple(sorted(o.matched_rules)) for o in batch}
+            assert seen.isdisjoint(keys)
+            seen |= keys
+
+    def test_single_oversized_group_still_emitted_alone(self):
+        """Stays total rather than looping or dropping the group."""
+        batches = chunk_items_for_report(self._objs(1), max_group_bytes=1)
         assert len(batches) == 1
         assert len(batches[0]) == 1

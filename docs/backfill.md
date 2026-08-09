@@ -2,6 +2,8 @@
 
 Adding or widening a tag-scoped rule does not replicate objects that were tagged before the change. Their journal records sit below the checkpoint watermark and outside the lookback window, so no run picks them up. Matching them from the source side would need a `HeadObject` per object in scope, so the Solution does not do it. Backfill manually instead.
 
+The same applies to objects tagged before initial deployment. The Solution begins processing from the deployment timestamp (see [Journal Start Point](../README.md#journal-start-point)), so tagging activity that predates the stack has the same shape: records below the watermark, unreachable by the scheduled runs, and recoverable with the recipe below.
+
 The recipe below queries the **S3 Metadata live inventory table** for the objects the new rule selects and writes a CSV manifest for an `S3ReplicateObject` Batch Operations job you submit yourself.
 
 Read this first:

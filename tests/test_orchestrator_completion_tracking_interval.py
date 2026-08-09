@@ -20,6 +20,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.adapters.sns_report_adapter import PublishResult
 from src.adapters.source_status_adapter import SourceStatusCheckKind, SourceStatusResult
 from src.core.models import (
@@ -503,7 +505,8 @@ def test_publish_mixed_batch_excludes_pending_includes_resolved():
 
     report = publish_mock.call_args[0][2]
     assert report["item_count"] == 1
-    assert report["items"][0]["object_key"] == "resolved.txt"
+    assert report["groups"][0]["count"] == 1
+    assert report["groups"][0]["outcome_counts"] == {"COMPLETE": 1}
 
     deleted_keys = store.delete_completion_items.call_args[0][3]
     assert deleted_keys == ["key-resolved"]
@@ -570,6 +573,49 @@ def test_outstanding_is_zero_when_the_report_covers_everything_tracked():
     assert report["summary"].endswith("No objects remain in tracking.")
 
 
+@pytest.mark.parametrize("n_resolved,n_pending", [(1, 0), (3, 0), (1, 4), (4, 1), (2, 2)])
+def test_outstanding_zero_iff_no_tracked_item_is_left_behind(n_resolved, n_pending):
+    """Requirement 2.3: an operator must be able to read ``outstanding == 0``
+    as "nothing remains for this bucket", so the count must equal the tracked
+    items this run does not delete — never a negative, and never zero while an
+    item is still in the state object.
+    """
+    resolved = [_resolved_obj(object_key=f"r{i}.txt") for i in range(n_resolved)]
+    pending = [_obj(object_key=f"p{i}.txt") for i in range(n_pending)]
+    tracked = {f"key-r{i}": obj for i, obj in enumerate(resolved)}
+    tracked.update({f"key-p{i}": obj for i, obj in enumerate(pending)})
+    all_items = {_SOURCE_BUCKET: tracked}
+    scan_state = {
+        _SOURCE_BUCKET: {
+            "cfg-1": _quiescent_scan_state(
+                resolved[0].configs["cfg-1"].manifest_generated_at
+            )
+        }
+    }
+    store = _make_store(all_items_by_bucket=all_items, scan_state_by_bucket=scan_state)
+
+    with patch(
+        "src.orchestrator.sns_report_adapter.publish_completion_report",
+        return_value=PublishResult(success=True, message_id="msg-1"),
+    ) as publish_mock:
+        _run(
+            [_bucket()],
+            _make_factory(),
+            store,
+            completion_report_topic_arn="arn:aws:sns:us-east-1:123456789012:CompletionReportTopic",
+        )
+
+    report = publish_mock.call_args[0][2]
+    outstanding = report["outstanding"]
+    deleted = set(store.delete_completion_items.call_args[0][3])
+
+    assert outstanding >= 0
+    # What the report claims is left must be what is actually left.
+    assert outstanding == len(set(tracked) - deleted)
+    # And the all-clear is only ever asserted when nothing is left.
+    assert (outstanding == 0) is (deleted == set(tracked))
+
+
 def test_publish_multi_config_item_aggregate_outcome():
     obj = TrackedObject(
         source_bucket=_SOURCE_BUCKET,
@@ -609,9 +655,9 @@ def test_publish_multi_config_item_aggregate_outcome():
     assert report["item_count"] == 1
     # The multiple configs collapse to one aggregate outcome and are not
     # reported as destinations.
-    assert report["items"][0]["source_bucket"] == _SOURCE_BUCKET
-    assert "destinations" not in report["items"][0]
-    assert report["items"][0]["outcome"] == "COMPLETE"
+    assert report["groups"][0]["source_bucket"] == _SOURCE_BUCKET
+    assert report["groups"][0]["destinations"] == []
+    assert report["groups"][0]["outcome_counts"] == {"COMPLETE": 1}
     assert report["outcome_counts"]["COMPLETE"] == 1
 
 
@@ -743,7 +789,7 @@ def test_publish_item_absent_from_check_eligible_but_present_in_full_set():
     assert publish_mock.call_count == 1
     report = publish_mock.call_args[0][2]
     assert report["item_count"] == 1
-    assert report["items"][0]["object_key"] == "fully-resolved.txt"
+    assert report["groups"][0]["count"] == 1
     store.delete_completion_items.assert_called_once()
 
 

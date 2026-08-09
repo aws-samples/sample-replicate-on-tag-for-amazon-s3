@@ -3,9 +3,11 @@
 Source of truth for the inline Lambda Code.ZipFile; tests/test_template.py
 asserts they match and that this file is < 4096 bytes.
 
-CREATE/UPDATE: writes Solution_Config JSON to State_Bucket. DELETE: removes it.
+CREATE/UPDATE: writes Solution_Config JSON to State_Bucket and seeds a
+checkpoint for each new source bucket. DELETE: removes config only.
 """
 import json
+from datetime import datetime, timezone
 
 import boto3
 import cfnresponse  # auto-provided for inline ZipFile Lambdas; do not bundle
@@ -22,6 +24,35 @@ def _interval_from_minutes(minutes):
     return f"{n}m"
 
 
+def _seed_checkpoints(bucket, names, kms_key_arn):
+    """Write an initial checkpoint for each bucket, skipping if one exists."""
+    wm = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    for name in names:
+        body = json.dumps({
+            "source_bucket": name,
+            "last_processed_watermark": wm,
+            "lease": None,
+            "processed_window": [],
+        })
+        kw = {
+            "Bucket": bucket,
+            "Key": f"state/{name}.json",
+            "Body": body.encode("utf-8"),
+            "ContentType": "application/json",
+            "IfNoneMatch": "*",
+        }
+        if kms_key_arn:
+            kw["ServerSideEncryption"] = "aws:kms"
+            kw["SSEKMSKeyId"] = kms_key_arn
+        try:
+            s3.put_object(**kw)
+        except s3.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] not in (
+                "PreconditionFailed", "ConditionalRequestConflict",
+            ):
+                raise
+
+
 def handler(event, context):
     props = event.get("ResourceProperties", {})
     bucket = props["StateBucket"]
@@ -32,7 +63,6 @@ def handler(event, context):
         else:  # Create or Update
             region = props["Region"]
             names = props["Buckets"]  # list from CommaDelimitedList parameter
-            # Omits any runtime "disabled" flag (see lambda_handler.py).
             config = {
                 "buckets": [{"name": n, "region": region} for n in names],
                 "processing_interval": _interval_from_minutes(props["CheckFrequencyMinutes"]),
@@ -48,7 +78,20 @@ def handler(event, context):
                 put_kwargs["ServerSideEncryption"] = "aws:kms"
                 put_kwargs["SSEKMSKeyId"] = kms_key_arn
             s3.put_object(**put_kwargs)
-        cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId=key)
+            # Seed checkpoint for newly added buckets only.
+            if event["RequestType"] == "Create":
+                to_seed = names
+            else:
+                old = set(event.get("OldResourceProperties", {}).get("Buckets", []))
+                to_seed = [n for n in names if n not in old]
+            if to_seed:
+                _seed_checkpoints(bucket, to_seed, kms_key_arn)
+        freq_seconds = str(int(props["CheckFrequencyMinutes"]) * 60)
+        cfnresponse.send(
+            event, context, cfnresponse.SUCCESS,
+            {"CheckFrequencySeconds": freq_seconds},
+            physicalResourceId=key,
+        )
     except Exception as exc:  # signal failure so the stack fails fast (Req 7.6)
         cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
         raise

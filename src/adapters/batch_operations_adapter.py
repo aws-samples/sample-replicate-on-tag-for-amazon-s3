@@ -250,7 +250,7 @@ def submit_batch_job(
     # ConfirmationRequired=False means the job transitions directly to Ready
     # and starts running immediately after creation.
     try:
-        description = f"s3rot: {source_bucket} / {config_id} ({object_count} objects)"
+        description = f"s3rot: {source_bucket} ({object_count} objects)"
         # S3 Batch Operations limits Description to 256 characters.
         if len(description) > 256:
             description = description[:253] + "..."

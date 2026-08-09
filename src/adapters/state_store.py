@@ -163,6 +163,15 @@ class ConditionalWriteError(Exception):
 # Private helpers
 # ---------------------------------------------------------------------------
 
+# Key in a bucket's state payload mapping bucket name to a consecutive
+# submission-failure count, cleared by a successful submission.
+_SUBMISSION_FAILURE_STREAK_FIELD = "submission_failure_streaks"
+
+# Key in a bucket's state payload mapping bucket name to the ISO 8601 time of
+# the most recent journal-unavailable alert. A timestamp rather than a count
+# because it expires on its own, so nothing has to clear it on the healthy path.
+_JOURNAL_UNAVAILABLE_ALERT_FIELD = "journal_unavailable_alerts"
+
 
 def _state_key(source_bucket: str) -> str:
     """Return the S3 object key for a bucket's state object."""
@@ -1719,7 +1728,7 @@ class StateStore:
             state = _default_state(source_bucket)
             payload = json.loads(serialize(state))
 
-        streaks = payload.setdefault("submission_failure_streaks", {})
+        streaks = payload.setdefault(_SUBMISSION_FAILURE_STREAK_FIELD, {})
         new_value = int(streaks.get(bucket_name, 0)) + 1
         streaks[bucket_name] = new_value
 
@@ -1761,14 +1770,73 @@ class StateStore:
             state = _default_state(source_bucket)
             payload = json.loads(serialize(state))
 
-        streaks = payload.get("submission_failure_streaks", {})
+        streaks = payload.get(_SUBMISSION_FAILURE_STREAK_FIELD, {})
         if bucket_name in streaks:
             del streaks[bucket_name]
-            payload["submission_failure_streaks"] = streaks
+            payload[_SUBMISSION_FAILURE_STREAK_FIELD] = streaks
 
         return _write_state_payload(
             s3_client, state_bucket, key, payload, current_etag, self._kms_key_arn
         )
+
+    def claim_journal_unavailable_alert(
+        self,
+        s3_client: Any,
+        state_bucket: str,
+        source_bucket: str,
+        bucket_name: str,
+        now: datetime,
+        min_interval: timedelta,
+        current_etag: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Claim the right to send one journal-unavailable alert for a bucket.
+
+        Returns ``(True, new_etag)`` when no alert has been recorded for
+        *bucket_name* within *min_interval* of *now*, having recorded *now* as
+        the latest alert time. Returns ``(False, current_etag)`` otherwise,
+        without writing.
+
+        A recorded timestamp that expires on its own is what makes this
+        self-clearing. The alternative, a counter cleared on the next
+        successful read, would put a write on the healthy path purely to delete
+        a key that is almost never present, and would thread that write into
+        the per-bucket conditional-write ETag chain for no benefit. It would
+        also go permanently quiet after a single notification, which is the
+        wrong behavior for a condition nobody has acted on yet.
+
+        A timestamp that cannot be parsed is treated as absent, so a
+        hand-edited or truncated value produces an extra alert rather than
+        suppressing alerts indefinitely.
+
+        Returns:
+            A tuple of (alert_should_be_sent, etag). The ETag is *current_etag*
+            unchanged when nothing was written.
+        """
+        key = _state_key(source_bucket)
+
+        payload, _ = _read_state_payload(s3_client, state_bucket, key)
+        if payload is None:
+            state = _default_state(source_bucket)
+            payload = json.loads(serialize(state))
+
+        alerts = payload.setdefault(_JOURNAL_UNAVAILABLE_ALERT_FIELD, {})
+        last_raw = alerts.get(bucket_name)
+        if last_raw:
+            try:
+                last = datetime.fromisoformat(str(last_raw))
+            except (TypeError, ValueError):
+                last = None
+            if last is not None:
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=now.tzinfo)
+                if now - last < min_interval:
+                    return False, current_etag
+
+        alerts[bucket_name] = now.isoformat()
+        new_etag = _write_state_payload(
+            s3_client, state_bucket, key, payload, current_etag, self._kms_key_arn
+        )
+        return True, new_etag
 
     def mark_report_diagnosed(
         self,

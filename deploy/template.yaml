@@ -1149,7 +1149,9 @@ Resources:
                 Action:
                   - s3:PutObject
                   - s3:DeleteObject
-                Resource: !Sub "${StateBucket.Arn}/config/solution-config.json"
+                Resource:
+                  - !Sub "${StateBucket.Arn}/config/solution-config.json"
+                  - !Sub "${StateBucket.Arn}/state/*"
               - Sid: ConfigResourceLogs
                 Effect: Allow
                 Action:
@@ -1186,9 +1188,11 @@ Resources:
           Source of truth for the inline Lambda Code.ZipFile; tests/test_template.py
           asserts they match and that this file is < 4096 bytes.
 
-          CREATE/UPDATE: writes Solution_Config JSON to State_Bucket. DELETE: removes it.
+          CREATE/UPDATE: writes Solution_Config JSON to State_Bucket and seeds a
+          checkpoint for each new source bucket. DELETE: removes config only.
           """
           import json
+          from datetime import datetime, timezone
 
           import boto3
           import cfnresponse  # auto-provided for inline ZipFile Lambdas; do not bundle
@@ -1205,6 +1209,35 @@ Resources:
               return f"{n}m"
 
 
+          def _seed_checkpoints(bucket, names, kms_key_arn):
+              """Write an initial checkpoint for each bucket, skipping if one exists."""
+              wm = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+              for name in names:
+                  body = json.dumps({
+                      "source_bucket": name,
+                      "last_processed_watermark": wm,
+                      "lease": None,
+                      "processed_window": [],
+                  })
+                  kw = {
+                      "Bucket": bucket,
+                      "Key": f"state/{name}.json",
+                      "Body": body.encode("utf-8"),
+                      "ContentType": "application/json",
+                      "IfNoneMatch": "*",
+                  }
+                  if kms_key_arn:
+                      kw["ServerSideEncryption"] = "aws:kms"
+                      kw["SSEKMSKeyId"] = kms_key_arn
+                  try:
+                      s3.put_object(**kw)
+                  except s3.exceptions.ClientError as e:
+                      if e.response["Error"]["Code"] not in (
+                          "PreconditionFailed", "ConditionalRequestConflict",
+                      ):
+                          raise
+
+
           def handler(event, context):
               props = event.get("ResourceProperties", {})
               bucket = props["StateBucket"]
@@ -1215,7 +1248,6 @@ Resources:
                   else:  # Create or Update
                       region = props["Region"]
                       names = props["Buckets"]  # list from CommaDelimitedList parameter
-                      # Omits any runtime "disabled" flag (see lambda_handler.py).
                       config = {
                           "buckets": [{"name": n, "region": region} for n in names],
                           "processing_interval": _interval_from_minutes(props["CheckFrequencyMinutes"]),
@@ -1231,7 +1263,20 @@ Resources:
                           put_kwargs["ServerSideEncryption"] = "aws:kms"
                           put_kwargs["SSEKMSKeyId"] = kms_key_arn
                       s3.put_object(**put_kwargs)
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId=key)
+                      # Seed checkpoint for newly added buckets only.
+                      if event["RequestType"] == "Create":
+                          to_seed = names
+                      else:
+                          old = set(event.get("OldResourceProperties", {}).get("Buckets", []))
+                          to_seed = [n for n in names if n not in old]
+                      if to_seed:
+                          _seed_checkpoints(bucket, to_seed, kms_key_arn)
+                  freq_seconds = str(int(props["CheckFrequencyMinutes"]) * 60)
+                  cfnresponse.send(
+                      event, context, cfnresponse.SUCCESS,
+                      {"CheckFrequencySeconds": freq_seconds},
+                      physicalResourceId=key,
+                  )
               except Exception as exc:  # signal failure so the stack fails fast (Req 7.6)
                   cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
                   raise
@@ -1259,6 +1304,11 @@ Resources:
       Region: !Ref AWS::Region
       CheckFrequencyMinutes: !Ref CheckFrequencyMinutes
       KmsKeyArn: !If [HasKmsKey, !Ref KmsKeyArn, ""]
+      # CodeHash forces re-invocation when the Lambda code changes (the
+      # handler's response attributes may have changed). Without it, an
+      # UPDATE that passes only UsePreviousValue parameters never re-invokes
+      # the custom resource even though its Lambda code was replaced.
+      CodeHash: "2"
 
   # Parses s3://bucket/key CodeLocation (robust for keys with prefixes,
   # which intrinsics can't extract) and checks the referenced zip has this
@@ -1827,12 +1877,11 @@ Resources:
   # version of the same event. There is no equivalent path for a Lambda failure,
   # so leaving the actions off would reproduce the gap being closed here.
   #
-  # TreatMissingData is missing, not notBreaching. Invocations are sparse: at
-  # the default CheckFrequencyMinutes of 15 only one 5-minute period in three
-  # carries a datapoint, so notBreaching would read each empty period as a
-  # recovery and re-alarm on the next failing run, emailing on every cycle.
-  # Retaining state across the gaps yields one notification when runs start
-  # failing and one when they recover, at any CheckFrequencyMinutes.
+  # TreatMissingData is missing, not notBreaching. With the period matching
+  # CheckFrequencyMinutes each period carries exactly one datapoint, so
+  # missing periods only occur when the schedule genuinely skips (throttle,
+  # scheduler delay). Retaining state across those rare gaps gives one
+  # notification when runs start failing and one when they recover.
   #
   # Throttles are deliberately not alarmed on: ReservedConcurrentExecutions is 1
   # by design, so a throttle means a scheduled trigger arrived while the
@@ -1854,7 +1903,13 @@ Resources:
         - Name: FunctionName
           Value: !Ref ReplicationLambda
       Statistic: Sum
-      Period: 300
+      # Period matches CheckFrequencyMinutes so every period carries exactly
+      # one invocation's datapoint. A shorter period (e.g. 300s with a
+      # 15-minute schedule) leaves two empty periods per cycle; after a few
+      # cycles CloudWatch transitions to INSUFFICIENT_DATA, and the next
+      # datapoint transitions back to OK, emitting a spurious OKActions
+      # email on every cycle.
+      Period: !GetAtt SolutionConfig.CheckFrequencySeconds
       EvaluationPeriods: 1
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold

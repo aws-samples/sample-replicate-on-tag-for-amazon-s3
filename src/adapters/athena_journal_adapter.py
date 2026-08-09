@@ -69,6 +69,17 @@ class JournalReadError:
         Journal position of the affected record (per-record errors only).
     object_key:
         Object key of the affected record (per-record errors only).
+    is_journal_unavailable:
+        ``True`` when the failure reason indicates the journal table or its
+        namespace does not exist, rather than a transient or permission
+        failure — in practice, that the S3 Metadata journal is not enabled on
+        this bucket, or the Region's ``s3tablescatalog`` integration was never
+        registered. This is an unmet prerequisite, not a condition that
+        retrying resolves, so the caller escalates it to an operator instead
+        of only logging it (see
+        :func:`src.orchestrator._escalate_journal_unavailable`).
+
+        Always ``False`` for per-record errors.
     """
 
     bucket: str
@@ -76,11 +87,46 @@ class JournalReadError:
     is_fatal: bool
     sequence_number: str | None = None
     object_key: str | None = None
+    is_journal_unavailable: bool = False
 
 
 # ---------------------------------------------------------------------------
 # Internal SQL helpers
 # ---------------------------------------------------------------------------
+
+
+# Substrings in an Athena failure reason that identify a missing journal table
+# or namespace, as opposed to a transient failure or a permission problem.
+# Matched case-insensitively.
+#
+# Deliberately excludes access-denied wording. A Lake Formation account
+# missing a grant also cannot read the journal, but the remediation is a
+# grant, not enabling the journal, so telling the operator to enable a journal
+# that already exists would send them down the wrong path. That case stays a
+# generic fatal error.
+_JOURNAL_UNAVAILABLE_MARKERS = (
+    "table_not_found",
+    "schema_not_found",
+    "database_not_found",
+    "entitynotfoundexception",
+    "does not exist",
+)
+
+
+def _is_journal_unavailable_reason(reason: str) -> bool:
+    """Return ``True`` when *reason* indicates the journal table is absent.
+
+    Athena reports a missing table or namespace through the human-readable
+    ``StateChangeReason`` rather than a distinct error code, so matching on
+    its text is the only signal available. That makes this classifier
+    inherently approximate, and it is built to fail in the harmless
+    direction: an unrecognised reason simply stays a generic fatal journal
+    error, which is exactly the behavior that existed before this
+    classification was added. A false negative therefore costs only the
+    escalation, never correctness.
+    """
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _JOURNAL_UNAVAILABLE_MARKERS)
 
 
 def _escape_sql_string(value: str) -> str:
@@ -668,6 +714,13 @@ def read_journal(
     unchanged** so the records are retried on the next run
     (Requirements 4.4, 12.3).
 
+    When the failure reason identifies the journal table or its namespace as
+    absent, the fatal error additionally carries
+    ``is_journal_unavailable=True``.  That distinguishes an unmet
+    prerequisite, which retrying never resolves and which therefore warrants
+    escalating to an operator, from a transient failure that the next run
+    clears on its own.
+
     Parameters
     ----------
     athena_client:
@@ -730,7 +783,15 @@ def read_journal(
             f"({error_code}): {exc}"
         )
         logger.error("%s | %s | %s", _COMPONENT, bucket_name, cause)
-        return [], [JournalReadError(bucket=bucket_name, cause=cause, is_fatal=True)]
+        # A missing namespace can also surface here, as an InvalidRequestException
+        # at submission rather than a FAILED terminal state, so the same
+        # classification applies to this branch.
+        return [], [JournalReadError(
+            bucket=bucket_name,
+            cause=cause,
+            is_fatal=True,
+            is_journal_unavailable=_is_journal_unavailable_reason(str(exc)),
+        )]
 
     # ------------------------------------------------------------------
     # Step 2: poll until the query reaches a terminal state
@@ -758,7 +819,12 @@ def read_journal(
             f"for bucket {bucket_name!r}: {reason}"
         )
         logger.error("%s | %s | %s", _COMPONENT, bucket_name, cause)
-        return [], [JournalReadError(bucket=bucket_name, cause=cause, is_fatal=True)]
+        return [], [JournalReadError(
+            bucket=bucket_name,
+            cause=cause,
+            is_fatal=True,
+            is_journal_unavailable=_is_journal_unavailable_reason(reason),
+        )]
 
     # ------------------------------------------------------------------
     # Step 3: retrieve and parse result rows

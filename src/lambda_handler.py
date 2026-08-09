@@ -14,6 +14,14 @@ callback writes ``disabled=true``, ``disabled_reason``, and ``disabled_at``
 back to ``solution-config.json`` so the bucket is skipped on subsequent
 intervals.  Other buckets in the same run are unaffected.
 
+A separate ``on_journal_unavailable`` callback fires on the first interval in
+which a source bucket's S3 Metadata journal cannot be found. That condition
+leaves the run itself successful, so it raises no Lambda ``Errors`` metric and
+``ReplicationLambdaErrorAlarm`` does not fire; without this callback the bucket
+would replicate nothing and report nothing. The bucket is left enabled, since
+the remedy is enabling the journal rather than any change to the Solution's
+configuration.
+
 Self-service recovery: the callback also (a) clears the bucket's persisted
 ``SubmissionRecord`` in the state store, so a stale/dead ``job_id`` cannot
 immediately re-trip the circuit breaker as soon as the bucket is
@@ -187,6 +195,72 @@ def _publish_submission_failure_alert(
                 f"The bucket will be automatically disabled after "
                 f"MaxBatchJobFailures consecutive intervals if "
                 f"the defect is not fixed.\n"
+            ),
+        )
+
+
+def _publish_journal_unavailable_alert(
+    sns_client,
+    logs_client,
+    topic_arn: str | None,
+    log_group_name: str,
+    bucket_name: str,
+    cause: str,
+    now: datetime,
+) -> None:
+    """Deliver one journal-unavailable escalation: always log, publish to SNS
+    iff ``topic_arn`` is present — the same log-always/SNS-conditional pattern
+    as :func:`_publish_bucket_disabled_alert` and
+    :func:`_publish_submission_failure_alert`.
+
+    Fired on the first interval in which a source bucket's S3 Metadata journal
+    cannot be found. Without this the condition is only a log line, and because
+    the run itself still succeeds it raises no Lambda ``Errors`` metric, so
+    ``ReplicationLambdaErrorAlarm`` never fires. Nothing would replicate from
+    that bucket and nothing would say so.
+
+    The bucket is not disabled, so no config edit is part of the recovery. The
+    message says as much, since an operator who has just been told replication
+    is not happening will otherwise go looking for a switch to flip.
+    """
+    recovery = (
+        f"Enable the S3 Metadata journal on bucket {bucket_name!r} (S3 console: "
+        f"select the bucket, Metadata configuration, Create metadata "
+        f"configuration), and confirm the S3 Tables analytics-services "
+        f"integration is enabled in this Region so the s3tablescatalog Glue "
+        f"catalog exists. Replication resumes on the next scheduled run once "
+        f"the journal is present. This bucket has not been disabled, so no "
+        f"configuration change is needed."
+    )
+    message = json.dumps(
+        {
+            "event": "journal_unavailable",
+            "source_bucket": bucket_name,
+            "cause": cause,
+            "recovery": recovery,
+        }
+    )
+    _write_batch_job_failure_log(
+        logs_client, log_group_name, message, now,
+        stream_prefix="journal-unavailable",
+    )
+    if topic_arn:
+        sns_client.publish(
+            TopicArn=topic_arn,
+            Subject=_sns_subject(
+                f"S3 replication cannot read the journal for {bucket_name}"
+            ),
+            Message=(
+                f"The S3 Metadata journal for source bucket {bucket_name} "
+                f"could not be read, because the journal table or its "
+                f"namespace does not exist.\n\n"
+                f"Details: {cause}\n\n"
+                f"No objects newly tagged in this bucket will be replicated "
+                f"until this is resolved. Retrying will not help on its own, "
+                f"since the journal is a prerequisite the Solution reads and "
+                f"does not create. Other monitored buckets are "
+                f"unaffected.\n\n"
+                f"To resolve:\n{recovery}\n"
             ),
         )
 
@@ -484,6 +558,10 @@ def handler(event, context):
     can mark that bucket as disabled in ``solution-config.json`` without
     affecting the other buckets in the same run.
 
+    Also provides an ``on_journal_unavailable`` callback, fired on the first
+    interval a bucket's S3 Metadata journal is found to be absent, so an unmet
+    prerequisite is escalated rather than only logged.
+
     Self_Reinvocation (Requirements 4.1, 4.4, 4.5, 5.1, 5.3): reads
     ``reinvocation_depth`` from ``event`` (absent on a scheduled
     EventBridge trigger, treated as ``0``). After ``run_interval``
@@ -551,6 +629,18 @@ def handler(event, context):
             log_group_name=batch_job_failure_log_group,
             bucket_name=bucket_name,
             error_reason=error_reason,
+            now=datetime.now(tz=UTC),
+        )
+    )
+
+    runtime_config["on_journal_unavailable"] = (
+        lambda bucket_name, cause: _publish_journal_unavailable_alert(
+            sns_client=sns_client,
+            logs_client=logs_client,
+            topic_arn=batch_job_failure_topic_arn,
+            log_group_name=batch_job_failure_log_group,
+            bucket_name=bucket_name,
+            cause=cause,
             now=datetime.now(tz=UTC),
         )
     )

@@ -207,8 +207,9 @@ class TestPreMigrationTrackedObjectHandling:
         assert report["item_count"] == 1
         # The legacy per-rule config keys are not destinations, so a
         # pre-migration object reports no destinations at all.
-        assert "destinations" not in report["items"][0]
-        assert report["items"][0]["source_bucket"] == "my-bucket"
+        group = report["groups"][0]
+        assert group["destinations"] == []
+        assert group["source_bucket"] == "my-bucket"
 
     def test_should_publish_multi_config_no_exception(self):
         """should_publish handles a TrackedObject with multiple configs

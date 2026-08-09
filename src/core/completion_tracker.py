@@ -391,9 +391,36 @@ def build_completion_report(
     """Build the JSON-serializable Completion_Report payload for a
     per-source_bucket batch (design.md Decision 7).
 
-    Each item carries ONE aggregate ``outcome`` covering every destination,
-    plus the ``matched_rules`` that selected the object and the
-    ``destinations`` those rules target.
+    ``groups`` holds one entry per distinct
+    ``(source_bucket, matched_rules, destinations)`` tuple among ``items``,
+    carrying the aggregate statistics for the objects sharing that tuple:
+    ``count``, per-group ``outcome_counts``, and the ``tagged_at`` and
+    ``last_modified`` ranges. ``_build_group`` documents each field. In the
+    common case — one bucket, one rule, one destination — the whole report is
+    a single group, so its length is set by how many rule and destination
+    combinations the bucket has rather than by how many objects replicated.
+
+    Object keys and version IDs are not reported. A report of several hundred
+    keys and version UUIDs cannot be read in an email, and the per-object
+    detail is already in the S3 Batch Operations completion report CSV on the
+    state bucket under ``completion-reports/``, which is where an operator
+    goes to find out which specific object failed.
+
+    ``format_version`` declares the payload shape for a non-email subscriber
+    (SQS, Lambda, HTTPS) that parses the body.
+
+    * ``summary`` is a one-line, human-readable headline — inserted as the
+      FIRST key so it appears first when the dict is pretty-printed, letting
+      an operator reading the raw notification (e.g. the SNS-to-email body)
+      see the headline result without parsing JSON, while the message body
+      remains strictly valid JSON for every other SNS subscriber protocol.
+    * ``source_bucket`` is copied verbatim from the parameter, not read off
+      any individual item.
+    * ``item_count`` is ``len(items)`` — counts Tracked_Objects, and equals
+      the sum of every group's ``count``.
+    * ``outcome_counts`` counts ONE per Tracked_Object (the single aggregate
+      outcome), not per destination. Only outcomes that actually occur
+      appear as keys.
 
     ``outstanding`` is how many Tracked_Objects for ``source_bucket`` remain
     in tracking after this report — objects whose replication has not yet
@@ -404,159 +431,204 @@ def build_completion_report(
     which keeps a caller that does not know the count from asserting a
     misleading zero.
 
-    * ``summary`` is a one-line, human-readable headline (e.g. "Completion
-      Report for my-bucket: 3 object(s) processed. Outcomes: COMPLETE: 2,
-      FAILED: 1.") — inserted as the FIRST key so it appears first when the
-      dict is pretty-printed, letting an operator reading the raw
-      notification (e.g. the SNS-to-email body) see the headline result
-      without parsing JSON, while the message body remains strictly valid
-      JSON for every other SNS subscriber protocol (SQS, Lambda, HTTPS).
-    * ``source_bucket`` is copied verbatim from the parameter, not read off
-      any individual item.
-    * ``item_count`` is ``len(items)`` — counts Tracked_Objects.
-    * ``outcome_counts`` counts ONE per Tracked_Object (the single aggregate
-      outcome), not per destination. Only outcomes that actually occur
-      appear as keys.
-    * ``items`` has one entry per ``TrackedObject`` in ``items``, in the
-      same order, with ``object_key``, ``version_id`` (``None`` passed
-      through as JSON ``null``), ``outcome`` (the single aggregate
-      ``replication_outcome``), and ``source_bucket``. ``tagged_at``,
-      ``last_modified``, ``matched_rules``, and ``destinations`` are included
-      when known and omitted when not, so an item tracked before those values
-      were recorded reports what is available rather than a row of nulls.
-
-    ``destinations`` names the buckets the object's matched replication rules
-    target — where it was *bound for*. It is deliberately NOT keyed to
-    ``outcome``: the source object's ``x-amz-replication-status`` header is a
-    single aggregate across every destination (``COMPLETED`` only once all
-    destinations succeed, ``FAILED`` when one or more fail), so a ``FAILED``
-    item with two destinations means "at least one of these two failed", not
-    "both failed". Attributing an outcome to an individual destination would
-    require reading the replica in each destination bucket, which this
-    Solution does not do by design.
-
     ``obj.configs`` is not reported. Under the one-job-per-bucket design
     (single-batch-job-per-bucket design.md Decision D4) it holds exactly one
-    entry keyed by the per-bucket sentinel — the source bucket's own name —
-    so it carried no information beyond ``source_bucket``, which is now
-    reported directly. The aggregate ``outcome`` field and ``outcome_counts``
-    are derived solely from ``obj.replication_outcome``, a single aggregate
-    value per object that is not keyed by ``configs``.
+    entry keyed by the per-bucket sentinel, the source bucket's own name, so
+    it carries no information beyond ``source_bucket``, which the group states
+    directly. ``outcome_counts`` derives solely from
+    ``obj.replication_outcome``, a single aggregate value per object that is
+    not keyed by ``configs``.
 
-    Requirements: 4.2, 4.3, 3.2
+    Requirements: 4.2, 4.3, 3.2, 1.1, 1.2, 1.3, 1.4
     """
     outcome_counts: dict[str, int] = {}
-    report_items = []
     for obj in items:
-        outcome_counts[obj.replication_outcome] = outcome_counts.get(obj.replication_outcome, 0) + 1
-        report_items.append(_report_entry(obj))
+        outcome_counts[obj.replication_outcome] = (
+            outcome_counts.get(obj.replication_outcome, 0) + 1
+        )
 
-    # "summary" is inserted FIRST (dict insertion order — Python 3.7+
-    # semantics — is preserved through json.dumps) so a human reading the
-    # raw, pretty-printed JSON message body (e.g. in an email) sees the
-    # headline result as the first visible line, without needing a
-    # separate non-JSON preamble that would break a non-email subscriber
-    # (SQS, Lambda, HTTPS) expecting the message body to be valid JSON.
-    report = {
+    groups = _build_groups(items)
+
+    report: dict = {
         "summary": _format_completion_report_summary(
             source_bucket, len(items), outcome_counts, outstanding
         ),
+        "format_version": 2,
         "source_bucket": source_bucket,
         "item_count": len(items),
     }
     if outstanding is not None:
         report["outstanding"] = outstanding
     report["outcome_counts"] = outcome_counts
-    report["items"] = report_items
+    report["groups"] = groups
     return report
+
+
+# The tuple deciding which group a Tracked_Object is reported in:
+# ``(source_bucket, sorted matched_rules, sorted destinations)``.
+_GroupKey = tuple[str, tuple[str, ...], tuple[str, ...]]
+
+
+def _group_key(obj: TrackedObject) -> _GroupKey:
+    """The group *obj* belongs to.
+
+    Both rule and destination sets are sorted into tuples, so an object
+    matching several rules lands in one deterministic group rather than a
+    different one per iteration order of the underlying frozensets.
+    """
+    return (
+        obj.source_bucket,
+        tuple(sorted(obj.matched_rules)),
+        tuple(sorted(obj.destinations)),
+    )
+
+
+def _grouped_by_key(
+    items: list[TrackedObject],
+) -> dict[_GroupKey, list[TrackedObject]]:
+    """Partition *items* by :func:`_group_key`, preserving input order.
+
+    Groups come out in order of first appearance and each group's items stay
+    in input order, so the same batch always produces the same report body.
+    Shared by :func:`_build_groups` and :func:`chunk_items_for_report` so the
+    grouping the chunker prices can never drift from the one published.
+    """
+    grouped: dict[_GroupKey, list[TrackedObject]] = {}
+    for obj in items:
+        grouped.setdefault(_group_key(obj), []).append(obj)
+    return grouped
+
+
+def _build_group(key: _GroupKey, items: list[TrackedObject]) -> dict:
+    """Build the one report group for *items*, all of which share *key*.
+
+    ``source_bucket``, ``matched_rules`` and ``destinations`` are stated once
+    here rather than repeated per object, which is the repetition the grouped
+    format exists to remove. ``matched_rules`` and ``destinations`` are always
+    present, empty when the Solution holds no routing for these objects — an
+    empty list says "none recorded" in the same position as a populated one,
+    which reads better in an aggregate than a field that disappears.
+
+    ``tagged_at_range`` and ``last_modified_range`` are ``[earliest, latest]``
+    across the objects holding that value, and are omitted entirely when no
+    object in the group holds it, since a range needs at least one endpoint.
+
+    ``outcome_counts`` is per group, not per object: objects matching the same
+    rule can still reach different outcomes, so a group with a ``FAILED`` count
+    is how a mixed result stays visible without listing objects.
+    """
+    bucket, rules, dests = key
+
+    outcome_counts: dict[str, int] = {}
+    tagged_ats: list[datetime] = []
+    last_modifieds: list[datetime] = []
+    for obj in items:
+        outcome_counts[obj.replication_outcome] = (
+            outcome_counts.get(obj.replication_outcome, 0) + 1
+        )
+        if obj.tagged_at is not None:
+            tagged_ats.append(obj.tagged_at)
+        if obj.last_modified is not None:
+            last_modifieds.append(obj.last_modified)
+
+    group: dict = {
+        "source_bucket": bucket,
+        "matched_rules": list(rules),
+        "destinations": list(dests),
+        "count": len(items),
+        "outcome_counts": outcome_counts,
+    }
+    if tagged_ats:
+        group["tagged_at_range"] = [
+            min(tagged_ats).isoformat(),
+            max(tagged_ats).isoformat(),
+        ]
+    if last_modifieds:
+        group["last_modified_range"] = [
+            min(last_modifieds).isoformat(),
+            max(last_modifieds).isoformat(),
+        ]
+    return group
+
+
+def _build_groups(items: list[TrackedObject]) -> list[dict]:
+    """Build every report group for *items* (see :func:`_build_group`)."""
+    return [
+        _build_group(key, group_items)
+        for key, group_items in _grouped_by_key(items).items()
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Completion_Report chunking (SNS 256 KiB message limit)
 # ---------------------------------------------------------------------------
-
 # SNS rejects a Publish whose message body exceeds 256 KiB. The budget below
-# is the usable allowance for report *items*; the remainder covers the
-# envelope (``summary``, ``source_bucket``, ``item_count``,
-# ``outcome_counts``) plus pretty-printing overhead. A rejected publish is
-# not merely a lost notification: covered items are deleted only after a
-# successful publish, so an oversized report would fail identically on every
-# subsequent run and pin those items in the state object forever.
+# is the usable allowance for report *groups*; the remainder covers the
+# envelope (``summary``, ``format_version``, ``source_bucket``,
+# ``item_count``, ``outcome_counts``) plus pretty-printing overhead. A
+# rejected publish is not merely a lost notification: covered items are
+# deleted only after a successful publish, so an oversized report would fail
+# identically on every subsequent run and pin those items in the state object
+# forever.
+#
+# A group's size is set by its rule and destination names, not by how many
+# objects it covers, so the budget is reached only by a bucket with hundreds
+# of distinct rule and destination combinations. One group per rule pair is
+# the ceiling, and a bucket at the S3 limit of 1,000 replication rules is the
+# case this guards.
 _SNS_MAX_MESSAGE_BYTES = 262_144
-_REPORT_ITEM_BUDGET_BYTES = 240_000
+_REPORT_GROUP_BUDGET_BYTES = 240_000
 
 # SNS rejects a Subject longer than 100 characters.
 _SNS_MAX_SUBJECT_CHARS = 100
 
-# Serialized length of an empty ``items`` wrapper, used to price one entry at
+# Serialized length of an empty ``groups`` wrapper, used to price one group at
 # the exact nesting depth (and therefore the exact indentation) it occupies in
-# the real report body. Measuring an entry on its own at top level
-# under-counts it by the added indentation of every line.
-_EMPTY_ITEMS_WRAPPER_BYTES = len(json.dumps({"items": []}, indent=2))
+# the real report body. Measuring a group on its own at top level under-counts
+# it by the added indentation of every line.
+_EMPTY_GROUPS_WRAPPER_BYTES = len(json.dumps({"groups": []}, indent=2))
 
 
-def _report_entry(obj: TrackedObject) -> dict:
-    """Build the one report entry for *obj*.
-
-    Shared by :func:`build_completion_report` and :func:`chunk_items_for_report`
-    so the size the chunker prices can never drift from the payload actually
-    published.
-    """
-    entry = {
-        "object_key": obj.object_key,
-        "version_id": obj.version_id,
-        "outcome": obj.replication_outcome,
-        "source_bucket": obj.source_bucket,
-    }
-    if obj.tagged_at is not None:
-        entry["tagged_at"] = obj.tagged_at.isoformat()
-    if obj.last_modified is not None:
-        entry["last_modified"] = obj.last_modified.isoformat()
-    if obj.matched_rules:
-        entry["matched_rules"] = sorted(obj.matched_rules)
-    if obj.destinations:
-        entry["destinations"] = sorted(obj.destinations)
-    return entry
-
-
-def _entry_bytes(obj: TrackedObject) -> int:
-    """Serialized cost of *obj*'s entry within a report body, including its
+def _group_bytes(group: dict) -> int:
+    """Serialized cost of *group* within a report body, including its
     trailing separator."""
-    nested = len(json.dumps({"items": [_report_entry(obj)]}, indent=2))
-    return nested - _EMPTY_ITEMS_WRAPPER_BYTES + 1
+    nested = len(json.dumps({"groups": [group]}, indent=2))
+    return nested - _EMPTY_GROUPS_WRAPPER_BYTES + 1
 
 
 def chunk_items_for_report(
     items: list[TrackedObject],
-    max_item_bytes: int = _REPORT_ITEM_BUDGET_BYTES,
+    max_group_bytes: int = _REPORT_GROUP_BUDGET_BYTES,
 ) -> list[list[TrackedObject]]:
     """Split *items* into batches each small enough for one SNS publish.
 
-    Sizing is measured, not assumed: each item is priced at the exact
-    serialized length its entry occupies inside the report body, so a batch of
-    long S3 keys chunks more aggressively than a batch of short ones.
+    Sizing is measured, not assumed: each group is priced at the exact
+    serialized length it occupies inside the report body, so a batch with long
+    rule and destination names chunks more aggressively than one with short
+    ones.
 
-    An item whose own entry exceeds *max_item_bytes* is still placed in a
-    batch by itself rather than dropped or looped on — an S3 key is capped at
-    1,024 bytes, so this cannot occur in practice, but the function stays
-    total for any input.
+    Splits between groups and never within one, so a group's header is never
+    duplicated across two messages and each message stays internally
+    consistent. A group whose own serialized size exceeds *max_group_bytes* is
+    still placed in a batch by itself rather than dropped or looped on, so the
+    function stays total for any input.
 
     Returns an empty list for empty input, so the caller publishes nothing.
 
-    Requirements: 4.5, 4.9
+    Requirements: 4.5, 4.9, 1.6
     """
     batches: list[list[TrackedObject]] = []
     current: list[TrackedObject] = []
     current_bytes = 0
 
-    for obj in items:
-        entry_bytes = _entry_bytes(obj)
-        if current and current_bytes + entry_bytes > max_item_bytes:
+    for key, group_items in _grouped_by_key(items).items():
+        group_bytes = _group_bytes(_build_group(key, group_items))
+        if current and current_bytes + group_bytes > max_group_bytes:
             batches.append(current)
             current = []
             current_bytes = 0
-        current.append(obj)
-        current_bytes += entry_bytes
+        current.extend(group_items)
+        current_bytes += group_bytes
 
     if current:
         batches.append(current)

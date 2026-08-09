@@ -32,6 +32,16 @@ from src.lambda_handler import (
 # from firing so these tests' non-reinvocation assertions are unaffected.
 _NOOP_OUTCOME = RunOutcome(any_capped_and_progressed=False, buckets=[])
 
+# runtime_config keys holding callbacks the handler builds as fresh closures on
+# every invocation. They compare unequal between two calls by construction, so
+# tests comparing whole runtime_config dicts exclude them. Kept as one list so
+# adding a callback does not mean hunting down each comparison separately.
+_CALLBACK_KEYS = (
+    "on_bucket_disable",
+    "on_submission_failure",
+    "on_journal_unavailable",
+)
+
 
 # ---------------------------------------------------------------------------
 # Strategies
@@ -968,14 +978,14 @@ class TestReinvocationHasNoLeaseBypass:
                         handler(event, None)
                         call_args_by_event[label] = mock_run.call_args
 
-        # Compare everything except on_bucket_disable, which is a fresh
-        # closure object each call (not comparable by identity/equality)
-        # but is otherwise irrelevant to the lease-bypass question.
+        # Compare everything except the _CALLBACK_KEYS closures, which are
+        # fresh objects each call (not comparable by identity/equality)
+        # but are otherwise irrelevant to the lease-bypass question.
         scheduled_config, scheduled_runtime = call_args_by_event["scheduled"].args
         reinvocation_config, reinvocation_runtime = call_args_by_event["reinvocation"].args
         assert scheduled_config == reinvocation_config
-        scheduled_runtime = {k: v for k, v in scheduled_runtime.items() if k not in ("on_bucket_disable", "on_submission_failure")}
-        reinvocation_runtime = {k: v for k, v in reinvocation_runtime.items() if k not in ("on_bucket_disable", "on_submission_failure")}
+        scheduled_runtime = {k: v for k, v in scheduled_runtime.items() if k not in _CALLBACK_KEYS}
+        reinvocation_runtime = {k: v for k, v in reinvocation_runtime.items() if k not in _CALLBACK_KEYS}
         assert scheduled_runtime == reinvocation_runtime
 
     def test_lease_contention_outcome_identical_for_scheduled_and_reinvocation_event(self):
@@ -1004,12 +1014,12 @@ class TestReinvocationHasNoLeaseBypass:
 
         # Same config + runtime_config passed to run_interval either way —
         # no reinvocation-specific argument, kwarg, or branch exists.
-        # (on_bucket_disable excluded: a fresh, non-comparable closure per call.)
+        # (_CALLBACK_KEYS excluded: fresh, non-comparable closures per call.)
         scheduled_config, scheduled_runtime = results["scheduled"].args
         reinvocation_config, reinvocation_runtime = results["reinvocation"].args
         assert scheduled_config == reinvocation_config
-        scheduled_runtime = {k: v for k, v in scheduled_runtime.items() if k not in ("on_bucket_disable", "on_submission_failure")}
-        reinvocation_runtime = {k: v for k, v in reinvocation_runtime.items() if k not in ("on_bucket_disable", "on_submission_failure")}
+        scheduled_runtime = {k: v for k, v in scheduled_runtime.items() if k not in _CALLBACK_KEYS}
+        reinvocation_runtime = {k: v for k, v in reinvocation_runtime.items() if k not in _CALLBACK_KEYS}
         assert scheduled_runtime == reinvocation_runtime
         assert results["scheduled"].kwargs == results["reinvocation"].kwargs
 

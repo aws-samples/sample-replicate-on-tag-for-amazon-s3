@@ -1102,7 +1102,7 @@ class TestConfigResourceStructure:
         )
 
     def test_config_resource_role_s3_resource_is_object_not_bucket(self, resources):
-        """ConfigResourceRole S3 resource must be scoped to the object ARN, not the bucket (Req 8.3)."""
+        """ConfigResourceRole S3 resource must be scoped to object ARNs, not the bucket (Req 8.3)."""
         stmts = []
         for policy in (
             resources.get("ConfigResourceRole", {})
@@ -1124,17 +1124,54 @@ class TestConfigResourceStructure:
             if not has_s3:
                 continue
             resource = stmt.get("Resource")
-            # Resource must be a !Sub tag referencing the object ARN (not bucket or /*)
-            assert isinstance(resource, _CfnTag), (
-                "ConfigResourceRole S3 Resource must be a CloudFormation intrinsic (!Sub)"
-            )
-            # The !Sub string should reference StateBucket.Arn and the fixed
-            # config object key (i.e. an object-level ARN, not a bucket ARN)
-            if isinstance(resource.value, str):
-                assert "solution-config.json" in resource.value, (
-                    f"ConfigResourceRole S3 Resource {resource.value!r} does not reference "
-                    "the config object key; expected an object-level ARN (Req 8.3)."
+            # Resource may be a single !Sub or a list of !Sub entries.
+            resource_items = resource if isinstance(resource, list) else [resource]
+            for item in resource_items:
+                assert isinstance(item, _CfnTag), (
+                    "ConfigResourceRole S3 Resource entries must be CloudFormation intrinsics (!Sub)"
                 )
+            # At least one entry should reference the config object key.
+            sub_values = [
+                item.value for item in resource_items
+                if isinstance(item, _CfnTag) and isinstance(item.value, str)
+            ]
+            assert any("solution-config.json" in v for v in sub_values), (
+                f"ConfigResourceRole S3 Resource {sub_values!r} does not reference "
+                "the config object key; expected an object-level ARN (Req 8.3)."
+            )
+
+    def test_config_resource_role_s3_resource_includes_state_prefix(self, resources):
+        """ConfigResourceRole S3 resource must include state/* for checkpoint seeding."""
+        stmts = []
+        for policy in (
+            resources.get("ConfigResourceRole", {})
+            .get("Properties", {})
+            .get("Policies", [])
+        ):
+            stmts.extend(policy.get("PolicyDocument", {}).get("Statement", []))
+
+        for stmt in stmts:
+            if not isinstance(stmt, dict):
+                continue
+            actions = stmt.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            has_s3 = any(
+                isinstance(a, str) and a.lower().startswith("s3:")
+                for a in actions
+            )
+            if not has_s3:
+                continue
+            resource = stmt.get("Resource")
+            resource_items = resource if isinstance(resource, list) else [resource]
+            sub_values = [
+                item.value for item in resource_items
+                if isinstance(item, _CfnTag) and isinstance(item.value, str)
+            ]
+            assert any("state/*" in v for v in sub_values), (
+                f"ConfigResourceRole S3 Resource must include state/* for checkpoint seeding; "
+                f"got {sub_values!r}."
+            )
 
     def test_solution_config_resource_exists(self, resources):
         """SolutionConfig Custom::SolutionConfig resource must be present (Req 7.1)."""
@@ -1625,12 +1662,21 @@ class TestReplicationLambdaErrorAlarm:
         assert props.get("ComparisonOperator") == "GreaterThanThreshold"
         assert props.get("EvaluationPeriods") == 1
 
+    def test_period_derives_from_check_frequency(self, lambda_error_alarm):
+        """Period must match CheckFrequencyMinutes (in seconds) so every
+        period carries exactly one datapoint. A shorter fixed period leaves
+        empty periods that accumulate to INSUFFICIENT_DATA and cause
+        spurious OKActions emails on every cycle."""
+        props = lambda_error_alarm.get("Properties", {})
+        period = props.get("Period")
+        assert isinstance(period, _CfnTag) and period.tag == "!GetAtt"
+        assert "SolutionConfig" in str(period.value)
+        assert "CheckFrequencySeconds" in str(period.value)
+
     def test_treat_missing_data_retains_state(self, lambda_error_alarm):
-        """Runs are sparse: at the default 15-minute schedule only one
-        5-minute period in three carries a datapoint. notBreaching would read
-        each empty period as a recovery and re-alarm on the next failing run,
-        emailing every cycle. Retaining state gives one alarm and one
-        recovery at any CheckFrequencyMinutes."""
+        """With Period matching CheckFrequencyMinutes, missing periods only
+        occur on genuine schedule skips. Retaining state gives one alarm and
+        one recovery rather than flapping on every cycle."""
         props = lambda_error_alarm.get("Properties", {})
         assert props.get("TreatMissingData") == "missing"
 

@@ -19,6 +19,7 @@ The Solution emits structured JSON log entries. All entries include a `timestamp
 | `manifest_strategy_selected` | The manifest format chosen for a run: `bucket`, `preflight_count`, `manifest_format`, `generation_mode` |
 | `bucket_disabled` | A bucket's `disabled` flag is set after repeated failures: `source_bucket`, `cause`, `recovery` |
 | `submission_failure_permanent` | `CreateJob` is rejected before the request is sent: `source_bucket`, `operation`, `cause` |
+| `journal_unavailable` | A bucket's S3 Metadata journal table or namespace does not exist: `source_bucket`, `cause`, `recovery` |
 | `completion_report_missing` | A terminal job's completion report never appeared: `source_bucket`, `replication_config_id`, `job_id`, `cause` |
 
 A run that fails before the handler executes emits none of these. An init failure such as `Runtime.ImportModuleError` from a code package with the wrong layout appears only as a Lambda runtime error in the log group, with no structured entry, so the absence of `interval_summary` is the signal. `ReplicationLambdaErrorAlarm` covers that case (see [Run failure alerts](../README.md#run-failure-alerts)).
@@ -36,6 +37,7 @@ Every `audit` log entry carries an `action` naming what happened, a `source_buck
 | `row_cap_overshoot` | A capped run read past the cap because many operations shared the boundary timestamp | `row_cap`, `rows_read`, `matched`, `overshoot_rows` |
 | `batch_job_failure_readmit` | A failed job's operations are readmitted for reprocessing | `job_id`, `config_id`, `watermark_low`, `watermark_high` |
 | `bucket_disabled` | A bucket's `disabled` flag is set after repeated failures | `reason`, `config_key` |
+| `journal_unavailable` | A bucket's journal read fails because the journal table or namespace does not exist | `cause` |
 | `completion_report_published` | An SNS completion report publishes successfully | `item_count` |
 | `completion_item_expired` | A tracked object passed `CompletionItemTtlHours` and was abandoned | `job_ids`, `age_seconds`, `ttl_seconds` |
 
