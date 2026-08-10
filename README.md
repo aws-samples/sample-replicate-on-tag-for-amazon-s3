@@ -45,7 +45,7 @@ Per source account and Region. Everything here is a condition on your account or
 - **Versioning enabled** on every source and destination bucket, as S3 replication requires regardless of this Solution.
 - **An S3 replication configuration** on each source bucket with at least one tag-scoped rule. Rules with no tag filter are ignored, since S3 already applies those at upload.
 - **A replication role** attached to each of those configurations, carrying the permissions S3 replication itself needs. The Solution requires nothing added to it: the stack creates its own role for the Batch Operations jobs it submits.
-- **The S3 Metadata journal table** enabled on each source bucket.
+- **The [S3 Metadata journal table](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-configuring.html)** enabled on each source bucket.
 - **The S3 Tables analytics-services integration** enabled in the Region, which creates the `s3tablescatalog` Glue catalog that Athena reads the journal through. One-time per account and Region, via S3 console → Table buckets → Enable integration. [`deploy/README.md`](deploy/README.md#prerequisites) has the `aws glue create-catalog` equivalent.
 - **An active CloudTrail trail** capturing management events in the Region, required only if you set `AlarmEmail`. Batch Operations job-status events reach EventBridge through CloudTrail, so without a trail those alerts never fire. Replication itself is unaffected.
 - **Customer-managed KMS keys**, optional. See [Customer-Managed KMS Keys](docs/kms.md).
