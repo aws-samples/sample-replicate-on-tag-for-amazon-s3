@@ -288,3 +288,7 @@ code, with no error to indicate it.
 `pip install -e ".[dev]"` installs the package with its test dependencies; `pytest` runs the unit suite.
 
 [Testing](docs/testing.md) covers the end-to-end test against real AWS resources, its environment variables, and the manual verification procedures.
+
+## Author
+
+Ed Gummett, Storage Specialist Solutions Architect, AWS — [Connect on LinkedIn](https://www.linkedin.com/in/egummett/)
