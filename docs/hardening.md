@@ -6,9 +6,17 @@ Each one is listed here with what to change to turn it on.
 ## State Bucket access logging
 
 The State Bucket has server access logging disabled. To record access to it,
-either add a `LoggingConfiguration` to the `StateBucket` resource in
-`deploy/template.yaml`, targeting a log-delivery bucket you create first, or
-enable a CloudTrail S3 data event selector on the State Bucket.
+choose one:
+
+- **Recommended:** deliver server access logs to a CloudWatch Logs log group,
+  and enable the S3 Tables integration to mirror them into an Apache Iceberg
+  table queryable with Athena. This needs no log-delivery bucket and no
+  lifecycle rules on this Solution's part; retention is set once on the log
+  group. See [Query Amazon S3 access logs instantly with CloudWatch and S3
+  Tables](https://aws.amazon.com/blogs/storage/query-amazon-s3-access-logs-instantly-with-cloudwatch-and-s3-tables/).
+- Add a `LoggingConfiguration` to the `StateBucket` resource in
+  `deploy/template.yaml`, targeting a log-delivery bucket you create first.
+- Enable a CloudTrail S3 data event selector on the State Bucket.
 
 ## State Bucket versioning
 
