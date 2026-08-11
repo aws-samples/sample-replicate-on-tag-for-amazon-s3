@@ -52,6 +52,33 @@ and means this role's manifest grant did not apply. Since the stack owns the
 grant, that is a defect in the deployment rather than a condition in your
 account.
 
+## Config resource role
+
+At stack create and update, a custom resource writes the internal config object
+the Lambda reads at startup, and seeds a starting checkpoint for each source
+bucket so the Solution begins at the deployment timestamp rather than at the
+beginning of the journal (see [Journal Start Point](../README.md#journal-start-point)).
+
+| Grant | Resource | Needed for |
+|---|---|---|
+| `s3:PutObject`, `s3:DeleteObject` | State Bucket `config/solution-config.json` | Writing the config object on create and update, removing it on delete |
+| `s3:PutObject` | State Bucket `state/*` | Seeding a starting checkpoint for each newly added source bucket. `PutObject` only, so the role cannot delete a checkpoint |
+| `kms:GenerateDataKey`, `kms:Decrypt`, `kms:DescribeKey` | The key named in `KmsKeyArn` | Writing both objects under SSE-KMS. Omitted when `KmsKeyArn` is empty |
+
+This role runs only during stack create and update, and holds nothing else
+beyond writing its own logs. It has no read access to the State Bucket and no
+access to any source bucket.
+
+The `state/*` grant is a prefix rather than a single key because the checkpoint
+key carries the bucket name, and `SourceBucketNames` is a parameter, so the
+individual keys are not known when the policy is written. It is split into its
+own statement so that `s3:DeleteObject`, which the config object needs for stack
+delete, is not also granted over checkpoints: deleting a checkpoint rewinds that
+bucket to the start of the journal, and the handler never does it. The seed write
+is conditional on the object not already existing, so it cannot overwrite a
+checkpoint the Lambda has since advanced. Deleting the stack removes only the
+config object; checkpoints remain.
+
 ## Code package validation role
 
 Before the stack builds a Lambda around the zip that `CodeLocation` names, a

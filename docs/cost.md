@@ -10,8 +10,9 @@ Approximate monthly cost in `us-east-1`, pricing as of 2026-06-24, for one sourc
 - 20% of daily tagging straddles a check boundary, about 36 jobs per month.
 - Lambda runs about 28s on a busy journal.
 - `HeadObject` rows assume `CompletionNotificationEmail` is set and replication completes within 10 minutes at p90, so most objects resolve on their first eligible check.
+- Athena rows assume the default `JournalLookbackSeconds` of 7,200. Every run re-scans the whole lookback window, so bytes scanned per run scale with that parameter. At this tagging volume the window stays small enough that the Athena charge is rounding error either way.
 
-Every row is per source bucket, with two exceptions. Lambda is one invocation per run covering all buckets, and one of the five CloudWatch metrics is run-level. Adding a bucket adds four metrics, not five.
+Every row is per source bucket, with two exceptions. Lambda is one invocation per run covering all buckets, and one of the six CloudWatch metrics is run-level. Adding a bucket adds five metrics, not six.
 
 ### Checking every 15 minutes
 
@@ -25,7 +26,7 @@ Every row is per source bucket, with two exceptions. Lambda is one invocation pe
 | Lambda | ~2,880 runs × ~28s (arm64, 2 GB) | ~$2.15 |
 | `HeadObject` checks (completion tracking, optional) | ~0.345M checks × $0.0004/1,000 | ~$0.14 |
 | S3 State Bucket | manifests + results, expired after 30 days | ~$1 |
-| CloudWatch metrics (optional) | 5 metrics × $0.30, activity in most hours | ~$1.50 |
+| CloudWatch metrics (optional) | 6 metrics × $0.30, activity in most hours | ~$1.80 |
 | **Total** | | **~$14** |
 
 ### Checking hourly
@@ -40,7 +41,7 @@ Every row is per source bucket, with two exceptions. Lambda is one invocation pe
 | Lambda | ~730 runs × ~28s (arm64, 2 GB) | ~$0.55 |
 | `HeadObject` checks (completion tracking, optional) | ~0.306M checks × $0.0004/1,000 | ~$0.12 |
 | S3 State Bucket | manifests + results, expired after 30 days | ~$1 |
-| CloudWatch metrics (optional) | 5 metrics × $0.30, activity in most hours | ~$1.50 |
+| CloudWatch metrics (optional) | 6 metrics × $0.30, activity in most hours | ~$1.80 |
 | **Total** | | **~$13** |
 
 ## What the two intervals show
@@ -51,7 +52,7 @@ The job charge dominates and does not change with `CheckFrequencyMinutes`. Only 
 
 Both tables assume a bucket active in most hours. A bucket that sees occasional bursts pays closer to $0.65, because only `BucketErrors` and the run-level metric are published on every run.
 
-CloudWatch bills each custom metric for every hour in which a data point is sent, per unique metric-and-dimension combination. Publishing a flat zero series would therefore cost the same as publishing real activity, so the three per-bucket activity metrics are withheld for an idle bucket. See [Interpreting missing metric data](monitoring.md#interpreting-missing-metric-data) for what a missing data point means.
+CloudWatch bills each custom metric for every hour in which a data point is sent, per unique metric-and-dimension combination. Publishing a flat zero series would therefore cost the same as publishing real activity, so the three per-bucket activity metrics are withheld for an idle bucket, and `ArchivedObjectsExcluded` is withheld unless at least one object was excluded. See [Interpreting missing metric data](monitoring.md#interpreting-missing-metric-data) for what a missing data point means.
 
 Log ingestion for the structured JSON logs applies whether or not `MetricsNamespace` is set.
 

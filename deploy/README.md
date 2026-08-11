@@ -102,7 +102,7 @@ These have no default. You must provide a value.
 |-----------|---------|-------------|
 | `CheckFrequencyMinutes` | `15` | How often the Solution runs, in minutes (15–1440). Smaller values run more often; because S3 Batch Operations charges per job, this can submit more jobs and increase cost, especially when tagging activity is spread over time rather than arriving in a single batch |
 | `LifecycleExpirationDays` | `30` | Days before manifest and Athena result objects expire in the State Bucket |
-| `JournalLookbackSeconds` | `3600` | Seconds to re-scan the journal below the watermark for late-arriving records |
+| `JournalLookbackSeconds` | `7200` | Seconds to re-scan the journal below the watermark for late-arriving records. A record delivered later than this is never replicated, so raise it rather than lower it if S3 Metadata delivery in your Region runs slow |
 
 **Scale & performance**
 
@@ -174,7 +174,7 @@ When either KMS parameter is set, the key policy must grant the `ExecutionRole` 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `AlarmEmail` | _(empty)_ | Email address for run-failure and S3 Batch Operations job-failure notifications. When set, creates an SNS topic and an email subscription; a failed or cancelled batch job sends one readable email with the job ID, status, and a console link. A CloudWatch alarm on the same event exists for console/dashboard visibility but does not itself send email. The separate `ReplicationLambdaErrorAlarm` does email this address when a scheduled run fails outright, and again when runs recover. Requires an active CloudTrail trail in the stack Region for the batch job events only (see [Verifying the CloudTrail trail](#verifying-the-cloudtrail-trail)) |
-| `MaxBatchJobFailures` | `4` | Consecutive S3 Batch Operations job failures (`Failed` or `Cancelled`) for a bucket's job before the Solution disables that bucket in `solution-config.json`. Prevents runaway per-job costs from a bucket whose job keeps failing; the failure counter resets on the first successful (`Complete`) job |
+| `MaxBatchJobFailures` | `4` | Consecutive S3 Batch Operations job failures (`Failed` or `Cancelled`) for a bucket's job before the Solution disables that bucket in its state object. Prevents runaway per-job costs from a bucket whose job keeps failing; the failure counter resets on the first successful (`Complete`) job |
 
 **Completion tracking**
 
@@ -348,7 +348,10 @@ To update the monitored bucket list, update the `SourceBucketNames` stack
 parameter and deploy a stack update. The custom resource rewrites the
 `solution-config.json` and seeds a checkpoint for each newly added bucket so
 processing starts from the update timestamp, not from the beginning of the
-journal.
+journal. It rewrites that config object in full from the template parameters,
+but writes a state object only for a bucket that does not already have one, so
+no existing bucket's checkpoint or `disabled` flag is affected by a stack
+update.
 
 ## Operational Notes
 
@@ -372,8 +375,25 @@ journal.
   on the S3 Metadata `record_timestamp`. Each run re-scans the journal from
   `watermark - JournalLookbackSeconds` so records delivered late are still
   picked up. A bounded processed-operation window suppresses re-submission of
-  already-processed records, so a larger lookback only scans more rows. It
-  never replicates an object twice.
+  already-processed records, so a larger lookback never replicates an object
+  twice.
+
+  The window is a bound, not a retry. A record whose `record_timestamp` falls
+  at or below `watermark - JournalLookbackSeconds` by the time it reaches the
+  journal is excluded permanently: no later run reconsiders it, and no metric or
+  alarm reports it. Recovering it means the manual catch-up in
+  [Backfilling After a Replication-Rule Change](../docs/backfill.md). Size the
+  window against the worst S3 Metadata delivery latency you are willing to
+  tolerate, not against typical latency.
+
+  Raising it has two costs. Every run re-scans the whole window from Athena
+  rather than only the newly arrived records, so bytes scanned per run grow with
+  the window. The processed-operation window also holds each submitted operation
+  until it ages out, so its entry count grows with the window times the tagging
+  rate, and that window is serialized into the per-bucket checkpoint object on
+  every run. A large tagging burst inside one lookback window can push that
+  object into the tens of megabytes and add seconds to each run's checkpoint
+  read and write.
 
 - **Code package dependencies:** the package relies on the Lambda runtime's
   built-in boto3 and does not bundle third-party dependencies. The runtime
@@ -387,9 +407,9 @@ journal.
   that predates a parameter this release sends (see Code package dependencies
   above). Neither is a condition in your account, so re-enabling the bucket
   without deploying a change reproduces the failure. The `disabled_reason` field
-  in `solution-config.json` carries this distinction. For all other disable
-  reasons (consecutive terminal-job failures), re-enabling after addressing the
-  underlying cause is sufficient.
+  in the bucket's state object (`state/<bucket-name>.json`) carries this
+  distinction. For all other disable reasons (consecutive terminal-job
+  failures), re-enabling after addressing the underlying cause is sufficient.
 
 - **Why the code is in S3, not embedded in the template:** the Lambda code is
   delivered as an S3 zip referenced by `CodeLocation`, not inlined in

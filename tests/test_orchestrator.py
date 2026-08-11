@@ -27,6 +27,7 @@ from src.adapters.batch_operations_adapter import SubmissionResult
 from src.adapters.inventory_manifest_writer import WrittenManifest
 from src.adapters.replication_config_adapter import SkipReport
 from src.core.models import (
+    BucketDisableState,
     CheckpointState,
     DestinationRef,
     DerivedReplicationRule,
@@ -39,6 +40,7 @@ from src.core.models import (
 )
 from src.core.rule_deriver import derive_rules
 from src.orchestrator import run_interval
+from tests.support import disabled_state, mock_state_store
 
 _NOW = datetime(2024, 1, 1, tzinfo=timezone.utc)
 _BATCHOPS_ROLE_ARN = "arn:aws:iam::123456789012:role/s3rot-batch-operations-role"
@@ -125,22 +127,36 @@ def _make_mocks(
     ops_per_bucket: dict[str, list[TaggingOperation]] | None = None,
     fail_rules_for: set[str] | None = None,
     submission_factory=None,
+    disabled_buckets: set[str] | None = None,
 ) -> tuple[MagicMock, MagicMock, MagicMock, MagicMock, MagicMock]:
-    """Return (factory_cls, store_cls, get_rules, read_journal, submit_job)."""
+    """Return (factory_cls, store_cls, get_rules, read_journal, submit_job).
+
+    ``disabled_buckets`` names buckets whose state object reports them
+    disabled. The flag is per-bucket runtime state read from the state object,
+    not a config field, so it is set here rather than in the config literal.
+    """
     if ops_per_bucket is None:
         ops_per_bucket = {n: [_op(n)] for n in bucket_names}
     if fail_rules_for is None:
         fail_rules_for = set()
     if submission_factory is None:
         submission_factory = lambda cfg_id: _submitted(cfg_id)
+    disabled = disabled_buckets or set()
 
     mock_factory_cls = MagicMock()
     mock_factory = MagicMock()
     mock_factory_cls.return_value = mock_factory
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
+
+    def get_disable_state_side_effect(s3_client, state_bucket, source_bucket):
+        if source_bucket in disabled:
+            return disabled_state(reason=f"{source_bucket} disabled for test")
+        return BucketDisableState()
+
+    mock_store.get_disable_state.side_effect = get_disable_state_side_effect
 
     def get_checkpoint_side_effect(s3_client, state_bucket, source_bucket):
         return (_checkpoint(source_bucket), '"etag-0"')
@@ -828,7 +844,7 @@ def _run_with_recovery_mocks(
     mock_factory.create_s3control_client.return_value = mock_s3control
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
 
     mock_store.get_checkpoint.side_effect = (
@@ -1058,7 +1074,7 @@ class TestFailedJobRecovery:
         mock_factory.create_s3control_client.return_value = mock_s3control
 
         mock_store_cls = MagicMock()
-        mock_store = MagicMock()
+        mock_store = mock_state_store()
         mock_store_cls.return_value = mock_store
         mock_store.get_checkpoint.side_effect = (
             lambda *a: (_checkpoint("my-bucket", _WM_CURRENT), '"etag-0"')
@@ -1161,7 +1177,7 @@ def _run_circuit_breaker(
     mock_factory.create_s3control_client.return_value = mock_s3control
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
     mock_store.get_checkpoint.side_effect = (
         lambda *a: (_checkpoint(bucket_name, _CB_WM_CURRENT), '"etag-0"')
@@ -1176,7 +1192,7 @@ def _run_circuit_breaker(
     rt = {
         **_BASE_RUNTIME,
         "max_batch_job_failures": max_batch_job_failures,
-        "on_bucket_disable": lambda name, reason: disabled_buckets.append(name),
+        "on_bucket_disabled": lambda name, reason: disabled_buckets.append(name),
     }
 
     with (
@@ -1217,7 +1233,7 @@ def _run_circuit_breaker(
 
 class TestCircuitBreaker:
     def test_at_threshold_disables_bucket(self):
-        """consecutive_failures + 1 == threshold → on_bucket_disable called."""
+        """consecutive_failures + 1 == threshold → on_bucket_disabled called."""
         # Prior record has 3 failures; this run adds the 4th → hit threshold of 4.
         prior = {"rule-1": _prior_rec_with_count(consecutive_failures=3)}
         disabled, _, _ = _run_circuit_breaker(
@@ -1388,7 +1404,7 @@ def _run_completion_tracking_hook(
     mock_factory.create_s3control_client.return_value = mock_s3control
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
 
     mock_store.get_checkpoint.side_effect = (
@@ -2052,7 +2068,7 @@ def _run_quiescence_scan_recording(
     mock_factory.create_s3control_client.return_value = mock_s3control
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
 
     mock_store.get_checkpoint.side_effect = (
@@ -2186,7 +2202,7 @@ def _run_idle_interval(
     mock_factory.create_s3control_client.return_value = MagicMock()
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
     mock_store.get_checkpoint.side_effect = (
         lambda s3_client, state_bucket, source_bucket:
@@ -2322,7 +2338,7 @@ def _run_completion_tracking_call_site(
     mock_factory_cls.return_value = mock_factory
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
 
     mock_store.get_checkpoint.side_effect = (
@@ -2485,7 +2501,7 @@ def _run_single_submission(
     mock_factory.create_s3control_client.return_value = mock_s3control
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
 
     mock_store.get_checkpoint.side_effect = (
@@ -2600,7 +2616,7 @@ def _run_with_multi_rule_mocks(
     mock_factory_cls.return_value = mock_factory
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
     mock_store.get_checkpoint.side_effect = (
         lambda s3_client, state_bucket, source_bucket:
@@ -2747,7 +2763,7 @@ def _run_migration_recovery_mocks(
     mock_factory.create_s3control_client.return_value = mock_s3control
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
 
     mock_store.get_checkpoint.side_effect = (
@@ -3443,20 +3459,20 @@ class TestRunOutcomeAnyCappedAndProgressed:
 
 class TestDisabledAndCircuitBrokenBucketNeverReinvoke:
     def test_disabled_bucket_excluded_before_process_bucket_runs(self):
-        """A bucket.disabled=True entry is skipped by the per-bucket loop
-        BEFORE _process_bucket runs at all — it never appears in
-        RunOutcome.buckets, and cannot contribute to any_capped_and_progressed
-        even though a second, active bucket in the same run does progress
-        (Requirement 5.4)."""
+        """A bucket whose state object reports it disabled is skipped by the
+        per-bucket loop BEFORE _process_bucket runs at all — it never appears
+        in RunOutcome.buckets, and cannot contribute to
+        any_capped_and_progressed even though a second, active bucket in the
+        same run does progress (Requirement 5.4)."""
         (
             mock_factory_cls, mock_store_cls,
             mock_get_rules, mock_read_journal,
             mock_submit_job,
-        ) = _make_mocks(["active-bucket"])
+        ) = _make_mocks(["active-bucket"], disabled_buckets={"disabled-bucket"})
 
         config = {
             "buckets": [
-                {"name": "disabled-bucket", "region": "us-east-1", "disabled": True},
+                {"name": "disabled-bucket", "region": "us-east-1"},
                 {"name": "active-bucket", "region": "us-east-1"},
             ]
         }
@@ -3498,11 +3514,13 @@ class TestDisabledAndCircuitBrokenBucketNeverReinvoke:
             mock_factory_cls, mock_store_cls,
             mock_get_rules, mock_read_journal,
             mock_submit_job,
-        ) = _make_mocks(["disabled-bucket"])
+        ) = _make_mocks(
+            ["disabled-bucket"], disabled_buckets={"disabled-bucket"}
+        )
 
         config = {
             "buckets": [
-                {"name": "disabled-bucket", "region": "us-east-1", "disabled": True},
+                {"name": "disabled-bucket", "region": "us-east-1"},
             ]
         }
 
@@ -3545,7 +3563,7 @@ class TestDisabledAndCircuitBrokenBucketNeverReinvoke:
         mock_factory.create_s3control_client.return_value = mock_s3control
 
         mock_store_cls = MagicMock()
-        mock_store = MagicMock()
+        mock_store = mock_state_store()
         mock_store_cls.return_value = mock_store
         mock_store.get_checkpoint.side_effect = (
             lambda *a: (_checkpoint(bucket_name), '"etag-0"')
@@ -3565,7 +3583,7 @@ class TestDisabledAndCircuitBrokenBucketNeverReinvoke:
         rt = {
             **_BASE_RUNTIME,
             "max_batch_job_failures": 4,
-            "on_bucket_disable": lambda name, reason: disabled_buckets.append(name),
+            "on_bucket_disabled": lambda name, reason: disabled_buckets.append(name),
         }
 
         with (
@@ -3714,12 +3732,12 @@ class TestLeaseContentionDefersToExistingHandling:
 
 
 class TestDisabledBucketsMetricWiring:
-    def _run(self, config: dict):
+    def _run(self, config: dict, disabled_buckets: set[str] | None = None):
         (
             mock_factory_cls, mock_store_cls,
             mock_get_rules, mock_read_journal,
             mock_submit_job,
-        ) = _make_mocks(["active-bucket"])
+        ) = _make_mocks(["active-bucket"], disabled_buckets=disabled_buckets)
 
         published: list = []
 
@@ -3750,13 +3768,16 @@ class TestDisabledBucketsMetricWiring:
         return published[0]
 
     def test_counts_disabled_buckets(self):
-        run_result = self._run({
-            "buckets": [
-                {"name": "disabled-a", "region": "us-east-1", "disabled": True},
-                {"name": "disabled-b", "region": "us-east-1", "disabled": True},
-                {"name": "active-bucket", "region": "us-east-1"},
-            ]
-        })
+        run_result = self._run(
+            {
+                "buckets": [
+                    {"name": "disabled-a", "region": "us-east-1"},
+                    {"name": "disabled-b", "region": "us-east-1"},
+                    {"name": "active-bucket", "region": "us-east-1"},
+                ]
+            },
+            disabled_buckets={"disabled-a", "disabled-b"},
+        )
         assert run_result.disabled_buckets == 2
         # The disabled buckets contribute no per-bucket metrics at all, which
         # is precisely why the run-level count is needed.

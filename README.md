@@ -88,7 +88,7 @@ The threshold parameters can also be changed on the Lambda function's environmen
 
 ## Configuration
 
-The Solution is configured entirely through CloudFormation stack parameters. There is no file to author before deploying. On deploy, the stack writes an internal config object (`solution-config.json`) to the State Bucket that the Lambda reads at startup. The only supported manual edit to that object is clearing a bucket's `disabled` flag after an auto-disable (see [Monitoring](#monitoring)). Every other value in it is derived from stack parameters and is overwritten on the next deploy.
+The Solution is configured entirely through CloudFormation stack parameters. There is no file to author before deploying. On deploy, the stack writes an internal config object (`solution-config.json`) to the State Bucket that the Lambda reads at startup. Every value in it is derived from stack parameters and is overwritten on the next deploy, so there is no supported manual edit to it. Per-bucket runtime state, including a bucket's `disabled` flag, lives in that bucket's state object instead (see [Monitoring](#monitoring)).
 
 **Monitored buckets.** The bucket list comes from the `SourceBucketNames` parameter. To add or remove a bucket, update `SourceBucketNames` and deploy a stack update. This is the only supported method. The execution role's per-bucket permissions, and in Lake Formation accounts the journal grants, are scoped to this parameter at deploy time, so adding a bucket by hand-editing the config object would leave it without journal or bucket access.
 
@@ -180,11 +180,15 @@ Tells you whether the Solution is running, keeping up, and still covering every 
 
 [Log entries](docs/monitoring.md#log-entries) lists every event type and the fields it carries, and [Audit actions](docs/monitoring.md#audit-actions) does the same for each `audit` action.
 
-**Auto-disable.** When consecutive Batch Operations job failures for a bucket reach `MaxBatchJobFailures` (default 4), the Solution sets that bucket's `disabled` flag to `true` in `solution-config.json` and clears its stored failure history. The other buckets keep running. This circuit breaker prevents runaway per-job costs from a bucket whose job keeps failing. When `AlarmEmail` is set, an email names the disabled bucket and the recovery step.
+**Auto-disable.** When consecutive Batch Operations job failures for a bucket reach `MaxBatchJobFailures` (default 4), the Solution sets that bucket's `disabled` flag to `true` in its state object and clears its stored failure history, in a single write. The other buckets keep running. This circuit breaker prevents runaway per-job costs from a bucket whose job keeps failing. When `AlarmEmail` is set, an email names the disabled bucket and the recovery step.
+
+The flag is held in the bucket's own state object rather than in `solution-config.json` because a stack update rewrites that config object wholesale from the template parameters. A disable recorded there would be cleared by any later deploy, resuming billable job submission for a bucket nobody had decided to re-enable. Nothing a deploy does touches a state object that already exists.
 
 The same threshold applies to permanent submission failures, where `create_job` is rejected by botocore's own parameter validation before the request is sent. Such a request fails identically on every retry, unlike a terminal-job failure, which may be transient, so it needs a change deployed rather than another interval. Service-side errors such as throttling and permission issues do not count toward the threshold.
 
-To re-enable a bucket, address the cause of the job failures, then set `"disabled": false` for its entry in `solution-config.json` on the State Bucket (`s3://<state-bucket>/config/solution-config.json`) and wait for the next scheduled run. No redeploy or manual state edit is needed. A bucket disabled by a rejected request needs a code fix deployed first, or the failure reproduces.
+To re-enable a bucket, address the cause of the job failures, then set `"disabled": false` in its state object on the State Bucket (`s3://<state-bucket>/state/<bucket-name>.json`) and wait for the next scheduled run. Removing the `disabled` key has the same effect. No redeploy is needed, and no other edit: the same write that set the flag also cleared the job history that tripped the breaker, so the first run after re-enabling starts from a clean counter. A bucket disabled by a rejected request needs a code fix deployed first, or the failure reproduces.
+
+Leave the rest of the state object alone while making that edit. [Checkpoint and Recovery](#checkpoint-and-recovery) covers what else it holds and why deleting it is not a way to reset a bucket.
 
 ### CloudWatch metrics
 
@@ -225,7 +229,7 @@ The Solution reads the journal and does not create it, so this condition persist
 
 The audit entry is written every run, so the condition is always queryable. The notification is limited to once a day so an unmet prerequisite stays visible without arriving every `CheckFrequencyMinutes`, and it stops as soon as the journal is readable.
 
-To resolve, enable the journal on the bucket (S3 console: select the bucket, **Metadata configuration**, **Create metadata configuration**), then confirm the `s3tablescatalog` Glue catalog exists in the Region. The bucket resumes on the next scheduled run. It is not disabled and its checkpoint has not moved, so no configuration change or state edit is part of the recovery, and no tagging operation is lost.
+To resolve, enable the journal on the bucket (S3 console: select the bucket, **Metadata configuration**, **Create metadata configuration**), then confirm the `s3tablescatalog` Glue catalog exists in the Region. The bucket resumes on the next scheduled run. It is not disabled and its checkpoint has not moved, so no state edit is part of the recovery, and no tagging operation is lost.
 
 A journal read that fails for any other reason, including throttling and a missing Lake Formation grant, raises an `error` entry instead. Those are not reported as a missing journal, because enabling one that already exists would not fix them.
 
@@ -233,7 +237,16 @@ A journal read that fails for any other reason, including throttling and a missi
 
 A run that fails part way through does not skip the objects it was working on. Each bucket's progress advances only once its Batch Operations job has been submitted, so a run that dies before that point leaves the checkpoint where it was and the next run covers the same tagging operations again. The checkpoint lives in the State Bucket at `state/<bucket-name>.json`.
 
-To reset a bucket to the beginning of the journal, delete its state object at `s3://<state-bucket>/state/<bucket-name>.json`.
+Do not delete the state object to replay history. It holds the lease, the processed-operation window, submission records, the bucket's `disabled` flag, and all completion tracking alongside the watermark, so deleting it resets the bucket to the beginning of the journal and every object in that history enters the next manifest. Batch Operations bills every manifest entry, so on a bucket with a long journal that is an unbounded charge. It also discards completion tracking for objects still in flight, disables failed-job recovery, and silently re-enables the bucket if it was disabled. To replicate objects tagged before the deployment, use [Backfilling After a Replication-Rule Change](docs/backfill.md) instead.
+
+Two fields are edited by hand, one field at a time, leaving everything else in the object untouched:
+
+| Field | When to edit it |
+|---|---|
+| `disabled` | Set to `false` to re-enable a bucket after an auto-disable (see [Monitoring](#monitoring)) |
+| `last_processed_watermark` | Only to repair the case below |
+
+If `last_processed_watermark` is set to a value more than 24 hours in the future, the Solution rejects it as implausible and skips that bucket every run, logging `Failed to read checkpoint`. No run can repair it, because every write happens after the read that fails. Edit that one field to a plausible value. The `disabled` flag is still read in that state, so a corrupted watermark cannot quietly re-enable a disabled bucket. A stale lease needs no intervention: the next run takes it over, and a lease carrying an implausible watermark is discarded automatically with a `lease_discarded` audit entry.
 
 ## Cost
 

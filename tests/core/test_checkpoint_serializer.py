@@ -220,7 +220,16 @@ class TestDeserializeErrors:
         with pytest.raises(KeyError):
             deserialize(payload)
 
-    def test_invalid_lease_status_raises(self):
+    def test_invalid_lease_status_is_discarded(self):
+        """An unrecognised LeaseStatus drops the lease instead of raising.
+
+        Replaces the former ``test_invalid_lease_status_raises``. The property
+        being protected is unchanged — a malformed lease is never honored — but
+        raising here would propagate to a per-bucket skip that repeats every
+        interval and that no write path can repair, because every write runs
+        downstream of the failing read. The rest of the checkpoint must still
+        parse so the bucket keeps making progress.
+        """
         payload = json.dumps({
             "source_bucket": "b",
             "last_processed_watermark": _WM_100,
@@ -231,10 +240,17 @@ class TestDeserializeErrors:
                 "status": "UNKNOWN_STATUS",
             },
         })
-        with pytest.raises(ValueError):
-            deserialize(payload)
+        state = deserialize(payload)
+        assert state.lease is None
+        assert state.last_processed_watermark == _WM_100
+        assert state.source_bucket == "b"
 
-    def test_invalid_datetime_raises(self):
+    def test_invalid_datetime_is_discarded(self):
+        """An unparseable ``acquired_at`` drops the lease instead of raising.
+
+        Replaces the former ``test_invalid_datetime_raises``; same rationale as
+        ``test_invalid_lease_status_is_discarded``.
+        """
         payload = json.dumps({
             "source_bucket": "b",
             "last_processed_watermark": _WM_100,
@@ -245,8 +261,9 @@ class TestDeserializeErrors:
                 "status": "IN_FLIGHT",
             },
         })
-        with pytest.raises(ValueError):
-            deserialize(payload)
+        state = deserialize(payload)
+        assert state.lease is None
+        assert state.last_processed_watermark == _WM_100
 
     def test_non_string_watermark_raises(self):
         payload = json.dumps({
@@ -266,6 +283,87 @@ class TestDeserializeErrors:
         })
         with pytest.raises(ValueError):
             deserialize(payload)
+
+
+class TestLeaseWatermarkPlausibilityBound:
+    """A lease whose ``candidate_max_watermark`` cannot be trusted is dropped.
+
+    ``is_eligible`` filters every operation at or below a live lease's
+    ``candidate_max_watermark``, so a far-future value there suppresses the
+    whole journal with no error raised and no journal record able to grow past
+    it. That makes it a permanent, silent halt — strictly worse than the
+    ``last_processed_watermark`` poisoning case, which at least resolves once
+    the clock catches up. The lease is therefore discarded so the next run
+    takes it over.
+    """
+
+    def _payload(self, candidate_max):
+        return json.dumps({
+            "source_bucket": "b",
+            "last_processed_watermark": _WM_100,
+            "lease": {
+                "lease_id": "lid",
+                "candidate_max_watermark": candidate_max,
+                "acquired_at": _NOW_UTC.isoformat(),
+                "status": "IN_FLIGHT",
+            },
+        })
+
+    def test_far_future_lease_watermark_is_discarded(self):
+        """The year-9999 poisoning case drops the lease."""
+        state = deserialize(self._payload("9999-12-31T23:59:59.000000Z"))
+        assert state.lease is None
+
+    def test_non_canonical_lease_watermark_is_discarded(self):
+        """A non-canonical string is not comparable and drops the lease."""
+        state = deserialize(self._payload("2024-01-01"))
+        assert state.lease is None
+
+    def test_non_string_lease_watermark_is_discarded(self):
+        """A well-typed JSON number would crash the ``<=`` comparison in
+        ``is_eligible``; drop the lease instead."""
+        state = deserialize(self._payload(12345))
+        assert state.lease is None
+
+    def test_plausible_lease_watermark_is_kept(self):
+        """A canonical past watermark is honored — the bound must not be so
+        tight that it discards legitimate leases."""
+        state = deserialize(self._payload(_WM_200))
+        assert state.lease is not None
+        assert state.lease.candidate_max_watermark == _WM_200
+
+    def test_discarding_the_lease_preserves_the_rest_of_the_checkpoint(self):
+        """Dropping the lease must not cost the watermark or the window, which
+        would rewind the bucket rather than just unblock it."""
+        payload = json.loads(self._payload("9999-12-31T23:59:59.000000Z"))
+        payload["processed_window"] = [
+            {"logical_operation_id": "op-1", "watermark": _WM_100}
+        ]
+        state = deserialize(json.dumps(payload))
+        assert state.lease is None
+        assert state.last_processed_watermark == _WM_100
+        assert [r.logical_operation_id for r in state.processed_window] == ["op-1"]
+
+    def test_lease_missing_a_required_key_is_discarded(self):
+        """A lease absent ``lease_id`` was not written by this serializer."""
+        payload = json.dumps({
+            "source_bucket": "b",
+            "last_processed_watermark": _WM_100,
+            "lease": {
+                "candidate_max_watermark": _WM_200,
+                "acquired_at": _NOW_UTC.isoformat(),
+                "status": "IN_FLIGHT",
+            },
+        })
+        assert deserialize(payload).lease is None
+
+    def test_lease_not_an_object_is_discarded(self):
+        payload = json.dumps({
+            "source_bucket": "b",
+            "last_processed_watermark": _WM_100,
+            "lease": "not-an-object",
+        })
+        assert deserialize(payload).lease is None
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +497,11 @@ class TestProperty10SerializationRoundTrip:
         source_bucket=st.from_regex(r"^[a-z][a-z0-9\-]{2,20}$", fullmatch=True),
         watermark=_persisted_watermarks,
         lease_id=st.text(min_size=1, max_size=36),
-        candidate_max=st.text(min_size=0, max_size=50),
+        # A real lease's candidate_max_watermark is a max() over journal
+        # record_timestamps, so it is always canonical. _deserialize_lease
+        # discards a lease whose watermark is not, so drawing arbitrary text
+        # here would be asserting a round trip the Solution never performs.
+        candidate_max=_persisted_watermarks,
     )
     @settings(max_examples=100)
     def test_round_trip_with_lease(

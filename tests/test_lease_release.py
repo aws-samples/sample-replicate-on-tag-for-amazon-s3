@@ -30,6 +30,7 @@ from src.core.models import (
     TaggingOperation,
 )
 from src.orchestrator import run_interval
+from tests.support import mock_state_store
 
 _NOW = datetime(2024, 1, 1, tzinfo=timezone.utc)
 _DEST_ARN = "arn:aws:s3:::dest-bucket"
@@ -112,7 +113,7 @@ def _make_base_mocks(bucket_name: str = "my-bucket"):
     mock_factory_cls.return_value = mock_factory
 
     mock_store_cls = MagicMock()
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store_cls.return_value = mock_store
 
     def get_checkpoint_side_effect(s3_client, state_bucket, source_bucket):
@@ -327,7 +328,7 @@ class TestLeaseReleaseOnSubmissionStreakDisable:
             submit_side_effect=lambda **kwargs: _permanent_client_failure(),
             runtime_overrides={
                 "max_batch_job_failures": 1,  # threshold=1 so first failure disables
-                "on_bucket_disable": lambda name, reason: disabled_buckets.append(name),
+                "on_bucket_disabled": lambda name, reason: disabled_buckets.append(name),
             },
         )
         # Bucket was indeed disabled

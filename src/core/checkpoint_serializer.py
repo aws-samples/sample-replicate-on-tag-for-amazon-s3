@@ -83,24 +83,73 @@ def _serialize_lease(lease: Lease) -> dict[str, Any]:
     }
 
 
-def _deserialize_lease(data: dict[str, Any]) -> Lease:
-    """Reconstruct a Lease from a parsed JSON dict.
+def _deserialize_lease(data: Any) -> Lease | None:
+    """Reconstruct a Lease from a parsed JSON dict, or ``None`` when the
+    persisted lease cannot be trusted.
+
+    A lease that does not have the exact shape :func:`_serialize_lease` writes
+    is **discarded** — returned as ``None``, the same as no lease at all —
+    rather than raising or being honored.
+
+    Why discard rather than raise
+    -----------------------------
+    The lease exists only to stop a concurrent run from submitting the same
+    operations twice (Req 9.4), and ``is_eligible`` enforces it by filtering
+    every operation at or below ``candidate_max_watermark``. That makes an
+    untrustworthy lease strictly worse than no lease: raising here would
+    propagate out of :func:`deserialize` into ``StateStore.get_checkpoint``,
+    which the orchestrator turns into a per-bucket skip, so the bucket would
+    log the same failure every interval and never replicate again. Nothing
+    could repair it either, because every write path to the state object runs
+    downstream of the read that failed. Discarding instead lets the next run
+    take the lease over and clear it, so the bucket recovers on its own.
+
+    Why discarding cannot cause a duplicate submission
+    --------------------------------------------------
+    A lease held by a genuine in-flight run always carries a canonical past
+    watermark (it is a ``max()`` over journal ``record_timestamp`` values), a
+    parseable ISO ``acquired_at``, and a recognised ``LeaseStatus``. If any of
+    those does not hold, the lease was not written by this Solution's
+    serializer, so no real run is holding it and dropping it cannot race
+    anything.
+
+    ``candidate_max_watermark`` in particular is bounded by
+    :func:`~src.core.watermark.is_plausible_watermark`, closing the same
+    poisoning vector that bound already closes for
+    ``last_processed_watermark``. Without it a far-future lease watermark
+    (``"9999-12-31T23:59:59.000000Z"``) filters out every journal record
+    forever, silently halting the bucket with no error and no alarm — and
+    unlike a poisoned ``last_processed_watermark``, no journal record can ever
+    grow past it to break the deadlock.
+
+    A discarded lease is not silent: ``StateStore.get_checkpoint`` compares the
+    raw payload against the parsed state and raises a ``lease_discarded``
+    audit entry when a lease was present but dropped.
 
     Args:
-        data: A dict produced by ``_serialize_lease``.
+        data: The raw ``lease`` value from the parsed state payload.
 
     Returns:
-        The reconstructed ``Lease``.
-
-    Raises:
-        KeyError: If a required key is absent.
-        ValueError: If ``acquired_at`` or ``status`` cannot be parsed.
+        The reconstructed ``Lease``, or ``None`` when it cannot be trusted.
     """
+    if not isinstance(data, dict):
+        return None
+    try:
+        lease_id = data["lease_id"]
+        candidate = data["candidate_max_watermark"]
+        acquired_at = datetime.fromisoformat(data["acquired_at"])
+        status = LeaseStatus(data["status"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(lease_id, str) or not isinstance(candidate, str):
+        return None
+    if not is_plausible_watermark(candidate):
+        return None
     return Lease(
-        lease_id=data["lease_id"],
-        candidate_max_watermark=data["candidate_max_watermark"],
-        acquired_at=datetime.fromisoformat(data["acquired_at"]),
-        status=LeaseStatus(data["status"]),
+        lease_id=lease_id,
+        candidate_max_watermark=candidate,
+        acquired_at=acquired_at,
+        status=status,
     )
 
 
@@ -267,14 +316,16 @@ def deserialize(data: str) -> CheckpointState:
     Returns:
         The reconstructed ``CheckpointState``.
 
+    An untrustworthy ``lease`` is discarded rather than raising — see
+    :func:`_deserialize_lease` for why a bad lease must not halt the bucket.
+
     Raises:
         json.JSONDecodeError: If ``data`` is not valid JSON.
         KeyError: If a required field is missing from the JSON.
-        ValueError: If a field value cannot be parsed (bad datetime or
-            unrecognised LeaseStatus value), if the top-level payload is not a
-            JSON object, if ``source_bucket`` / ``last_processed_watermark``
-            is not a string, or if ``last_processed_watermark`` is not a
-            plausible canonical watermark.
+        ValueError: If the top-level payload is not a JSON object, if
+            ``source_bucket`` / ``last_processed_watermark`` is not a string,
+            or if ``last_processed_watermark`` is not a plausible canonical
+            watermark.
 
     Security note
     -------------
@@ -294,6 +345,14 @@ def deserialize(data: str) -> CheckpointState:
     halt replication for the bucket. Restricting write access to the state
     bucket at the bucket-policy / IAM layer remains the primary control; this
     is defence in depth.
+
+    The lease's own ``candidate_max_watermark`` carries the same bound, applied
+    in :func:`_deserialize_lease`. It is the more dangerous of the two: a
+    far-future value there filters every operation out via ``is_eligible``'s
+    lease guard with no error raised at all, and no journal record can ever
+    grow past it, so the bucket would be blocked permanently rather than until
+    the clock caught up. A lease failing that bound is discarded, not raised on,
+    so the next run takes it over and the bucket recovers unattended.
     """
     payload: Any = json.loads(data)
     if not isinstance(payload, dict):

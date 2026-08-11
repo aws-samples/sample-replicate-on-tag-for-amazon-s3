@@ -30,12 +30,9 @@ class MonitoredBucket:
     name: str    # must satisfy S3 bucket naming rules; required (1.2, 2.2)
     region: str  # non-empty, valid AWS region; required (1.2, 13.3, 13.8)
     # No tag_filter and no destination permitted (1.5)
-    # The following three fields are written by the Solution when a bucket
-    # must be disabled (e.g. InlineHashCeiling exceeded).  Operators can
-    # also set disabled=True manually to pause a bucket without removing it.
-    disabled: bool = False
-    disabled_reason: str = ""
-    disabled_at: str = ""   # ISO 8601 timestamp set when disabled=True is written
+    # Whether a bucket is disabled is NOT carried here: it is per-bucket
+    # runtime state, held in that bucket's state object and read via
+    # StateStore.get_disable_state (see BucketDisableState for why).
 
 
 @dataclass
@@ -373,6 +370,43 @@ class CheckpointState:
     processed_window: list[ProcessedRef] = field(default_factory=list)  # late-arrival dedup memory (9.x)
 
 
+@dataclass(frozen=True)
+class BucketDisableState:
+    """Whether a Monitored_Bucket is disabled, read from its state object.
+
+    Persisted as sibling top-level keys in ``state/<source_bucket>.json``
+    alongside ``CheckpointState`` rather than as fields *of* it, and in the
+    state object rather than in Solution_Config. Three reasons, each of which
+    rules out an alternative that looks simpler:
+
+    * **Not in Solution_Config.** The config custom resource rewrites that
+      object wholesale from template parameters on every stack create/update
+      and has no notion of this flag, so a disable stored there is cleared by
+      an unrelated deploy — re-enabling a bucket whose jobs keep failing
+      without anyone deciding to. The state object is only ever seeded with
+      ``If-None-Match: *``, so a disable recorded here survives every deploy.
+    * **Not a ``CheckpointState`` field.**
+      :func:`~src.core.checkpoint_logic.advance_checkpoint` builds a fresh
+      ``CheckpointState`` from an explicit field list on every lease release,
+      so a field added there would reset to its default at the end of every
+      interval. As sibling keys, ``put_checkpoint``'s overlay preserves them
+      untouched, the same way it preserves ``submission_records``.
+    * **Read without ``deserialize``.** A disabled bucket must not become an
+      enabled one because its watermark was corrupted, and ``deserialize``
+      raises on an implausible ``last_processed_watermark``.
+      :meth:`~src.adapters.state_store.StateStore.get_disable_state` therefore
+      reads the raw payload, as ``get_submission_records`` does.
+
+    An absent ``disabled`` key and an explicit ``false`` both mean enabled, so
+    the documented recovery step (setting ``"disabled": false``) and deleting
+    the key outright are equivalent.
+    """
+
+    disabled: bool = False
+    reason: str = ""
+    at: str = ""  # ISO 8601 timestamp recorded when the bucket was disabled
+
+
 # ---------------------------------------------------------------------------
 # SubmissionRecord
 # ---------------------------------------------------------------------------
@@ -494,7 +528,7 @@ class RunResult:
         One BucketMetrics entry per Monitored_Bucket processed in the run.
     disabled_buckets:
         Run-level count of Monitored_Buckets skipped because their
-        ``disabled`` flag is set in Solution_Config. A disabled bucket
+        ``disabled`` flag is set in their state object. A disabled bucket
         produces no ``BucketMetrics`` entry at all (it is skipped before the
         per-bucket counters exist), so without this count an auto-disabled
         bucket — replication silently stopped, awaiting a manual re-enable —

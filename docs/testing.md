@@ -100,9 +100,10 @@ python tests/test_e2e_aws.py  # a script, not a pytest module
 ```
 
 The run needs journal records newer than the stored checkpoint. S3 Metadata
-delivers journal records within a few minutes of the change but not instantly, so
-after tagging objects in the source bucket, expect to wait before the records
-appear and the test has anything to submit. Until then it exits 2.
+delivery is not instant; expect up to 15 minutes between tagging an object and
+its record appearing in the journal. Until then the test exits 2, which is
+delivery latency, not a fault. Confirm delivery with a direct Athena count query
+against the journal before concluding anything is broken.
 
 ## Verifying a KMS-enabled deployment
 

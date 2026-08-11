@@ -272,7 +272,7 @@ class TestLambdaFunction:
 
     def test_batch_job_failure_env_vars_present(self, lambda_props):
         """ReplicationLambda needs BATCH_JOB_FAILURE_TOPIC_ARN and
-        BATCH_JOB_FAILURE_LOG_GROUP so its on_bucket_disable callback can
+        BATCH_JOB_FAILURE_LOG_GROUP so its on_bucket_disabled callback can
         publish the bucket-disabled recovery-instructions alert (mirrors
         CompletionReportCheckLambda's own report-missing alert wiring)."""
         env_vars = lambda_props.get("Environment", {}).get("Variables", {})
@@ -347,6 +347,39 @@ class TestReinvocationChainLimitParameter:
         chain_limit` is always False when chain_limit is 0, so 0 is a
         legitimate (opt-out) value, not an error."""
         assert param.get("MinValue") == 0
+
+
+class TestJournalLookbackSecondsParameter:
+    """The lookback default exists in two places that must not drift apart."""
+
+    @pytest.fixture(scope="class")
+    def param(self, template) -> dict:
+        return template.get("Parameters", {}).get("JournalLookbackSeconds", {})
+
+    def test_exists_with_default_7200(self, param):
+        assert param.get("Type") == "Number"
+        assert param.get("Default") == 7200
+
+    def test_min_value_is_0(self, param):
+        """0 disables the lookback re-scan, reading only strictly above the
+        watermark. Legitimate for a deployment that would rather miss a
+        late-delivered record than re-scan, so not an error."""
+        assert param.get("MinValue") == 0
+
+    def test_matches_orchestrator_default(self, param):
+        """The template default and DEFAULT_JOURNAL_LOOKBACK must agree.
+
+        Each governs a different entry path: the template value reaches the
+        Lambda as JOURNAL_LOOKBACK_SECONDS on every CloudFormation deploy, and
+        DEFAULT_JOURNAL_LOOKBACK applies when that variable is unset (direct
+        invocation, tests). A silent divergence would mean the deployed window
+        and the documented window differ, and the failure it governs — a journal
+        record delivered outside the window is dropped permanently, with no
+        retry and no alarm — is invisible when it happens.
+        """
+        from src.orchestrator import DEFAULT_JOURNAL_LOOKBACK
+
+        assert param.get("Default") == DEFAULT_JOURNAL_LOOKBACK.total_seconds()
 
 
 # ---------------------------------------------------------------------------
@@ -951,6 +984,45 @@ _CONFIG_RESOURCE_SOURCE = (
 )
 
 
+def _config_role_s3_statements(resources) -> list[tuple[set[str], list[str]]]:
+    """Yield ``(lowercased s3 actions, resolved !Sub resource strings)`` for every
+    ConfigResourceRole statement carrying an ``s3:`` action.
+
+    The role's S3 grants are split across more than one statement so that
+    ``DeleteObject`` can be withheld from the ``state/`` prefix, so assertions
+    have to aggregate rather than assume a single statement.
+    """
+    stmts = []
+    for policy in (
+        resources.get("ConfigResourceRole", {})
+        .get("Properties", {})
+        .get("Policies", [])
+    ):
+        stmts.extend(policy.get("PolicyDocument", {}).get("Statement", []))
+
+    out: list[tuple[set[str], list[str]]] = []
+    for stmt in stmts:
+        if not isinstance(stmt, dict):
+            continue  # skip !If / conditional statements (_CfnTag)
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        s3_actions = {
+            a.lower() for a in actions
+            if isinstance(a, str) and a.lower().startswith("s3:")
+        }
+        if not s3_actions:
+            continue
+        resource = stmt.get("Resource")
+        resource_items = resource if isinstance(resource, list) else [resource]
+        sub_values = [
+            item.value for item in resource_items
+            if isinstance(item, _CfnTag) and isinstance(item.value, str)
+        ]
+        out.append((s3_actions, sub_values))
+    return out
+
+
 class TestConfigResourceFidelity:
     """Task 4.1 — inline ZipFile matches the standalone module and is under the size limit."""
 
@@ -1102,75 +1174,43 @@ class TestConfigResourceStructure:
         )
 
     def test_config_resource_role_s3_resource_is_object_not_bucket(self, resources):
-        """ConfigResourceRole S3 resource must be scoped to object ARNs, not the bucket (Req 8.3)."""
-        stmts = []
-        for policy in (
-            resources.get("ConfigResourceRole", {})
-            .get("Properties", {})
-            .get("Policies", [])
-        ):
-            stmts.extend(policy.get("PolicyDocument", {}).get("Statement", []))
-
-        for stmt in stmts:
-            if not isinstance(stmt, dict):
-                continue  # skip !If / conditional statements (_CfnTag)
-            actions = stmt.get("Action", [])
-            if isinstance(actions, str):
-                actions = [actions]
-            has_s3 = any(
-                isinstance(a, str) and a.lower().startswith("s3:")
-                for a in actions
+        """ConfigResourceRole S3 resources must be object/prefix ARNs, never a bare
+        bucket ARN (Req 8.3)."""
+        for _actions, sub_values in _config_role_s3_statements(resources):
+            assert sub_values, (
+                "ConfigResourceRole S3 Resource entries must be CloudFormation "
+                "intrinsics (!Sub) resolving to strings"
             )
-            if not has_s3:
-                continue
-            resource = stmt.get("Resource")
-            # Resource may be a single !Sub or a list of !Sub entries.
-            resource_items = resource if isinstance(resource, list) else [resource]
-            for item in resource_items:
-                assert isinstance(item, _CfnTag), (
-                    "ConfigResourceRole S3 Resource entries must be CloudFormation intrinsics (!Sub)"
+            for value in sub_values:
+                assert "${StateBucket.Arn}/" in value, (
+                    f"ConfigResourceRole S3 Resource {value!r} is not scoped below "
+                    "the State Bucket ARN; a bare bucket ARN grants the whole "
+                    "bucket (Req 8.3)."
                 )
-            # At least one entry should reference the config object key.
-            sub_values = [
-                item.value for item in resource_items
-                if isinstance(item, _CfnTag) and isinstance(item.value, str)
-            ]
-            assert any("solution-config.json" in v for v in sub_values), (
-                f"ConfigResourceRole S3 Resource {sub_values!r} does not reference "
-                "the config object key; expected an object-level ARN (Req 8.3)."
-            )
 
-    def test_config_resource_role_s3_resource_includes_state_prefix(self, resources):
-        """ConfigResourceRole S3 resource must include state/* for checkpoint seeding."""
-        stmts = []
-        for policy in (
-            resources.get("ConfigResourceRole", {})
-            .get("Properties", {})
-            .get("Policies", [])
-        ):
-            stmts.extend(policy.get("PolicyDocument", {}).get("Statement", []))
+    def test_config_resource_role_covers_config_and_state(self, resources):
+        """Across all statements, the role can write the config object and seed
+        checkpoints under state/."""
+        all_values = [
+            v for _actions, sub_values in _config_role_s3_statements(resources)
+            for v in sub_values
+        ]
+        assert any("solution-config.json" in v for v in all_values), (
+            f"ConfigResourceRole must be able to write the config object; got {all_values!r}"
+        )
+        assert any("state/*" in v for v in all_values), (
+            f"ConfigResourceRole must be able to seed checkpoints; got {all_values!r}"
+        )
 
-        for stmt in stmts:
-            if not isinstance(stmt, dict):
+    def test_config_resource_role_cannot_delete_state_objects(self, resources):
+        """Deleting a state object rewinds that bucket to the start of the journal,
+        and the handler never does it, so the deploy-time role must not be able to."""
+        for actions, sub_values in _config_role_s3_statements(resources):
+            if not any("state/" in v for v in sub_values):
                 continue
-            actions = stmt.get("Action", [])
-            if isinstance(actions, str):
-                actions = [actions]
-            has_s3 = any(
-                isinstance(a, str) and a.lower().startswith("s3:")
-                for a in actions
-            )
-            if not has_s3:
-                continue
-            resource = stmt.get("Resource")
-            resource_items = resource if isinstance(resource, list) else [resource]
-            sub_values = [
-                item.value for item in resource_items
-                if isinstance(item, _CfnTag) and isinstance(item.value, str)
-            ]
-            assert any("state/*" in v for v in sub_values), (
-                f"ConfigResourceRole S3 Resource must include state/* for checkpoint seeding; "
-                f"got {sub_values!r}."
+            assert "s3:deleteobject" not in actions, (
+                f"ConfigResourceRole grants s3:DeleteObject on {sub_values!r}. "
+                "Seeding needs PutObject only."
             )
 
     def test_solution_config_resource_exists(self, resources):
@@ -1192,6 +1232,30 @@ class TestConfigResourceStructure:
             assert depends_on == "StateBucket", (
                 f"SolutionConfig DependsOn must include StateBucket; got {depends_on!r}"
             )
+
+    def test_solution_config_code_hash_is_bound_to_code_location(self, resources):
+        """CodeHash must be !Ref CodeLocation, not a hand-maintained literal.
+
+        CloudFormation sends this custom resource an Update only when one of its
+        own properties changes. A literal has to be bumped by whoever edits the
+        handler's inline code, which has already been missed once: a release
+        that added the CheckFrequencySeconds response attribute shipped without
+        re-invoking the resource, so the attribute this template consumes kept
+        its previous value. CodeLocation changes on every release, so binding to
+        it makes the correct behavior automatic.
+        """
+        code_hash = resources["SolutionConfig"].get("Properties", {}).get("CodeHash")
+        assert isinstance(code_hash, _CfnTag), (
+            f"SolutionConfig CodeHash must be a CloudFormation intrinsic, not a "
+            f"literal that has to be bumped by hand; got {code_hash!r}"
+        )
+        assert code_hash.tag == "!Ref", (
+            f"SolutionConfig CodeHash must use !Ref; got {code_hash.tag!r}"
+        )
+        assert code_hash.value == "CodeLocation", (
+            f"SolutionConfig CodeHash must reference CodeLocation; got "
+            f"{code_hash.value!r}"
+        )
 
     def test_solution_config_passes_check_frequency(self, resources):
         """SolutionConfig must pass CheckFrequencyMinutes to the handler; processing_interval

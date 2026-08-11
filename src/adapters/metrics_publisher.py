@@ -152,8 +152,8 @@ def _build_metric_data(
     # rather than a missing-data condition. Run-level rather than per-bucket
     # deliberately: one metric covers any number of buckets at a flat cost,
     # and the bucket's identity is already carried by the disable
-    # notification, the per-run error log entry, and Solution_Config
-    # (Req 3.3).
+    # notification, the per-run error log entry, and the bucket's own state
+    # object (Req 3.3).
     datums.append({
         "MetricName": "DisabledBuckets",
         "Dimensions": extra_dims,

@@ -14,6 +14,14 @@ The core schema is the ``CheckpointState`` schema from
 ``PutObject`` can update the checkpoint, the lease, *and* the latest
 submission record atomically.
 
+The per-bucket disable flag (``disabled``, ``disabled_reason``,
+``disabled_at``) is persisted here too, written by :meth:`StateStore.disable_bucket`
+and read by :meth:`StateStore.get_disable_state`.  It is the one part of this
+object an operator is expected to edit by hand: setting ``disabled`` to
+``false`` re-enables the bucket on the next scheduled run.  See
+:class:`~src.core.models.BucketDisableState` for why it lives here rather than
+in Solution_Config.
+
 Per design.md Decision D3 (one Batch Operations job per bucket), a bucket has
 a single ``SubmissionRecord``, and :meth:`StateStore.record_submission` writes
 ``submission_records`` as exactly one entry, keyed by the per-bucket sentinel
@@ -31,6 +39,9 @@ overwrites ``submission_records`` with the single bucket-keyed entry.
       "last_processed_watermark": "<canonical record_timestamp str>",
       "lease": { ... } | null,
       "processed_window": [ ... ],
+      "disabled": true,                    // absent when the bucket is enabled
+      "disabled_reason": "<str>",          // absent when the bucket is enabled
+      "disabled_at": "<ISO 8601>",         // absent when the bucket is enabled
       "submission_records": {
         "<source_bucket sentinel>": {
           "replication_config_id": "<str>",
@@ -135,6 +146,7 @@ from src.core.checkpoint_serializer import (
 )
 from src.core import completion_serializer, completion_tracker, observability
 from src.core.models import (
+    BucketDisableState,
     CheckpointState,
     CompletionState,
     Lease,
@@ -160,7 +172,7 @@ class ConditionalWriteError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Private helpers
+# Object key and payload field names
 # ---------------------------------------------------------------------------
 
 # Key in a bucket's state payload mapping bucket name to a consecutive
@@ -172,9 +184,24 @@ _SUBMISSION_FAILURE_STREAK_FIELD = "submission_failure_streaks"
 # because it expires on its own, so nothing has to clear it on the healthy path.
 _JOURNAL_UNAVAILABLE_ALERT_FIELD = "journal_unavailable_alerts"
 
+# Keys in a bucket's state payload recording that the bucket is disabled and
+# why. Written by the circuit breaker via :meth:`StateStore.disable_bucket`,
+# read by :meth:`StateStore.get_disable_state`, and cleared by the operator
+# setting ``disabled`` to ``false``. See
+# :class:`~src.core.models.BucketDisableState` for why they live here rather
+# than in Solution_Config or on ``CheckpointState``.
+_DISABLED_FIELD = "disabled"
+_DISABLED_REASON_FIELD = "disabled_reason"
+_DISABLED_AT_FIELD = "disabled_at"
 
-def _state_key(source_bucket: str) -> str:
-    """Return the S3 object key for a bucket's state object."""
+
+def state_object_key(source_bucket: str) -> str:
+    """Return the S3 object key for a bucket's state object.
+
+    Public because the bucket-disabled recovery instructions name this key: the
+    operator's recovery step is editing this object, so the message has to be
+    able to print its exact location rather than describe it.
+    """
     return f"state/{source_bucket}.json"
 
 
@@ -361,11 +388,28 @@ class StateStore:
         Raises:
             ClientError: For S3 errors other than ``NoSuchKey``.
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
         payload, etag = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             return _default_state(source_bucket), None
         state = deserialize(json.dumps(payload))
+        # A lease present in the payload but absent from the parsed state was
+        # discarded by _deserialize_lease as untrustworthy (see its docstring).
+        # Discarding is what stops a poisoned lease from blocking the bucket
+        # forever, but it is state being dropped, so it is never silent.
+        if payload.get("lease") is not None and state.lease is None:
+            observability.emit(
+                observability.log_audit(
+                    action="lease_discarded",
+                    source_bucket=source_bucket,
+                    details={
+                        "reason": (
+                            "persisted lease was malformed or carried an "
+                            "implausible candidate_max_watermark"
+                        ),
+                    },
+                )
+            )
         # Defense-in-depth: verify the source_bucket recorded inside the
         # JSON matches the bucket whose state key we read. A mismatch
         # indicates the state object was tampered with (e.g. content of
@@ -418,7 +462,8 @@ class StateStore:
             (``source_bucket``, ``last_processed_watermark``, ``lease``,
             ``processed_window``) onto it before writing. This preserves
             every sibling key not owned by ``CheckpointState`` —
-            ``submission_records``, ``completion_items``,
+            ``submission_records``, the ``disabled`` flag and its two
+            companions, ``completion_items``,
             ``completion_processed_job_ids``, ``completion_scan_state``, and
             ``completion_report_alerted_configs`` — mirroring the
             read-raw-JSON, mutate-one-key pattern used by every other mutator
@@ -427,15 +472,18 @@ class StateStore:
             (which both persist via this method) would silently wipe every
             completion-tracking and submission key on every call.
         """
-        key = _state_key(state.source_bucket)
+        key = state_object_key(state.source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             payload = {}
 
         # Overlay only the CheckpointState-owned keys; every other key already
-        # present in the raw payload (submission_records, completion_items,
+        # present in the raw payload (submission_records, disabled,
+        # disabled_reason, disabled_at, completion_items,
         # completion_processed_job_ids, completion_scan_state,
-        # completion_report_alerted_configs) is left untouched.
+        # completion_report_alerted_configs) is left untouched. The disable
+        # keys matter most here: this overlay is what stops the end-of-interval
+        # release_lease from wiping a disable recorded mid-run.
         payload.update(json.loads(serialize(state)))
         return _write_state_payload(
             s3_client, state_bucket, key, payload, expected_etag, self._kms_key_arn
@@ -626,7 +674,7 @@ class StateStore:
 
         Requirements: 4.1, 4.2
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             return {}
@@ -689,7 +737,7 @@ class StateStore:
         Requirements: 4.1, 4.2, 7.4, 2.2, 2.4
         """
         source_bucket = submission.source_bucket
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         # Read the current raw JSON so that we preserve all existing fields
         # (checkpoint + lease + other submission records) while
@@ -724,52 +772,101 @@ class StateStore:
         )
 
     # ------------------------------------------------------------------
-    # Write — clear submission records (self-healing bucket re-enable)
+    # Read / write — per-bucket disable flag (self-healing bucket re-enable)
     # ------------------------------------------------------------------
 
-    def clear_submission_records(
+    def get_disable_state(
         self,
         s3_client: Any,
         state_bucket: str,
         source_bucket: str,
+    ) -> BucketDisableState:
+        """Read whether ``source_bucket`` is disabled, and why.
+
+        Reads the raw payload rather than going through :func:`deserialize`,
+        deliberately: ``deserialize`` raises on an implausible
+        ``last_processed_watermark``, and a disabled bucket must not read back
+        as enabled because its watermark was corrupted or hand-edited. This
+        mirrors :meth:`get_submission_records`, which reads the same object the
+        same way for the same reason.
+
+        An absent state object, an absent ``disabled`` key, and a falsy
+        ``disabled`` value all yield an enabled
+        :class:`~src.core.models.BucketDisableState`, so an operator can
+        re-enable a bucket either by setting ``"disabled": false`` or by
+        removing the key.
+
+        Args:
+            s3_client:     A boto3 S3 client.
+            state_bucket:  The scratch/state bucket name.
+            source_bucket: The Monitored_Bucket whose flag to read.
+
+        Returns:
+            The bucket's :class:`~src.core.models.BucketDisableState`.
+
+        Raises:
+            ClientError: For S3 errors other than ``NoSuchKey``.
+        """
+        key = state_object_key(source_bucket)
+        payload, _ = _read_state_payload(s3_client, state_bucket, key)
+        if payload is None or not payload.get(_DISABLED_FIELD, False):
+            return BucketDisableState()
+        return BucketDisableState(
+            disabled=True,
+            reason=str(payload.get(_DISABLED_REASON_FIELD, "")),
+            at=str(payload.get(_DISABLED_AT_FIELD, "")),
+        )
+
+    def disable_bucket(
+        self,
+        s3_client: Any,
+        state_bucket: str,
+        source_bucket: str,
+        reason: str,
+        now: datetime,
+        current_etag: str | None = None,
     ) -> str:
-        """Remove every persisted ``SubmissionRecord`` for ``source_bucket``.
+        """Record that ``source_bucket`` is disabled and clear its job history.
 
-        Called when the orchestrator's circuit breaker disables a bucket
-        (``on_bucket_disable``), so that a customer's only recovery step is
-        flipping ``disabled: false`` back in ``solution-config.json`` — no
-        Lambda invocation or manual state-object edit is required.
+        One conditional write does both, so the bucket can never be left
+        disabled with a stale ``SubmissionRecord`` still in place, or the
+        reverse. The operator's only recovery step is setting
+        ``"disabled": false`` in the state object — no Lambda invocation and
+        no redeploy.
 
-        Without this call, the ``SubmissionRecord`` that triggered the
-        disable keeps pointing at the same terminal ``Failed``/``Cancelled``
-        ``job_id`` forever (nothing else clears it). On the next run after
-        re-enabling, the circuit breaker's ``DescribeJob`` check would find
-        that same dead job Failed again, push
-        ``bucket_consecutive_failures`` past the threshold a second time,
-        and immediately re-disable the bucket — before a new job (e.g. one
-        that benefits from a fix deployed in between) ever gets a chance to
-        be submitted. Clearing ``submission_records`` here gives the next
-        run a clean job history: :meth:`get_submission_records` returns
-        ``{}``, so the circuit breaker seeds its counter at 0 and proceeds
-        to a normal submission attempt instead of re-tripping.
+        Clearing ``submission_records`` is what makes that one step
+        sufficient. The record that triggered the disable keeps pointing at
+        the same terminal ``Failed``/``Cancelled`` ``job_id`` forever, since
+        nothing else clears it. On the first run after re-enabling, the
+        circuit breaker's ``DescribeJob`` check would find that same dead job
+        Failed again, push ``bucket_consecutive_failures`` past the threshold
+        a second time, and immediately re-disable the bucket — before a new
+        job (for instance one benefiting from a fix deployed in between) ever
+        got a chance to be submitted. With the records cleared,
+        :meth:`get_submission_records` returns ``{}``, so the breaker seeds
+        its counter at 0 and proceeds to a normal submission attempt.
 
-        This is safe with respect to the checkpoint watermark: a bucket is
-        only ever disabled *before* any watermark advancement for the
-        failing job's range is persisted (the circuit breaker check runs
-        before lease acquisition/journal read/``release_lease``), so the
-        on-disk ``last_processed_watermark`` already precedes the failed
-        job's ``watermark_low`` — the same journal range will be re-read and
-        resubmitted on the next run after re-enabling, exactly as the
-        circuit breaker's own (in-memory) watermark rollback would have done
-        had the bucket not been disabled.
+        Safe with respect to the checkpoint watermark: a bucket is only ever
+        disabled *before* any watermark advancement for the failing job's
+        range is persisted, so the on-disk ``last_processed_watermark``
+        already precedes the failed job's ``watermark_low``. The same journal
+        range is re-read and resubmitted on the first run after re-enabling,
+        exactly as the breaker's own in-memory rollback would have done had
+        the bucket not been disabled.
 
-        Self-contained read-fresh-ETag-then-conditional-write, single
-        attempt: this method is called from the Lambda handler's disable
-        path, not from inside the orchestrator's own per-bucket ETag chain,
-        so it manages its own ETag rather than requiring the caller to
-        supply one. A best-effort caller (see ``lambda_handler``) should
-        catch and log :class:`ConditionalWriteError` rather than letting it
-        block the (more important) disable-flag write.
+        The submission-failure streak is deliberately **not** cleared. That
+        counter tracks a request the Solution builds which botocore rejects
+        outright, which is a code defect rather than a transient condition, so
+        re-enabling without deploying a fix should re-trip promptly rather
+        than start from zero.
+
+        Takes ``current_etag`` from the caller rather than re-reading its own,
+        because the circuit-breaker and submission-streak call sites both run
+        inside the orchestrator's per-bucket ETag chain — the streak path from
+        inside the lease scope. A self-managed ETag here would invalidate the
+        ``StateWriter``'s held one and make the ``release_lease`` in
+        ``_lease_scope``'s ``finally`` fail, stranding the lease in the state
+        object.
 
         Preserves every other top-level key (checkpoint, lease,
         ``completion_items``, ``completion_processed_job_ids``,
@@ -778,25 +875,29 @@ class StateStore:
         Args:
             s3_client:     A boto3 S3 client.
             state_bucket:  The scratch/state bucket name.
-            source_bucket: The Monitored_Bucket whose submission records to
-                            clear.
+            source_bucket: The Monitored_Bucket to disable.
+            reason:        Operator-facing explanation, persisted verbatim.
+            now:           Timestamp recorded as ``disabled_at``.
+            current_etag:  The ETag from the caller's most recent observation.
 
         Returns:
             The new ETag returned by S3.
 
         Raises:
-            ConditionalWriteError: When the state object was modified
-                between this method's own read and its write.
+            ConditionalWriteError: On ETag mismatch (concurrent modification),
+                in which case the bucket is **not** disabled and the caller
+                must not announce it as such.
             ClientError: For other S3 errors.
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
-        payload, current_etag = _read_state_payload(s3_client, state_bucket, key)
+        payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
-            state = _default_state(source_bucket)
-            payload = json.loads(serialize(state))
-            current_etag = None
+            payload = json.loads(serialize(_default_state(source_bucket)))
 
+        payload[_DISABLED_FIELD] = True
+        payload[_DISABLED_REASON_FIELD] = reason
+        payload[_DISABLED_AT_FIELD] = now.isoformat()
         payload["submission_records"] = {}
         # Remove the legacy singular field too, if present, so no dead job_id
         # survives under either schema form.
@@ -851,7 +952,7 @@ class StateStore:
 
         Requirements: 2.4
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             return False
@@ -898,7 +999,7 @@ class StateStore:
 
         Requirements: 2.1, 2.6, 3.1
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             return {}
@@ -949,7 +1050,7 @@ class StateStore:
 
         Requirements: 4.1, 4.4, 5.4
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             return {}
@@ -1037,7 +1138,7 @@ class StateStore:
 
         Requirements: 2.1, 2.4, 2.6
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
@@ -1134,7 +1235,7 @@ class StateStore:
         Merges into existing entries (does not overwrite previously stored
         entries for objects already in either map).
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             state = _default_state(source_bucket)
@@ -1217,7 +1318,7 @@ class StateStore:
 
         Requirements: 1.1, 1.4, 1.6
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
@@ -1318,7 +1419,7 @@ class StateStore:
                 f"max_attempts must be a positive integer, got {max_attempts!r}"
             )
 
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         last_error: ConditionalWriteError | None = None
         for _ in range(max_attempts):
@@ -1388,7 +1489,7 @@ class StateStore:
 
         Requirements: 8.5, 8.6
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             return set()
@@ -1463,7 +1564,7 @@ class StateStore:
 
         Requirements: 8.5
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, read_etag = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
@@ -1535,7 +1636,7 @@ class StateStore:
 
         Requirements: 8.6
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, read_etag = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
@@ -1634,7 +1735,7 @@ class StateStore:
 
         Requirements: 5.1, 5.2, 5.3, 3.3
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
@@ -1688,7 +1789,7 @@ class StateStore:
 
         Requirements: 5.1, 5.2, 5.3, 3.3
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
             return {}
@@ -1721,7 +1822,7 @@ class StateStore:
         Raises:
             ConditionalWriteError: On ETag mismatch (concurrent modification).
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
@@ -1763,7 +1864,7 @@ class StateStore:
         Raises:
             ConditionalWriteError: On ETag mismatch (concurrent modification).
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
@@ -1812,7 +1913,7 @@ class StateStore:
             A tuple of (alert_should_be_sent, etag). The ETag is *current_etag*
             unchanged when nothing was written.
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:
@@ -1869,7 +1970,7 @@ class StateStore:
         Raises:
             ConditionalWriteError: On ETag mismatch (concurrent modification).
         """
-        key = _state_key(source_bucket)
+        key = state_object_key(source_bucket)
 
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
         if payload is None:

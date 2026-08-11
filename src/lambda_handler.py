@@ -9,9 +9,9 @@ unhandled exception so Lambda surfaces it as an invocation failure.
 
 When the per-bucket circuit breaker trips after too many consecutive S3
 Batch Operations job failures, ``run_interval`` calls the
-``on_bucket_disable`` callback provided here.  The
-callback writes ``disabled=true``, ``disabled_reason``, and ``disabled_at``
-back to ``solution-config.json`` so the bucket is skipped on subsequent
+``on_bucket_disabled`` callback provided here.  By then the orchestrator has
+already written ``disabled=true``, ``disabled_reason``, and ``disabled_at``
+into that bucket's state object, so the bucket is skipped on subsequent
 intervals.  Other buckets in the same run are unaffected.
 
 A separate ``on_journal_unavailable`` callback fires on the first interval in
@@ -22,14 +22,14 @@ would replicate nothing and report nothing. The bucket is left enabled, since
 the remedy is enabling the journal rather than any change to the Solution's
 configuration.
 
-Self-service recovery: the callback also (a) clears the bucket's persisted
-``SubmissionRecord`` in the state store, so a stale/dead ``job_id`` cannot
-immediately re-trip the circuit breaker as soon as the bucket is
-re-enabled, and (b) publishes an alert (SNS email, when ``AlarmEmail`` is
+Self-service recovery: the same write that sets the flag also clears the
+bucket's persisted ``SubmissionRecord``, so a stale/dead ``job_id`` cannot
+immediately re-trip the circuit breaker as soon as the bucket is re-enabled.
+This callback then publishes an alert (SNS email, when ``AlarmEmail`` is
 configured, plus a CloudWatch Logs entry unconditionally) naming the exact
-recovery step: set ``disabled: false`` for this bucket in
-``solution-config.json`` on the State Bucket. No Lambda invocation or
-manual state-object edit is required to recover.
+recovery step: set ``disabled`` to ``false`` for this bucket in
+``state/<bucket>.json`` on the State Bucket. No Lambda invocation and no
+redeploy is required to recover.
 
 Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 8.1
 """
@@ -88,7 +88,6 @@ def _publish_bucket_disabled_alert(
     topic_arn: str | None,
     log_group_name: str,
     state_bucket: str,
-    config_key: str,
     bucket_name: str,
     reason: str,
     now: datetime,
@@ -100,21 +99,27 @@ def _publish_bucket_disabled_alert(
     (never silent, richer when ``AlarmEmail`` is configured) applies here.
 
     The message states the concrete, sufficient recovery step: set
-    ``disabled: false`` for this bucket's entry in the Solution_Config —
-    the disable callback has already cleared this bucket's submission
-    history, so no other action is needed.
+    ``disabled`` to ``false`` in the bucket's state object. The same write
+    that set the flag also cleared this bucket's submission history, so no
+    other action is needed, and no redeploy: a stack update does not touch
+    the state object.
+
+    Reached only after the flag has been persisted (see
+    ``orchestrator._disable_bucket``), so this never names a recovery step
+    for a bucket that is not actually disabled.
 
     Any exception raised by the log write or the SNS publish propagates to
-    the caller — the caller (the disable callback) is responsible for
-    isolating this failure so it never blocks the (more important)
-    disabled-flag write itself.
+    the caller, which is responsible for isolating it so a failed alert does
+    not look like a failed disable.
     """
     recovery = (
-        f'Set "disabled": false for bucket {bucket_name!r} in the '
-        f"Solution_Config at s3://{state_bucket}/{config_key} and "
-        f"wait for the next scheduled run. No other action is "
-        f"needed — this bucket's prior S3 Batch Operations job "
-        f"failure history has already been cleared."
+        f'Set "disabled": false for bucket {bucket_name!r} in '
+        f"s3://{state_bucket}/"
+        f"{state_store_module.state_object_key(bucket_name)} and wait for "
+        f"the next scheduled run. No other action is needed — this bucket's "
+        f"prior S3 Batch Operations job failure history has already been "
+        f"cleared — and no redeploy, since a stack update does not modify "
+        f"this object."
     )
     # The log entry stays structured JSON so it remains queryable in
     # CloudWatch Logs Insights; the email gets prose, because a JSON blob in
@@ -265,165 +270,6 @@ def _publish_journal_unavailable_alert(
         )
 
 
-def _disable_bucket_in_config(
-    s3_client,
-    state_bucket: str,
-    config_key: str,
-    bucket_name: str,
-    reason: str,
-    kms_key_arn: str | None = None,
-    sns_client=None,
-    logs_client=None,
-    batch_job_failure_topic_arn: str | None = None,
-    batch_job_failure_log_group: str = "",
-) -> None:
-    """Mark a bucket as disabled in solution-config.json on the State Bucket.
-
-    Reads the current config, finds the matching bucket entry, adds
-    ``disabled=true``, ``disabled_reason``, and ``disabled_at``, then writes
-    it back conditionally with ``If-Match`` against the ETag from the read.
-    Failures are logged but not re-raised — the caller continues
-    processing other buckets regardless.
-
-    When ``kms_key_arn`` is provided the write uses SSE-KMS with that key,
-    matching the encryption applied to state objects (consistency with
-    state_store.py).
-
-    Self-service recovery (see module docstring): after successfully
-    writing the disabled flag, this also (a) best-effort clears the
-    bucket's persisted ``SubmissionRecord`` via
-    ``StateStore.clear_submission_records`` so a stale ``job_id`` cannot
-    immediately re-trip the circuit breaker on re-enable, and (b)
-    best-effort publishes the recovery-instructions alert via
-    :func:`_publish_bucket_disabled_alert` when ``logs_client`` is
-    provided. Neither step blocks or is blocked by the other, and neither
-    failing prevents the disabled-flag write itself from having already
-    succeeded — both are isolated in their own try/except.
-    """
-    try:
-        resp = s3_client.get_object(Bucket=state_bucket, Key=config_key)
-        # Passed through exactly as S3 returned it (quotes included), matching
-        # state_store's conditional writes. A response without an ETag would
-        # leave no precondition to write under, so treat that as a failure
-        # rather than writing unconditionally.
-        config_etag = resp.get("ETag")
-        if not config_etag:
-            _logger.error(
-                "Could not disable bucket %r — the config read returned no ETag, "
-                "so the write cannot be made conditional. Bucket is NOT reported "
-                "as disabled. Reason for disable attempt: %s",
-                bucket_name,
-                reason,
-            )
-            return
-        config = json.loads(resp["Body"].read().decode("utf-8"))
-        patched = False
-        for entry in config.get("buckets", []):
-            if entry.get("name") == bucket_name:
-                entry["disabled"] = True
-                entry["disabled_reason"] = reason
-                entry["disabled_at"] = datetime.now(tz=UTC).isoformat()
-                patched = True
-                break
-        if not patched:
-            _logger.error(
-                "Could not find bucket %r in config to disable it", bucket_name
-            )
-            return
-        put_kwargs: dict = {
-            "Bucket": state_bucket,
-            "Key": config_key,
-            "Body": json.dumps(config, indent=2).encode("utf-8"),
-            "ContentType": "application/json",
-            "IfMatch": config_etag,
-        }
-        if kms_key_arn:
-            put_kwargs["ServerSideEncryption"] = "aws:kms"
-            put_kwargs["SSEKMSKeyId"] = kms_key_arn
-        s3_client.put_object(**put_kwargs)
-        observability.emit(observability.log_audit(
-            action="bucket_disabled",
-            source_bucket=bucket_name,
-            details={
-                "reason": reason,
-                "config_key": config_key,
-            },
-        ))
-        _logger.error(
-            "Bucket %r marked disabled in %s. "
-            "Re-enable after resolving: %s",
-            bucket_name,
-            config_key,
-            reason,
-        )
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "PreconditionFailed":
-            _logger.error(
-                "Could not disable bucket %r — config was modified concurrently. "
-                "Bucket is NOT reported as disabled. Reason for disable attempt: %s",
-                bucket_name,
-                reason,
-            )
-        else:
-            _logger.error(
-                "Failed to write disabled flag for bucket %r to %s: %s. "
-                "Manual update required.",
-                bucket_name,
-                config_key,
-                exc,
-            )
-        return
-    except Exception as exc:  # noqa: BLE001
-        _logger.error(
-            "Failed to write disabled flag for bucket %r to %s: %s. "
-            "Manual update required.",
-            bucket_name,
-            config_key,
-            exc,
-        )
-        return
-
-    # Self-service recovery, part 1: clear the stale SubmissionRecord so
-    # re-enabling this bucket doesn't immediately re-trip the circuit
-    # breaker on the same dead job_id. Best-effort — a failure here is
-    # logged but must not be treated as a failure of the disable itself
-    # (the disabled flag above has already been persisted).
-    try:
-        state_store_module.StateStore(kms_key_arn=kms_key_arn).clear_submission_records(
-            s3_client, state_bucket, bucket_name
-        )
-    except Exception as exc:  # noqa: BLE001
-        _logger.error(
-            "Failed to clear stale submission records for bucket %r: %s. "
-            "Re-enabling this bucket without resolving that first may "
-            "immediately re-trip the circuit breaker.",
-            bucket_name,
-            exc,
-        )
-
-    # Self-service recovery, part 2: publish the recovery-instructions
-    # alert. Best-effort and independent of part 1.
-    if logs_client is not None:
-        try:
-            _publish_bucket_disabled_alert(
-                sns_client,
-                logs_client,
-                batch_job_failure_topic_arn,
-                batch_job_failure_log_group,
-                state_bucket=state_bucket,
-                config_key=config_key,
-                bucket_name=bucket_name,
-                reason=reason,
-                now=datetime.now(tz=UTC),
-            )
-        except Exception as exc:  # noqa: BLE001
-            _logger.error(
-                "Failed to publish bucket-disabled alert for bucket %r: %s",
-                bucket_name,
-                exc,
-            )
-
-
 def _load_solution_config(s3_client, state_bucket: str, config_key: str) -> dict:
     """Download and parse the Solution_Config JSON object from S3.
 
@@ -553,10 +399,11 @@ def handler(event, context):
     environment, downloads and parses the Solution_Config, builds the
     Runtime_Config, and calls ``run_interval``.
 
-    Provides an ``on_bucket_disable`` callback so that if ``run_interval``
-    detects a permanent per-bucket failure (InlineHashCeiling exceeded), it
-    can mark that bucket as disabled in ``solution-config.json`` without
-    affecting the other buckets in the same run.
+    Provides an ``on_bucket_disabled`` callback so that when ``run_interval``
+    disables a bucket after a permanent per-bucket failure, the operator is
+    told which bucket and how to re-enable it. ``run_interval`` persists the
+    flag itself, to that bucket's state object, without affecting the other
+    buckets in the same run.
 
     Also provides an ``on_journal_unavailable`` callback, fired on the first
     interval a bucket's S3 Metadata journal is found to be absent, so an unmet
@@ -610,15 +457,22 @@ def handler(event, context):
     logs_client = boto3.client("logs") if batch_job_failure_log_group else None
     sns_client = boto3.client("sns") if batch_job_failure_topic_arn else None
 
-    runtime_config["on_bucket_disable"] = (
-        lambda bucket_name, reason: _disable_bucket_in_config(
-            s3_client, state_bucket, config_key, bucket_name, reason,
-            kms_key_arn=runtime_config.get("kms_key_arn"),
-            sns_client=sns_client,
-            logs_client=logs_client,
-            batch_job_failure_topic_arn=batch_job_failure_topic_arn,
-            batch_job_failure_log_group=batch_job_failure_log_group,
+    # Notification only. The orchestrator has already persisted the flag to
+    # the bucket's state object by the time this fires, through its own
+    # conditional-write ETag chain, so there is nothing to write here.
+    runtime_config["on_bucket_disabled"] = (
+        lambda bucket_name, reason: _publish_bucket_disabled_alert(
+            sns_client,
+            logs_client,
+            batch_job_failure_topic_arn,
+            batch_job_failure_log_group,
+            state_bucket=state_bucket,
+            bucket_name=bucket_name,
+            reason=reason,
+            now=datetime.now(tz=UTC),
         )
+        if logs_client is not None
+        else None
     )
 
     runtime_config["on_submission_failure"] = (
@@ -672,8 +526,8 @@ def handler(event, context):
     # Capped_Run) AND (b) `progressed` — submitted its
     # Batch_Replication_Job and advanced its checkpoint. A disabled or
     # circuit-broken bucket is skipped by `run_interval`'s per-bucket loop
-    # before `_process_bucket` runs at all (disabled buckets: skipped in
-    # the `bucket.disabled` check; circuit-broken buckets: the circuit
+    # before `_process_bucket` runs at all (disabled buckets: skipped by
+    # the state-object disable check; circuit-broken buckets: the circuit
     # breaker's own disable path returns early with `progressed` left
     # `False`) — so such a bucket can never contribute `capped=True,
     # progressed=True` to the aggregate. `any_capped_and_progressed` being

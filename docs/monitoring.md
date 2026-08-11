@@ -36,7 +36,7 @@ Every `audit` log entry carries an `action` naming what happened, a `source_buck
 | `journal_read_capped` | A run hits `JournalReadRowCap` and bounds itself | `row_cap`, `until_timestamp`, `since_timestamp` |
 | `row_cap_overshoot` | A capped run read past the cap because many operations shared the boundary timestamp | `row_cap`, `rows_read`, `matched`, `overshoot_rows` |
 | `batch_job_failure_readmit` | A failed job's operations are readmitted for reprocessing | `job_id`, `config_id`, `watermark_low`, `watermark_high` |
-| `bucket_disabled` | A bucket's `disabled` flag is set after repeated failures | `reason`, `config_key` |
+| `bucket_disabled` | A bucket's `disabled` flag is set after repeated failures | `reason`, `state_key` |
 | `journal_unavailable` | A bucket's journal read fails because the journal table or namespace does not exist | `cause` |
 | `completion_report_published` | An SNS completion report publishes successfully | `item_count` |
 | `completion_item_expired` | A tracked object passed `CompletionItemTtlHours` and was abandoned | `job_ids`, `age_seconds`, `ttl_seconds` |
@@ -61,12 +61,12 @@ Set `MetricsNamespace` to publish these after each run. The namespace is the nam
 | Observation | Meaning |
 |---|---|
 | No activity metrics, `BucketErrors` present | Bucket was processed and had nothing to do |
-| `BucketErrors` present and 1 | Bucket was processed and errored |
+| `BucketErrors` present and 1 | Bucket errored, either during processing or before it started because its state object could not be read |
 | No `BucketErrors` for a bucket | Bucket is disabled, absent from `SourceBucketNames`, or the run never reached it |
 
 Alarm on the last row with `treatMissingData: breaching` to catch a bucket that silently stopped being processed. Alarm on `ArchivedObjectsExcluded` with `treatMissingData: notBreaching`, since it is published only when at least one object was excluded.
 
-For the auto-disable case, alarm on `DisabledBuckets >= 1` instead. It is a plain threshold on a metric published every run, so it does not depend on missing-data handling, and unlike the disable notification email it reports the condition for as long as it persists rather than once when it happens. It is run-level, so it tells you how many buckets are disabled. Which ones is in the notification email, the per-run `error` log entry, and the `disabled` flags in `solution-config.json`.
+For the auto-disable case, alarm on `DisabledBuckets >= 1` instead. It is a plain threshold on a metric published every run, so it does not depend on missing-data handling, and unlike the disable notification email it reports the condition for as long as it persists rather than once when it happens. It is run-level, so it tells you how many buckets are disabled. Which ones is in the notification email, the per-run `error` log entry, and the `disabled` flag in each bucket's state object at `s3://<state-bucket>/state/<bucket-name>.json`.
 
 ## Diagnosing task failures
 

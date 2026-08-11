@@ -154,7 +154,7 @@ Parameters:
 
   JournalLookbackSeconds:
     Type: Number
-    Default: 3600
+    Default: 7200
     MinValue: 0
     Description: Seconds to re-scan the journal watermark (see deploy/README.md).
 
@@ -1149,9 +1149,15 @@ Resources:
                 Action:
                   - s3:PutObject
                   - s3:DeleteObject
-                Resource:
-                  - !Sub "${StateBucket.Arn}/config/solution-config.json"
-                  - !Sub "${StateBucket.Arn}/state/*"
+                Resource: !Sub "${StateBucket.Arn}/config/solution-config.json"
+              # Seeding a starting checkpoint needs PutObject only. DeleteObject
+              # is deliberately not granted here: the handler never deletes a
+              # state object, and deleting one rewinds that bucket to the start
+              # of the journal, so the deploy-time role must not be able to.
+              - Sid: SeedCheckpointObjects
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${StateBucket.Arn}/state/*"
               - Sid: ConfigResourceLogs
                 Effect: Allow
                 Action:
@@ -1304,11 +1310,28 @@ Resources:
       Region: !Ref AWS::Region
       CheckFrequencyMinutes: !Ref CheckFrequencyMinutes
       KmsKeyArn: !If [HasKmsKey, !Ref KmsKeyArn, ""]
-      # CodeHash forces re-invocation when the Lambda code changes (the
-      # handler's response attributes may have changed). Without it, an
-      # UPDATE that passes only UsePreviousValue parameters never re-invokes
-      # the custom resource even though its Lambda code was replaced.
-      CodeHash: "2"
+      # Forces re-invocation when the release changes. CloudFormation sends
+      # this custom resource an Update only when one of its own properties
+      # changes, so without this an update that replaced the handler's inline
+      # code would leave it uninvoked: the response attributes this template
+      # consumes (CheckFrequencySeconds, below) would keep their previous
+      # values, and the config object would keep its previous shape.
+      #
+      # Bound to CodeLocation rather than a hand-bumped literal because a
+      # literal only works if whoever edits the handler remembers to bump it,
+      # and it has already been missed once. CodeLocation must change for every
+      # release anyway (build-package.sh content-hashes the key, and an
+      # unchanged value leaves the Lambda running the old code — see
+      # "Upgrading" in README.md), so this fires on exactly the deploys where
+      # the handler could have changed, and stays quiet on a parameter-only
+      # update such as LambdaMemoryMB where nothing here depends on the change.
+      #
+      # Re-invocation is side-effect-safe: the handler rewrites the config
+      # object from these properties, and seeds a state object only for a
+      # bucket that has none (If-None-Match: *). It does not write the
+      # per-bucket disabled flag, which lives in the state object, so a
+      # re-invocation cannot clear a circuit-breaker disable.
+      CodeHash: !Ref CodeLocation
 
   # Parses s3://bucket/key CodeLocation (robust for keys with prefixes,
   # which intrinsics can't extract) and checks the referenced zip has this

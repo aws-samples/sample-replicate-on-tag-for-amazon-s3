@@ -14,6 +14,7 @@ Requirements: submission-failure-visibility 1.1, 2.1-2.4, 3.1-3.4, 4.1-4.5, 5.1-
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ from src.core.models import (
     SubmissionStatus,
 )
 from src.orchestrator import run_interval
+from tests.support import mock_state_store
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -104,7 +106,7 @@ def _mock_infra(submission_result: SubmissionResult):
 
     # State store
     from src.core.models import CheckpointState
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store.get_checkpoint.return_value = (
         CheckpointState(source_bucket=_SRC_BUCKET, last_processed_watermark="2026-01-01T00:00:00.000000Z"),
         '"etag1"',
@@ -161,8 +163,6 @@ def _run(submission_result: SubmissionResult, **runtime_overrides):
         outcome = run_interval(_CONFIG, rc)
     return outcome, mock_store
 
-
-import contextlib
 
 
 # ===========================================================================
@@ -482,7 +482,7 @@ class TestTask6DisableAtThreshold:
     """Requirements 4.1, 4.2, 4.5: disable when streak reaches threshold."""
 
     def test_permanent_at_threshold_disables(self):
-        """When streak reaches max_batch_job_failures, on_bucket_disable is called."""
+        """When streak reaches max_batch_job_failures, on_bucket_disabled is called."""
         sub = SubmissionResult(
             status=SubmissionStatus.CREATE_FAILED,
             config_id="rule-1",
@@ -495,7 +495,7 @@ class TestTask6DisableAtThreshold:
         mock_store.increment_submission_failure_streak.return_value = (4, '"etag5"')
         rc = _make_runtime_config(
             max_batch_job_failures=4,
-            on_bucket_disable=lambda b, r: disable_calls.append((b, r)),
+            on_bucket_disabled=lambda b, r: disable_calls.append((b, r)),
         )
         with contextlib.ExitStack() as stack:
             for p in patches:
@@ -510,7 +510,7 @@ class TestTask6DisableAtThreshold:
         assert "code fix" in reason
 
     def test_service_side_never_disables(self):
-        """A SERVICE failure never triggers on_bucket_disable (Req 4.4)."""
+        """A SERVICE failure never triggers on_bucket_disabled (Req 4.4)."""
         sub = SubmissionResult(
             status=SubmissionStatus.CREATE_FAILED,
             config_id="rule-1",
@@ -522,7 +522,7 @@ class TestTask6DisableAtThreshold:
         patches, mock_store = _mock_infra(sub)
         rc = _make_runtime_config(
             max_batch_job_failures=1,
-            on_bucket_disable=lambda b, r: disable_calls.append((b, r)),
+            on_bucket_disabled=lambda b, r: disable_calls.append((b, r)),
         )
         with contextlib.ExitStack() as stack:
             for p in patches:
@@ -545,7 +545,7 @@ class TestTask6DisableAtThreshold:
         mock_store.increment_submission_failure_streak.return_value = (3, '"etag5"')
         rc = _make_runtime_config(
             max_batch_job_failures=4,
-            on_bucket_disable=lambda b, r: disable_calls.append((b, r)),
+            on_bucket_disabled=lambda b, r: disable_calls.append((b, r)),
         )
         with contextlib.ExitStack() as stack:
             for p in patches:

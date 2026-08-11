@@ -225,13 +225,7 @@ def load_config(source: Any) -> AppConfig:
             )
         seen_pairs.add(pair)
 
-        buckets.append(MonitoredBucket(
-            name=name,
-            region=region,
-            disabled=bool(raw.get("disabled", False)),
-            disabled_reason=str(raw.get("disabled_reason", "")),
-            disabled_at=str(raw.get("disabled_at", "")),
-        ))
+        buckets.append(MonitoredBucket(name=name, region=region))
 
     # -- 5. Success (Requirement 2.7) -----------------------------------------
     return AppConfig(buckets=buckets)

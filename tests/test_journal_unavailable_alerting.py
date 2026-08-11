@@ -33,6 +33,7 @@ from src.core.checkpoint_serializer import serialize
 from src.core.models import CheckpointState
 from src.lambda_handler import _publish_journal_unavailable_alert
 from src.orchestrator import JOURNAL_UNAVAILABLE_REALERT_INTERVAL, run_interval
+from tests.support import mock_state_store
 
 _ACCOUNT = "123456789012"
 _STATE_BUCKET = "state-bucket"
@@ -285,7 +286,7 @@ def _run_with_journal_errors(
     journal_errors: list[JournalReadError],
     claim_result: tuple[bool, str] = (True, _NEW_ETAG),
     on_journal_unavailable=None,
-    on_bucket_disable=None,
+    on_bucket_disabled=None,
 ):
     """Drive run_interval to the journal read and stop there.
 
@@ -304,7 +305,7 @@ def _run_with_journal_errors(
         destination=DestinationRef(bucket_arn="arn:aws:s3:::dest"),
     )
 
-    mock_store = MagicMock()
+    mock_store = mock_state_store()
     mock_store.get_checkpoint.return_value = (
         CheckpointState(
             source_bucket=_SRC_BUCKET,
@@ -325,8 +326,8 @@ def _run_with_journal_errors(
     }
     if on_journal_unavailable is not None:
         runtime_config["on_journal_unavailable"] = on_journal_unavailable
-    if on_bucket_disable is not None:
-        runtime_config["on_bucket_disable"] = on_bucket_disable
+    if on_bucket_disabled is not None:
+        runtime_config["on_bucket_disabled"] = on_bucket_disabled
 
     emitted: list = []
     with patch("src.orchestrator.ClientFactory", return_value=MagicMock()), \
@@ -423,7 +424,7 @@ class TestJournalUnavailableEscalation:
         _run_with_journal_errors(
             [_unavailable_error()],
             on_journal_unavailable=lambda b, c: None,
-            on_bucket_disable=lambda b, r: disabled.append(b),
+            on_bucket_disabled=lambda b, r: disabled.append(b),
         )
         assert disabled == []
 
@@ -440,7 +441,7 @@ class TestJournalUnavailableEscalation:
     def test_alert_still_sent_when_the_claim_write_fails(self):
         """Losing the notification is worse than sending a duplicate."""
         alerts: list = []
-        mock_store = MagicMock()
+        mock_store = mock_state_store()
         mock_store.get_checkpoint.return_value = (
             CheckpointState(
                 source_bucket=_SRC_BUCKET,

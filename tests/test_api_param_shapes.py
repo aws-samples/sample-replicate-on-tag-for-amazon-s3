@@ -410,39 +410,43 @@ class TestReinvocationInvoke:
 
 
 # ---------------------------------------------------------------------------
-# The remaining call sites: the config write (its own KMS branch, separate from
-# the state-object write), the two other Athena readers, and DescribeJob.
+# The remaining call sites: the disable write, the two other Athena readers,
+# and DescribeJob.
 # ---------------------------------------------------------------------------
 
 
-class TestConfigWriteAndRemainingReaders:
+class TestDisableWriteAndRemainingReaders:
     @pytest.mark.parametrize("kms_key_arn", [None, _KMS_ARN], ids=["no-kms", "kms"])
-    def test_circuit_breaker_config_write_is_valid(self, kms_key_arn):
-        """``_disable_bucket_in_config`` writes solution-config.json with its
-        own If-Match plus optional SSE-KMS kwargs, built independently of
-        ``state_store``'s write path."""
-        from src.lambda_handler import _disable_bucket_in_config
+    def test_circuit_breaker_disable_write_is_valid(self, kms_key_arn):
+        """``StateStore.disable_bucket`` writes the bucket's state object with
+        the caller-supplied If-Match plus optional SSE-KMS kwargs."""
+        from src.adapters.state_store import StateStore
 
-        config_bytes = json.dumps(
-            {"buckets": [{"name": _SRC_BUCKET, "region": "us-west-2"}]}
+        state_bytes = json.dumps(
+            {
+                "source_bucket": _SRC_BUCKET,
+                "last_processed_watermark": "",
+                "lease": None,
+                "processed_window": [],
+            }
         ).encode("utf-8")
         client = MagicMock()
         client.get_object.side_effect = lambda **kw: {
-            "Body": io.BytesIO(config_bytes),
+            "Body": io.BytesIO(state_bytes),
             "ETag": _ETAG,
         }
         client.put_object.return_value = {"ETag": _ETAG}
 
-        _disable_bucket_in_config(
+        StateStore(kms_key_arn=kms_key_arn).disable_bucket(
             client,
             _STATE_BUCKET,
-            "config/solution-config.json",
             _SRC_BUCKET,
-            "circuit breaker",
-            kms_key_arn,
+            reason="circuit breaker",
+            now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            current_etag=_ETAG,
         )
         ops = assert_calls_match_api(client, "s3")
-        assert "PutObject" in ops, "the config write must be reached"
+        assert "PutObject" in ops, "the disable write must be reached"
 
     def test_preflight_count_calls_are_valid(self):
         from src.adapters.preflight_counter import preflight_count

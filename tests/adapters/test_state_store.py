@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
@@ -18,7 +18,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from src.adapters.state_store import ConditionalWriteError, StateStore
-from src.core.checkpoint_serializer import serialize
+from src.core.checkpoint_serializer import deserialize, serialize
 from src.core.completion_serializer import item_key as _item_key_fn
 from src.core.completion_serializer import serialize_completion_items
 from src.core.models import (
@@ -522,14 +522,26 @@ class TestRecordSubmission:
 
 
 # ---------------------------------------------------------------------------
-# clear_submission_records — self-healing bucket re-enable
+# disable_bucket / get_disable_state — the per-bucket disable flag
+#
+# The flag lives in the state object rather than in solution-config.json, so
+# that the config custom resource — which rewrites that object wholesale from
+# template parameters on every stack create/update — cannot silently re-enable
+# a bucket the circuit breaker disabled.
 # ---------------------------------------------------------------------------
 
 
-class TestClearSubmissionRecords:
+def _disabled_payload(reason: str = "circuit breaker tripped") -> dict:
+    payload = json.loads(serialize(_make_state()))
+    payload["disabled"] = True
+    payload["disabled_reason"] = reason
+    payload["disabled_at"] = _NOW.isoformat()
+    return payload
+
+
+class TestDisableBucket:
     def _submission_body(self, key: str = _SRC_BUCKET) -> dict:
-        state = _make_state()
-        payload = json.loads(serialize(state))
+        payload = json.loads(serialize(_make_state()))
         payload["submission_records"] = {
             key: {
                 "replication_config_id": key,
@@ -553,89 +565,162 @@ class TestClearSubmissionRecords:
         client.put_object.return_value = {"ETag": _NEW_ETAG}
         return client
 
-    def test_clears_submission_records_to_empty_dict(self):
-        """The stale record (any dead job_id) is removed entirely — the next
-        get_submission_records call sees a clean history, so the circuit
-        breaker's DescribeJob check has nothing left to re-fail against."""
-        payload = self._submission_body()
-        client = self._mock_s3_get_raw(payload)
-        store = StateStore()
-        store.clear_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-        kwargs = client.put_object.call_args[1]
-        body = json.loads(kwargs["Body"])
-        assert body["submission_records"] == {}
+    def _disable(self, client, current_etag=_ETAG, reason="circuit breaker tripped"):
+        return StateStore().disable_bucket(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            reason=reason, now=_NOW, current_etag=current_etag,
+        )
+
+    def _written(self, client) -> dict:
+        return json.loads(client.put_object.call_args[1]["Body"])
+
+    def test_writes_the_three_disable_keys(self):
+        client = self._mock_s3_get_raw(self._submission_body())
+        self._disable(client, reason="ceiling exceeded")
+        body = self._written(client)
+        assert body["disabled"] is True
+        assert body["disabled_reason"] == "ceiling exceeded"
+        assert body["disabled_at"] == _NOW.isoformat()
+
+    def test_clears_submission_records_in_the_same_write(self):
+        """One write does both, so the bucket can never be left disabled with a
+        stale SubmissionRecord still pointing at the dead job that tripped the
+        breaker — which would re-trip it on the first run after re-enabling."""
+        client = self._mock_s3_get_raw(self._submission_body())
+        self._disable(client)
+        client.put_object.assert_called_once()
+        assert self._written(client)["submission_records"] == {}
 
     def test_clears_legacy_singular_submission_record_field_too(self):
-        """A pre-dict-form legacy `submission_record` field is also dropped,
-        so neither schema form can carry forward a dead job_id."""
         payload = self._submission_body()
         payload["submission_record"] = payload["submission_records"][_SRC_BUCKET]
         client = self._mock_s3_get_raw(payload)
-        store = StateStore()
-        store.clear_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-        kwargs = client.put_object.call_args[1]
-        body = json.loads(kwargs["Body"])
-        assert "submission_record" not in body
-
-    def test_preserves_checkpoint_and_other_sibling_keys(self):
-        """Only submission_records is touched — checkpoint, lease, and other
-        top-level keys survive untouched."""
-        payload = self._submission_body()
-        payload["completion_processed_job_ids"] = ["job-1", "job-2"]
-        client = self._mock_s3_get_raw(payload)
-        store = StateStore()
-        store.clear_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-        kwargs = client.put_object.call_args[1]
-        body = json.loads(kwargs["Body"])
-        assert body["source_bucket"] == _SRC_BUCKET
-        assert body["last_processed_watermark"] == _WM_050
-        assert body["completion_processed_job_ids"] == ["job-1", "job-2"]
-
-    def test_uses_conditional_write_with_observed_etag(self):
-        payload = self._submission_body()
-        client = self._mock_s3_get_raw(payload, etag=_ETAG)
-        store = StateStore()
-        store.clear_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-        kwargs = client.put_object.call_args[1]
-        assert kwargs.get("IfMatch") == _ETAG
-
-    def test_stale_etag_at_write_time_raises_conditional_write_error(self):
-        payload = self._submission_body()
-        client = self._mock_s3_get_raw(payload)
-        client.put_object.side_effect = _client_error("PreconditionFailed")
-        store = StateStore()
-        with pytest.raises(ConditionalWriteError):
-            store.clear_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-
-    def test_missing_state_object_is_a_no_op_create(self):
-        """No prior state object (edge case — bucket disabled before its
-        first-ever checkpoint write) still succeeds via create-only write."""
-        client = MagicMock()
-        client.get_object.side_effect = _client_error("NoSuchKey")
-        client.put_object.return_value = {"ETag": _NEW_ETAG}
-        store = StateStore()
-        new_etag = store.clear_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert new_etag == _NEW_ETAG
-        kwargs = client.put_object.call_args[1]
-        assert kwargs.get("IfNoneMatch") == "*"
-        body = json.loads(kwargs["Body"])
-        assert body["submission_records"] == {}
+        self._disable(client)
+        assert "submission_record" not in self._written(client)
 
     def test_clears_legacy_config_id_keyed_records_too(self):
-        """A pre-migration state object with multiple legacy config_id-keyed
-        entries (not the bucket-name sentinel) is also fully cleared —
-        clear_submission_records does not selectively drop only the
-        sentinel key."""
+        """A pre-migration object with legacy config_id-keyed entries (not the
+        bucket-name sentinel) is fully cleared, not selectively drained."""
         payload = self._submission_body(key="legacy-cfg-1")
         payload["submission_records"]["legacy-cfg-2"] = dict(
             payload["submission_records"]["legacy-cfg-1"]
         )
         client = self._mock_s3_get_raw(payload)
-        store = StateStore()
-        store.clear_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
+        self._disable(client)
+        assert self._written(client)["submission_records"] == {}
+
+    def test_preserves_checkpoint_and_other_sibling_keys(self):
+        payload = self._submission_body()
+        payload["completion_processed_job_ids"] = ["job-1", "job-2"]
+        client = self._mock_s3_get_raw(payload)
+        self._disable(client)
+        body = self._written(client)
+        assert body["source_bucket"] == _SRC_BUCKET
+        assert body["last_processed_watermark"] == _WM_050
+        assert body["completion_processed_job_ids"] == ["job-1", "job-2"]
+
+    def test_does_not_clear_the_submission_failure_streak(self):
+        """The streak counts requests botocore rejects outright, which is a code
+        defect rather than a transient condition, so re-enabling without a fix
+        deployed should re-trip promptly instead of starting from zero."""
+        payload = self._submission_body()
+        payload["submission_failure_streaks"] = {_SRC_BUCKET: 4}
+        client = self._mock_s3_get_raw(payload)
+        self._disable(client)
+        assert self._written(client)["submission_failure_streaks"] == {_SRC_BUCKET: 4}
+
+    def test_uses_the_caller_supplied_etag_not_its_own_read(self):
+        """The write is guarded by the ETag the orchestrator's StateWriter holds,
+        not by the one this method's own read returned. Both call sites run
+        inside that ETag chain — the submission-streak one from inside the lease
+        scope — so a self-managed ETag would invalidate the writer's and make
+        the release_lease in _lease_scope's finally strand the lease."""
+        client = self._mock_s3_get_raw(self._submission_body(), etag='"fresh-read"')
+        self._disable(client, current_etag='"held-by-writer"')
+        assert client.put_object.call_args[1]["IfMatch"] == '"held-by-writer"'
+
+    def test_returns_the_new_etag_so_the_chain_continues(self):
+        client = self._mock_s3_get_raw(self._submission_body())
+        assert self._disable(client) == _NEW_ETAG
+
+    def test_stale_etag_at_write_time_raises_conditional_write_error(self):
+        """The caller must be able to tell that the bucket was NOT disabled, so
+        it does not announce a disable that never landed."""
+        client = self._mock_s3_get_raw(self._submission_body())
+        client.put_object.side_effect = _client_error("PreconditionFailed")
+        with pytest.raises(ConditionalWriteError):
+            self._disable(client)
+
+    def test_missing_state_object_is_a_create(self):
+        """Edge case: the bucket is disabled before its first-ever checkpoint
+        write. A create-only write still records the flag."""
+        client = MagicMock()
+        client.get_object.side_effect = _client_error("NoSuchKey")
+        client.put_object.return_value = {"ETag": _NEW_ETAG}
+        assert self._disable(client, current_etag=None) == _NEW_ETAG
         kwargs = client.put_object.call_args[1]
+        assert kwargs.get("IfNoneMatch") == "*"
         body = json.loads(kwargs["Body"])
+        assert body["disabled"] is True
         assert body["submission_records"] == {}
+
+    def test_survives_a_subsequent_put_checkpoint(self):
+        """put_checkpoint overlays only the CheckpointState keys, so the flag
+        written here is preserved by the end-of-interval release_lease. Were it
+        a CheckpointState field instead, advance_checkpoint would rebuild it
+        from an explicit field list and reset it every interval."""
+        client = self._mock_s3_get_raw(_disabled_payload())
+        StateStore().put_checkpoint(client, _STATE_BUCKET, _make_state(), _ETAG)
+        body = json.loads(client.put_object.call_args[1]["Body"])
+        assert body["disabled"] is True
+        assert body["disabled_reason"] == "circuit breaker tripped"
+
+
+class TestGetDisableState:
+    def _client(self, payload: dict | None) -> MagicMock:
+        client = MagicMock()
+        if payload is None:
+            client.get_object.side_effect = _client_error("NoSuchKey")
+        else:
+            body = MagicMock()
+            body.read.return_value = json.dumps(payload).encode("utf-8")
+            client.get_object.return_value = {"Body": body, "ETag": _ETAG}
+        return client
+
+    def _read(self, payload: dict | None):
+        return StateStore().get_disable_state(
+            self._client(payload), _STATE_BUCKET, _SRC_BUCKET
+        )
+
+    def test_reads_the_flag_and_its_reason(self):
+        state = self._read(_disabled_payload(reason="ceiling exceeded"))
+        assert state.disabled is True
+        assert state.reason == "ceiling exceeded"
+        assert state.at == _NOW.isoformat()
+
+    def test_absent_state_object_is_enabled(self):
+        assert self._read(None).disabled is False
+
+    def test_absent_key_is_enabled(self):
+        assert self._read(json.loads(serialize(_make_state()))).disabled is False
+
+    def test_explicit_false_is_enabled(self):
+        """The documented recovery step is setting "disabled": false, so that
+        has to read back as enabled just as removing the key does."""
+        payload = _disabled_payload()
+        payload["disabled"] = False
+        assert self._read(payload).disabled is False
+
+    def test_readable_when_the_checkpoint_itself_does_not_parse(self):
+        """The read deliberately bypasses deserialize(). A disabled bucket must
+        not read back as enabled because its watermark was corrupted or
+        hand-edited — that would resume billable job submission for exactly the
+        bucket the breaker stopped."""
+        payload = _disabled_payload()
+        payload["last_processed_watermark"] = "9999-12-31T23:59:59.000000Z"
+        with pytest.raises(ValueError):
+            deserialize(json.dumps(payload))
+        assert self._read(payload).disabled is True
 
 
 # ---------------------------------------------------------------------------
@@ -2709,3 +2794,86 @@ class TestStateWriterMarkReportDiagnosed:
         writer = StateWriter(store, client, _STATE_BUCKET, _SRC_BUCKET, _ETAG)
 
         writer.mark_report_diagnosed(_SRC_BUCKET)
+
+
+# ---------------------------------------------------------------------------
+# get_checkpoint — a discarded lease is reported, never silent
+# ---------------------------------------------------------------------------
+
+
+class TestLeaseDiscardedAudit:
+    """Dropping an untrustworthy lease unblocks the bucket, but it is state
+    being discarded, so it must be visible to an operator."""
+
+    def _poisoned_payload(self, candidate_max="9999-12-31T23:59:59.000000Z"):
+        return {
+            "source_bucket": _SRC_BUCKET,
+            "last_processed_watermark": _WM_050,
+            "lease": {
+                "lease_id": "lease-1",
+                "candidate_max_watermark": candidate_max,
+                "acquired_at": _NOW.isoformat(),
+                "status": "IN_FLIGHT",
+            },
+        }
+
+    def test_discarded_lease_emits_audit(self):
+        client = _mock_s3_get_raw_payload(self._poisoned_payload())
+        store = StateStore()
+        with patch("src.adapters.state_store.observability.emit") as emit:
+            state, _ = store.get_checkpoint(client, _STATE_BUCKET, _SRC_BUCKET)
+        assert state.lease is None
+        actions = [
+            call[0][0].get("action")
+            for call in emit.call_args_list
+            if call[0] and isinstance(call[0][0], dict)
+        ]
+        assert "lease_discarded" in actions
+
+    def test_audit_names_the_bucket(self):
+        client = _mock_s3_get_raw_payload(self._poisoned_payload())
+        store = StateStore()
+        with patch("src.adapters.state_store.observability.emit") as emit:
+            store.get_checkpoint(client, _STATE_BUCKET, _SRC_BUCKET)
+        entries = [
+            call[0][0]
+            for call in emit.call_args_list
+            if call[0]
+            and isinstance(call[0][0], dict)
+            and call[0][0].get("action") == "lease_discarded"
+        ]
+        assert entries, "expected a lease_discarded entry"
+        assert entries[0]["source_bucket"] == _SRC_BUCKET
+
+    def test_no_audit_when_lease_is_legitimately_absent(self):
+        """An absent lease is the normal state and must not be reported as a
+        discard, or every idle run would emit one."""
+        payload = {
+            "source_bucket": _SRC_BUCKET,
+            "last_processed_watermark": _WM_050,
+            "lease": None,
+        }
+        client = _mock_s3_get_raw_payload(payload)
+        store = StateStore()
+        with patch("src.adapters.state_store.observability.emit") as emit:
+            state, _ = store.get_checkpoint(client, _STATE_BUCKET, _SRC_BUCKET)
+        assert state.lease is None
+        actions = [
+            call[0][0].get("action")
+            for call in emit.call_args_list
+            if call[0] and isinstance(call[0][0], dict)
+        ]
+        assert "lease_discarded" not in actions
+
+    def test_no_audit_when_lease_is_valid(self):
+        client = _mock_s3_get_raw_payload(self._poisoned_payload(_WM_099))
+        store = StateStore()
+        with patch("src.adapters.state_store.observability.emit") as emit:
+            state, _ = store.get_checkpoint(client, _STATE_BUCKET, _SRC_BUCKET)
+        assert state.lease is not None
+        actions = [
+            call[0][0].get("action")
+            for call in emit.call_args_list
+            if call[0] and isinstance(call[0][0], dict)
+        ]
+        assert "lease_discarded" not in actions

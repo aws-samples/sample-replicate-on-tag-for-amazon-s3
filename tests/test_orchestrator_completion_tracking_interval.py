@@ -32,6 +32,7 @@ from src.core.models import (
     TrackedObject,
 )
 from src.orchestrator import _run_completion_tracking_interval
+from tests.support import mock_state_store
 
 _NOW = datetime.now(tz=timezone.utc)
 _STATE_BUCKET = "scratch-state-bucket"
@@ -86,7 +87,7 @@ def _make_store(
     all_items_by_bucket: dict[str, dict[str, TrackedObject]] | None = None,
     scan_state_by_bucket: dict[str, dict[str, ScanState]] | None = None,
 ) -> MagicMock:
-    store = MagicMock()
+    store = mock_state_store()
 
     def _get_eligible(_s3_client, _state_bucket, source_bucket):
         return (eligible_items_by_bucket or {}).get(source_bucket, {})
@@ -1227,7 +1228,7 @@ class TestCallOrdering:
         mock_factory_cls.return_value = mock_factory
 
         mock_store_cls = MagicMock()
-        mock_store = MagicMock()
+        mock_store = mock_state_store()
         mock_store_cls.return_value = mock_store
 
         def _checkpoint(source_bucket, watermark=""):

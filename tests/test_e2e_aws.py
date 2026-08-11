@@ -86,7 +86,7 @@ from src.core.archived_filter import (
 from src.core.delete_filter import filter_deleted_versions
 from src.core.models import MatchedObject
 from src.adapters.permanent_delete_reader import read_permanent_deletes
-from src.orchestrator import _completion_report_prefix
+from src.orchestrator import DEFAULT_JOURNAL_LOOKBACK, _completion_report_prefix
 
 # ---------------------------------------------------------------------------
 # Test resource config
@@ -171,8 +171,10 @@ KMS_KEY_ARN = os.getenv("S3ROT_TEST_KMS_KEY_ARN") or None
 JOURNAL_TABLE_SQL = f'"s3tablescatalog/aws-s3"."b_{SOURCE_BUCKET.replace(".", "_")}"."journal"'
 
 # Lookback window for re-scanning the journal below the record_timestamp
-# watermark (matches the orchestrator default).
-LOOKBACK = timedelta(hours=1)
+# watermark. Bound to the orchestrator's own default rather than restating it,
+# so changing that default cannot leave this harness exercising a window the
+# Solution no longer uses.
+LOOKBACK = DEFAULT_JOURNAL_LOOKBACK
 
 
 # ---------------------------------------------------------------------------

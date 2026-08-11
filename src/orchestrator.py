@@ -15,12 +15,21 @@ The orchestrator owns no business logic itself; it delegates to:
   - core.observability      (Observability / Logger)
   - adapters.*              (thin AWS I/O shells)
 
-When InlineHashCeiling is exceeded for a bucket, the orchestrator calls
-``runtime_config['on_bucket_disable'](bucket_name, reason)`` if provided,
-then skips that bucket and continues processing the remaining buckets.
-The lambda handler supplies this callback and uses it to write the
-``disabled``/``disabled_reason``/``disabled_at`` fields back to
-``solution-config.json``.
+When a bucket must be disabled, the orchestrator writes the ``disabled``,
+``disabled_reason``, and ``disabled_at`` keys into that bucket's own state
+object (``state/<bucket>.json``) through the same conditional-write ETag chain
+as every other per-bucket write, then calls
+``runtime_config['on_bucket_disabled'](bucket_name, reason)`` if provided so
+the lambda handler can publish the recovery-instructions alert. The callback is
+notification only: it fires after the flag is persisted and never when the
+write failed, so an alert cannot tell an operator to re-enable a bucket that
+was never disabled. The bucket is then skipped and the remaining buckets
+continue.
+
+The flag lives in the state object rather than in ``solution-config.json``
+because the config custom resource rewrites that object wholesale from
+template parameters on every stack create/update, which would clear a disable
+on an unrelated deploy. See ``src.core.models.BucketDisableState``.
 
 When a bucket's S3 Metadata journal cannot be found at all, the orchestrator
 calls ``runtime_config['on_journal_unavailable'](bucket_name, cause)`` on the
@@ -105,7 +114,21 @@ _COMPONENT = "Orchestrator"
 # journal is eventually consistent) are still picked up.  The bounded
 # processed-operation window suppresses re-submission of records already
 # included in a job, so the lookback never causes redundant replication.
-DEFAULT_JOURNAL_LOOKBACK = timedelta(hours=1)
+#
+# A record delivered later than this window is excluded permanently: once the
+# watermark has advanced past (record_timestamp + lookback), is_eligible in
+# src/core/checkpoint_logic.py returns False for it on every subsequent run, and
+# nothing retries or alerts.  The window is therefore sized for observed S3
+# Metadata delivery latency rather than for scan cost, since a missed tagging
+# event is silently unreplicated until someone backfills it by hand
+# (docs/backfill.md).
+#
+# Must stay in sync with the JournalLookbackSeconds default in
+# deploy/template.yaml; tests/test_template.py asserts the two agree.  This
+# value applies only when JOURNAL_LOOKBACK_SECONDS is unset, which a
+# CloudFormation deploy never leaves unset, so it governs direct invocation and
+# tests.
+DEFAULT_JOURNAL_LOOKBACK = timedelta(hours=2)
 
 # Minimum spacing between journal-unavailable alerts for the same bucket. The
 # condition recurs on every interval until the journal exists, so an unbounded
@@ -491,7 +514,7 @@ class _BucketContext:
     lookback: timedelta
     journal_read_row_cap: int
     max_batch_job_failures: int
-    on_bucket_disable: Callable | None
+    on_bucket_disabled: Callable | None
     on_submission_failure: Callable | None
     # Invoked on the first interval in which the bucket's S3 Metadata journal
     # is found to be absent. Defaults to None so a library caller that does not
@@ -630,6 +653,21 @@ class StateWriter:
             bucket_name, current_etag=self._etag,
         )
 
+    def disable_bucket(self, reason: str, now: datetime) -> None:
+        """Record the bucket as disabled and clear its job history, updating
+        the held ETag.
+
+        Routed through the writer rather than written self-contained because
+        the submission-streak call site runs inside ``_lease_scope``: a write
+        managing its own ETag would invalidate the one held here, and the
+        ``release_lease`` in that scope's ``finally`` would then fail and
+        strand the lease in the state object.
+        """
+        self._etag = self._store.disable_bucket(
+            self._s3_client, self._state_bucket, self._source_bucket,
+            reason=reason, now=now, current_etag=self._etag,
+        )
+
     def claim_journal_unavailable_alert(
         self, bucket_name: str, now: datetime,
     ) -> bool:
@@ -696,6 +734,81 @@ class _BucketResult:
 # ---------------------------------------------------------------------------
 # Extracted phases — called from _process_bucket
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _BucketSkip:
+    """Why ``run_interval`` is skipping a bucket before ``_process_bucket`` runs.
+
+    ``counts_as_disabled`` feeds the run-level ``DisabledBuckets`` metric.
+    ``metrics`` is the ``BucketMetrics`` entry to publish for the bucket, or
+    ``None`` to publish nothing — a disabled bucket deliberately publishes
+    nothing, so that a missing ``BucketErrors`` datum stays a usable signal
+    that a bucket has stopped being processed.
+    """
+
+    counts_as_disabled: bool
+    metrics: BucketMetrics | None
+
+
+def _check_bucket_disabled(
+    bucket: MonitoredBucket,
+    factory: ClientFactory,
+    store: state_store_module.StateStore,
+    state_bucket: str,
+) -> _BucketSkip | None:
+    """Return why to skip *bucket*, or ``None`` to process it.
+
+    A bucket whose disable state cannot be read is skipped rather than assumed
+    enabled. The flag is a cost control: guessing "enabled" on a transient read
+    error is what would let a bucket whose jobs keep failing resume submitting
+    billable jobs. Guessing costs at most one interval, because the same read
+    is retried on the next run, and the skip is reported as a bucket error so
+    it is not silent.
+    """
+    bucket_name = bucket.name
+    try:
+        s3_client = factory.create_s3_client(region=bucket.region)
+        disable_state = store.get_disable_state(
+            s3_client, state_bucket, bucket_name
+        )
+    except Exception as exc:  # noqa: BLE001
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=bucket_name,
+            cause=(
+                f"Failed to read the disabled flag from the state object: "
+                f"{exc}. Skipping the bucket this run rather than processing "
+                f"it as enabled."
+            ),
+        ))
+        return _BucketSkip(
+            counts_as_disabled=False,
+            metrics=BucketMetrics(
+                source_bucket=bucket_name,
+                ops_read=0,
+                matched=0,
+                submitted=0,
+                errored=True,
+            ),
+        )
+
+    if not disable_state.disabled:
+        return None
+
+    observability.emit(observability.log_error(
+        component=_COMPONENT,
+        bucket=bucket_name,
+        cause=(
+            f"Bucket is disabled in its state object "
+            f"(disabled_at={disable_state.at!r}, "
+            f"reason={disable_state.reason!r}). Re-enable by setting "
+            f'"disabled": false in '
+            f"s3://{state_bucket}/"
+            f"{state_store_module.state_object_key(bucket_name)}."
+        ),
+    ))
+    return _BucketSkip(counts_as_disabled=True, metrics=None)
 
 
 def _create_clients(
@@ -933,8 +1046,67 @@ def _describe_prior_jobs(
     )
 
 
+def _disable_bucket(
+    ctx: _BucketContext,
+    writer: StateWriter,
+    reason: str,
+) -> None:
+    """Persist the bucket's disable flag, then notify.
+
+    Order matters: the notification follows a successful write and nothing
+    else, so an alert never tells an operator to re-enable a bucket that was
+    never disabled. A failed write still leaves the caller skipping the bucket
+    for this run, and the condition that triggered the disable is re-evaluated
+    on the next run and disables it then, so a lost write costs one interval
+    rather than the protection itself.
+
+    Deliberately returns nothing. Whether the write landed makes no difference
+    to either caller: both abandon the bucket for this run either way, so a
+    success flag here would be an affordance to branch on a decision that does
+    not exist. The outcome is reported through the log entries instead.
+
+    Both call sites reach this from inside the orchestrator's per-bucket ETag
+    chain, which is why the write goes through *writer* — see
+    :meth:`StateWriter.disable_bucket`.
+    """
+    bucket_name = ctx.bucket_name
+    try:
+        writer.disable_bucket(reason, now=datetime.now(tz=UTC))
+    except Exception as exc:  # noqa: BLE001
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=bucket_name,
+            cause=(
+                f"Failed to record the disabled flag in the state object: "
+                f"{exc}. The bucket is NOT disabled; the condition is "
+                f"re-evaluated on the next run."
+            ),
+        ))
+        return
+
+    observability.emit(observability.log_audit(
+        action="bucket_disabled",
+        source_bucket=bucket_name,
+        details={
+            "reason": reason,
+            "state_key": state_store_module.state_object_key(bucket_name),
+        },
+    ))
+
+    if ctx.on_bucket_disabled is not None:
+        try:
+            ctx.on_bucket_disabled(bucket_name, reason)
+        except Exception as cb_exc:  # noqa: BLE001
+            observability.emit(observability.log_error(
+                component=_COMPONENT,
+                bucket=bucket_name,
+                cause=f"Bucket-disabled alert callback failed: {cb_exc}",
+            ))
+
+
 def _apply_recovery_plan(
     ctx: _BucketContext,
+    writer: StateWriter,
     state: Any,
     recovery: RecoveryPlan,
     result: _BucketResult,
@@ -942,8 +1114,8 @@ def _apply_recovery_plan(
     """Apply a :class:`RecoveryPlan` produced by :func:`plan_recovery`.
 
     Performs the side effects the pure function cannot: threshold-breach
-    disabling (log + on_bucket_disable callback), the empty-watermark_low audit
-    log, and the watermark rollback mutation.
+    disabling (log + state write + notification), the empty-watermark_low
+    audit log, and the watermark rollback mutation.
 
     See ``src.core.job_recovery.plan_recovery`` for the decision logic.
 
@@ -960,15 +1132,7 @@ def _apply_recovery_plan(
             cause=recovery.disable_reason,
         ))
         result.errored = True
-        if ctx.on_bucket_disable is not None:
-            try:
-                ctx.on_bucket_disable(bucket_name, recovery.disable_reason)
-            except Exception as cb_exc:  # noqa: BLE001
-                observability.emit(observability.log_error(
-                    component=_COMPONENT,
-                    bucket=bucket_name,
-                    cause=f"Failed to write disabled flag to config: {cb_exc}",
-                ))
+        _disable_bucket(ctx, writer, recovery.disable_reason)
         return None
 
     # Audit log for skipped empty watermark_lows.
@@ -1547,15 +1711,7 @@ def _escalate_submission_failure(
         bucket=bucket_name,
         cause=disable_reason_submission,
     ))
-    if ctx.on_bucket_disable is not None:
-        try:
-            ctx.on_bucket_disable(bucket_name, disable_reason_submission)
-        except Exception as cb_exc:  # noqa: BLE001
-            observability.emit(observability.log_error(
-                component=_COMPONENT,
-                bucket=bucket_name,
-                cause=f"Failed to disable bucket after submission streak: {cb_exc}",
-            ))
+    _disable_bucket(ctx, writer, disable_reason_submission)
     return True
 
 
@@ -1818,10 +1974,10 @@ def run_interval(
 
     lookback = _resolve_lookback(runtime_config)
 
-    # Callback invoked when InlineHashCeiling is exceeded for a bucket.
-    # The lambda handler provides this to write disabled=True back to the
-    # solution-config.json; library callers may omit it.
-    on_bucket_disable = runtime_config.get("on_bucket_disable")
+    # Notification callback invoked after a bucket has been disabled and the
+    # flag persisted to its state object. The lambda handler wires this to the
+    # recovery-instructions alert; library callers may omit it.
+    on_bucket_disabled = runtime_config.get("on_bucket_disabled")
 
     # Callback invoked on the first occurrence of a permanent client-side
     # submission failure. The lambda handler wires this to publish to
@@ -1872,19 +2028,18 @@ def run_interval(
     any_capped_and_progressed = False  # RunOutcome signal for Self_Reinvocation
 
     for bucket in app_config.buckets:
-        if bucket.disabled:
-            disabled_buckets += 1
-            entry = observability.log_error(
-                component=_COMPONENT,
-                bucket=bucket.name,
-                cause=(
-                    f"Bucket is disabled in solution-config "
-                    f"(disabled_at={bucket.disabled_at!r}, "
-                    f"reason={bucket.disabled_reason!r}). "
-                    f"Re-enable by setting disabled=false in the config."
-                ),
-            )
-            observability.emit(entry)
+        # The disable flag lives in the bucket's state object, so reading it
+        # needs a client. Checking here rather than inside _process_bucket
+        # keeps the guarantee that a disabled bucket costs nothing: no
+        # replication configuration is read, no journal is queried, and it
+        # contributes no BucketMetrics, which is what makes "no BucketErrors
+        # datum for a bucket" a meaningful alarm condition.
+        skip = _check_bucket_disabled(bucket, factory, store, state_bucket)
+        if skip is not None:
+            if skip.counts_as_disabled:
+                disabled_buckets += 1
+            if skip.metrics is not None:
+                bucket_results.append(skip.metrics)
             continue
 
         result = _process_bucket(
@@ -1898,7 +2053,7 @@ def run_interval(
             batch_operations_role_arn=batch_operations_role_arn,
             kms_key_arn=kms_key_arn,
             lookback=lookback,
-            on_bucket_disable=on_bucket_disable,
+            on_bucket_disabled=on_bucket_disabled,
             on_submission_failure=on_submission_failure,
             on_journal_unavailable=on_journal_unavailable,
             max_batch_job_failures=max_batch_job_failures,
@@ -2262,7 +2417,9 @@ def _prepare_state_and_recovery(
     )
 
     if job_check.any_check_failed:
-        new_watermark = _apply_recovery_plan(ctx, state, recovery, result)
+        new_watermark = _apply_recovery_plan(
+            ctx, state_writer, state, recovery, result
+        )
         if new_watermark is None:
             return None
         checkpoint_watermark = new_watermark
@@ -2281,7 +2438,7 @@ def _process_bucket(
     batch_operations_role_arn: str,
     kms_key_arn: str = "",
     lookback: timedelta = DEFAULT_JOURNAL_LOOKBACK,
-    on_bucket_disable=None,
+    on_bucket_disabled=None,
     on_submission_failure=None,
     on_journal_unavailable=None,
     max_batch_job_failures: int = 4,
@@ -2316,7 +2473,7 @@ def _process_bucket(
         lookback=lookback,
         journal_read_row_cap=journal_read_row_cap,
         max_batch_job_failures=max_batch_job_failures,
-        on_bucket_disable=on_bucket_disable,
+        on_bucket_disabled=on_bucket_disabled,
         on_submission_failure=on_submission_failure,
         on_journal_unavailable=on_journal_unavailable,
     )

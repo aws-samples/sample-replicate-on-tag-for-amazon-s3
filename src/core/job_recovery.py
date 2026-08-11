@@ -233,7 +233,7 @@ def plan_recovery(
             f"{consecutive_failures} consecutive time(s) (threshold: "
             f"{threshold}). Bucket disabled to prevent runaway "
             f"per-job costs. Investigate and re-enable by setting "
-            f"disabled=false in the solution-config."
+            f'"disabled": false in the bucket\'s state object.'
         )
 
     return RecoveryPlan(
