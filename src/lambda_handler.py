@@ -65,8 +65,9 @@ _REINVOCATION_CHAIN_LIMIT_DEFAULT = 20
 
 _logger = logging.getLogger(__name__)
 
-# SNS rejects a Subject that is non-ASCII, contains a newline, or reaches 100
-# characters.
+# SNS rejects a Subject that is non-ASCII, contains a newline, or reaches 101
+# characters — exactly 100 is accepted. The 99 below is one character more
+# conservative than the limit, harmlessly so.
 _SNS_MAX_SUBJECT_CHARS = 99
 
 

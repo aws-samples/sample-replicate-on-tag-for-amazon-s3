@@ -171,8 +171,16 @@ exercise it:
 2. Deploy the stack. Confirm the `ExecuteLFPermissionsGranter` custom resource
    succeeds and that `grant_permissions` calls appear in the `LFGranterRole`
    Lambda logs.
-3. Run an Athena query against the journal namespace and confirm it returns
+3. With `LFAdminRoleArn` left empty, confirm `LFGranterRole` appears in the
+   account's data lake administrators
+   (`aws lakeformation get-data-lake-settings --region "$REGION" --no-cli-pager`).
+   Registration is gated on catalog mode, so an IAM-mode deployment never
+   performs it and this step is the only way to exercise it.
+4. Run an Athena query against the journal namespace and confirm it returns
    without `INSUFFICIENT_PRIVILEGES`.
+5. Delete the stack and confirm `LFGranterRole` is gone from the administrators
+   list. A removal failure does not fail the delete; it appears as an `ERROR`
+   line in the `LFAdminGranter` log group.
 
 [Required AWS Permissions](permissions.md#lake-formation-accounts) covers the
 detection logic and the `LFAdminRoleArn` permissions this path needs.

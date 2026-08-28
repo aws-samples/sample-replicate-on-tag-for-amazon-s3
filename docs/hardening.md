@@ -43,5 +43,9 @@ notification silently stops arriving. See
 [SNS topic encryption](kms.md#sns-topic-encryption) for the key-policy
 statements and how to verify delivery.
 
-Completion report bodies carry object keys and version IDs, which is the reason
-to encrypt these topics if those keys are sensitive in your environment.
+Completion report bodies carry per-bucket object counts, replication outcomes,
+matched rule IDs, destination bucket names, and tag and last-modified timestamp
+ranges. They do not carry object keys or version IDs. Encrypt these topics if
+that operational detail is sensitive in your environment. See
+[Report group fields](completion-reporting.md#report-group-fields) for the full
+body.

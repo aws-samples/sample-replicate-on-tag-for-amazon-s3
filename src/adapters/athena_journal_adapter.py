@@ -139,27 +139,43 @@ def _escape_sql_string(value: str) -> str:
 
 
 def _escape_like_pattern(value: str) -> str:
-    """Escape a string for use as a prefix in an Athena LIKE pattern.
+    r"""Escape a string for use as a prefix in an Athena LIKE pattern.
 
     Escapes the three characters that have special meaning in a LIKE pattern
-    when the LIKE escape character is a backslash (``ESCAPE '\\'``):
+    when the LIKE escape character is a backslash:
 
-    * ``\\`` — the escape character itself; must be escaped first
-    * ``%``  — matches any sequence of characters
-    * ``_``  — matches any single character
+    * ``\`` — the escape character itself; must be escaped first
+    * ``%`` — matches any sequence of characters
+    * ``_`` — matches any single character
 
     The caller appends the trailing ``%`` wildcard for prefix matching and
-    must include ``ESCAPE '\\\\'`` in the SQL predicate so Athena interprets
-    the escaped characters as literals.  Single quotes are also doubled so
-    the result is safe to embed directly in a SQL string literal.
+    must include an ``ESCAPE`` clause whose value is a **single** backslash
+    at runtime, so Athena interprets the escaped characters as literals.
+    Trino rejects a two-character escape value with
+    ``INVALID_FUNCTION_ARGUMENT: Escape string must be a single character``,
+    and it does not process backslash escapes inside a single-quoted literal,
+    so the runtime SQL must read ``ESCAPE '\'`` exactly.  Single quotes are
+    also doubled so the result is safe to embed directly in a SQL string
+    literal.
 
-    Example::
+    Every backslash below is shown as it exists at runtime, not as Python
+    source.  In a non-raw string literal each one needs doubling in source:
+    ``"ESCAPE '\\'"`` is the source form that emits ``ESCAPE '\'``.
 
-        prefix = "archive/2024%01"
-        escaped = _escape_like_pattern(prefix)   # → "archive/2024\\%01"
-        sql = f"key LIKE '{escaped}%' ESCAPE '\\\\'"
-        # → key LIKE 'archive/2024\\%01%' ESCAPE '\\\\'
+    Example, in runtime values::
+
+        prefix  = archive/2024%01
+        escaped = archive/2024\%01          # _escape_like_pattern(prefix)
+        sql     = key LIKE 'archive/2024\%01%' ESCAPE '\'
         # Athena: key starts with literal "archive/2024%01"
+
+    The corresponding Python source for that ``sql`` line, with each
+    backslash doubled, is::
+
+        f"key LIKE '{escaped}%' ESCAPE '\\'"
+
+    See ``preflight_counter.build_rule_predicate`` for the only caller that
+    emits an ``ESCAPE`` clause; this module builds no LIKE predicate itself.
     """
     value = value.replace("\\", "\\\\")  # backslash first — it is the escape char
     value = value.replace("%", "\\%")    # literal percent sign
@@ -204,9 +220,16 @@ def _build_query(
     finding). This is an inclusive upper bound, not a ``LIMIT``, specifically
     so a boundary that lands mid-tie (multiple records sharing the exact same
     ``record_timestamp``) never splits that tie: every record at
-    *until_timestamp* is included. Splitting a tie would let the excluded half
-    fall below the watermark this run advances to, without ever having been
-    submitted — silently lost, not merely delayed. See
+    *until_timestamp* is included. Splitting a tie leaves the excluded half at
+    the watermark this run advances to, without having been submitted. That loss
+    is bounded rather than immediate:
+    :func:`~src.core.checkpoint_logic.is_eligible` treats a record at the
+    watermark as eligible while it sits inside the lookback window and its
+    ``logical_operation_id`` is absent from the processed-operation window, so
+    the excluded half is re-read on a later run. It becomes unrecoverable only
+    once the watermark advances more than ``JournalLookbackSeconds`` past it.
+    The inclusive bound removes that window of exposure entirely, and is
+    cheaper to reason about than a row count. See
     :func:`find_row_count_boundary` for how *until_timestamp* is determined.
 
     The result set is ordered by ``record_timestamp ASC``.

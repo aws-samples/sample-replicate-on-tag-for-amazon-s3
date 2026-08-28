@@ -788,7 +788,7 @@ class TestCompletionReportSubject:
         assert "action needed" in format_completion_report_subject(report)
 
     def test_within_sns_length_limit_for_a_long_bucket_name(self):
-        """SNS rejects a subject of 100 characters or more."""
+        """SNS rejects a subject of 101 characters or more; 100 is accepted."""
         report = build_completion_report(
             "a" * 63, [make_obj(replication_outcome="FAILED")]
         )

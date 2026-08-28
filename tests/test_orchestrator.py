@@ -910,18 +910,24 @@ def _run_with_recovery_mocks(
 
 
 def _diagnosed_flags(mock_store) -> dict:
-    """The per-job flags the last mark_report_diagnosed call asked to set.
+    """The per-job flags the run asked to set, across every call.
 
     One store method sets both ``report_diagnosed`` and ``recovery_scored``, so
-    "was it called" no longer says which happened. They are set on different
+    "was it called" does not say which happened. They are set on different
     conditions: a job whose completion report cannot be read is scored but not
-    diagnosed.
+    diagnosed. They are also committed at different points — diagnosis inside the
+    DescribeJob loop, scoring only once the work it authorized has landed
+    (Requirement 5.1) — so this aggregates rather than reading the last call.
     """
     mock_store.mark_report_diagnosed.assert_called()
-    kwargs = mock_store.mark_report_diagnosed.call_args.kwargs
+    calls = mock_store.mark_report_diagnosed.call_args_list
     return {
-        "report_diagnosed": kwargs.get("report_diagnosed", True),
-        "recovery_scored": kwargs.get("recovery_scored", False),
+        "report_diagnosed": any(
+            call.kwargs.get("report_diagnosed", True) for call in calls
+        ),
+        "recovery_scored": any(
+            call.kwargs.get("recovery_scored", False) for call in calls
+        ),
     }
 
 
@@ -1796,7 +1802,6 @@ class TestCompletionRecordCreationHook:
 
         successful_read.assert_called_once()
         successful_store.merge_completion_report.assert_called_once()
-        successful_store.mark_report_diagnosed.assert_called_once()
         assert _diagnosed_flags(successful_store)["report_diagnosed"] is True
 
     def test_zero_invoked_tasks_uses_synthetic_empty_report(self):
@@ -1813,7 +1818,7 @@ class TestCompletionRecordCreationHook:
         report = mock_store.merge_completion_report.call_args.kwargs["report"]
         assert report.entries == ()
         assert report.created_at == _NOW
-        mock_store.mark_report_diagnosed.assert_called_once()
+        assert _diagnosed_flags(mock_store)["report_diagnosed"] is True
 
     def test_repeated_terminal_delivery_skips_report_merge_after_processed_id_exists(self):
         """A duplicate terminal notification leaves the ready report unread.
@@ -2152,13 +2157,18 @@ class TestPermissionShapedErrorCodeDiagnosis:
         assert "BatchOperationsRoleArn" not in cause
 
     def test_src_object_not_eligible_names_archived_storage_classes(self):
-        """SrcObjectNotEligible gets storage-class-specific guidance.
+        """SrcObjectNotEligible names its known causes as possibilities.
 
         The service reports an archived object only as SrcObjectNotEligible
         with the message "Object is not eligible for replication", which names
         no storage class and also covers unrelated ineligibility conditions.
         Verified against job 17a27c3a-aa18-4bc7-91a6-caeaaa28dd8c in the
         us-west-2 test deployment.
+
+        A second cause carries the identical code, confirmed by probe against
+        job a5fb3a8c-cea7-4668-b80b-0336c3d6c1ce: an object matched only by a
+        replication rule whose Status is Disabled. So the diagnostic lists
+        both as possibilities and asserts neither.
         """
         prior = {"rule-1": _ct_prior_rec(job_id="job-archived")}
         entries = [
@@ -2190,6 +2200,11 @@ class TestPermissionShapedErrorCodeDiagnosis:
         # replication status that would block its lifecycle rules.
         assert "lifecycle" in cause.lower()
         assert "s3:InitiateReplication" not in cause
+        # Storage class is one possibility, not the cause: the second known
+        # cause is named too, and nothing claims archival outright.
+        assert "Disabled" in cause
+        assert "most common cause" not in cause.lower()
+        assert "several ineligibility conditions" in cause
 
     def test_distinct_error_codes_each_reported_once(self):
         """A job mixing several failure causes reports each one separately."""
@@ -3558,16 +3573,24 @@ class TestJournalReadRowCap:
         ]
         assert audits == []
 
-    def test_boundary_check_failure_proceeds_uncapped_not_fatal(self):
-        """A best-effort failure in find_row_count_boundary itself must not
-        abort the run — it proceeds uncapped, which is the pre-existing
-        behavior (not a regression), rather than blocking a whole run on a
-        check that exists purely to prevent a rare condition."""
+    def test_boundary_check_failure_skips_the_bucket_and_errors_it(self):
+        """A failure in find_row_count_boundary skips the bucket for the
+        interval rather than reading uncapped.
+
+        read_journal emits no LIMIT, so proceeding with until_timestamp at None
+        would read every row tagged since the watermark in one invocation — the
+        row cap's only bound is the predicate the failed lookup was supposed to
+        supply. The bucket is skipped with its checkpoint unchanged, and
+        `errored` moves BucketErrors so the Athena fault is visible. The run
+        itself still completes: one bucket's Athena failure is not fatal to the
+        interval.
+        """
         (
             mock_factory_cls, mock_store_cls,
             mock_get_rules, mock_read_journal,
             mock_submit_job,
         ) = _make_mocks(["my-bucket"])
+        mock_store = mock_store_cls.return_value
         with (
             patch("src.orchestrator.ClientFactory", mock_factory_cls),
             patch("src.orchestrator.state_store_module.StateStore", mock_store_cls),
@@ -3581,12 +3604,15 @@ class TestJournalReadRowCap:
             patch("src.orchestrator.preflight_count", return_value=0),
             patch("src.orchestrator.read_permanent_deletes", return_value=set()),
         ):
-            run_interval(_config(["my-bucket"]), _BASE_RUNTIME)  # must not raise
+            outcome = run_interval(  # must not raise
+                _config(["my-bucket"]), _BASE_RUNTIME)
 
-        # The run still completed and read_journal was still called
-        # (uncapped — until_timestamp is None).
-        mock_read_journal.assert_called_once()
-        assert mock_read_journal.call_args.kwargs.get("until_timestamp") is None
+        mock_read_journal.assert_not_called()
+        mock_submit_job.assert_not_called()
+        # No lease was taken, so nothing advanced the checkpoint.
+        mock_store.release_lease.assert_not_called()
+        assert outcome.buckets[0].errored is True
+        assert outcome.buckets[0].submitted == 0
 
     def test_row_cap_runtime_config_value_passed_through(self):
         """A custom journal_read_row_cap in runtime_config reaches

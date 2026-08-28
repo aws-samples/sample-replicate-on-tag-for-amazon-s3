@@ -1336,6 +1336,79 @@ class TestConfigResourceStructure:
         )
 
 
+class TestConfigResourcePrivilegedParameters:
+    """scan-aa27a832 remediation, Req 1.3 — the handler's privileged parameters
+    are supplied by the template, and the resource keeps its change triggers."""
+
+    def test_environment_supplies_state_bucket_config_key_and_stack_id(self, resources):
+        """ConfigResourceFunction sets the three variables the handler reads."""
+        env = (
+            resources["ConfigResourceFunction"]
+            .get("Properties", {})
+            .get("Environment", {})
+            .get("Variables", {})
+        )
+        assert isinstance(env.get("STATE_BUCKET"), _CfnTag)
+        assert env["STATE_BUCKET"].tag == "!Ref"
+        assert env["STATE_BUCKET"].value == "StateBucket"
+        assert env.get("CONFIG_KEY") == "config/solution-config.json"
+        assert isinstance(env.get("STACK_ID"), _CfnTag)
+        assert env["STACK_ID"].tag == "!Ref"
+        assert env["STACK_ID"].value == "AWS::StackId"
+
+    def test_environment_and_resource_property_agree_on_the_config_key(self, resources):
+        """Both sides name the same object, so the change trigger cannot drift
+        from the value the handler acts on."""
+        env_key = (
+            resources["ConfigResourceFunction"]["Properties"]["Environment"][
+                "Variables"
+            ]["CONFIG_KEY"]
+        )
+        prop_key = resources["SolutionConfig"]["Properties"]["ConfigKey"]
+        assert env_key == prop_key
+
+    def test_environment_supplies_the_whole_config_object(self, resources):
+        """Diff scan scan-972cfd4f, f-77d789f5: the bucket list, Region, interval,
+        and KMS key come from the environment too, so a forged event cannot
+        choose the content of config/solution-config.json."""
+        env = (
+            resources["ConfigResourceFunction"]
+            .get("Properties", {})
+            .get("Environment", {})
+            .get("Variables", {})
+        )
+        assert isinstance(env.get("SOURCE_BUCKET_NAMES"), _CfnTag)
+        assert env["SOURCE_BUCKET_NAMES"].tag == "!Join"
+        assert isinstance(env.get("REGION"), _CfnTag)
+        assert env["REGION"].tag == "!Ref"
+        assert env["REGION"].value == "AWS::Region"
+        assert isinstance(env.get("CHECK_FREQUENCY_MINUTES"), _CfnTag)
+        assert env["CHECK_FREQUENCY_MINUTES"].tag == "!Ref"
+        assert env["CHECK_FREQUENCY_MINUTES"].value == "CheckFrequencyMinutes"
+        assert isinstance(env.get("KMS_KEY_ARN"), _CfnTag)
+        assert env["KMS_KEY_ARN"].tag == "!If"
+
+    def test_solution_config_retains_state_bucket_and_config_key_properties(
+        self, resources
+    ):
+        """CloudFormation sends this resource an Update only when one of its own
+        properties changes, so every value the handler reads from its environment
+        stays listed as a trigger."""
+        props = resources["SolutionConfig"].get("Properties", {})
+        for name in (
+            "StateBucket",
+            "ConfigKey",
+            "Buckets",
+            "Region",
+            "CheckFrequencyMinutes",
+            "KmsKeyArn",
+        ):
+            assert name in props, (
+                f"{name} must stay a property of SolutionConfig so a change to it "
+                "re-invokes the handler"
+            )
+
+
 class TestExistingResourcesPreserved:
     """Task 4.2 (partial) — existing resources, outputs, and parameters preserved (Req 10.1-10.4)."""
 

@@ -63,7 +63,7 @@ Athena is billed per query on bytes scanned, so the query count per run matters 
 | Query | Issued |
 |---|---|
 | Journal read | Every run that reaches the journal |
-| Row-cap boundary | Every run that reaches the journal |
+| Row-cap boundary | Every run that reaches the journal. If this query fails, the bucket is skipped for that interval, so the journal read is not issued either |
 | Lookback re-scan window row count | Every run, except a bucket's first run and any run with `JournalLookbackSeconds` set to 0 |
 | Lookback re-scan window lower bound | When that window holds more rows than its share of `JournalReadRowCap`, or when the row count above could not be established. If this query itself fails, the bucket is skipped for that interval, so the journal read is not issued either |
 

@@ -43,10 +43,13 @@ default. SNS has no keyless server-side encryption option (there is no equivalen
 of S3's `SSEAlgorithm: AES256`), so encrypting them requires a symmetric
 customer-managed KMS key and adds a KMS request charge per publish.
 
-Completion report bodies carry object keys and version IDs. If those keys are
-sensitive in your environment, set `SnsKmsKeyArn` to a symmetric
-customer-managed key ARN. The stack then sets `KmsMasterKeyId` on both topics
-and grants the `ExecutionRole` the KMS actions needed to publish.
+Completion report bodies carry per-bucket object counts, replication outcomes,
+matched rule IDs, destination bucket names, and tag and last-modified timestamp
+ranges, not object keys or version IDs (see
+[Report group fields](completion-reporting.md#report-group-fields)). If that
+operational detail is sensitive in your environment, set `SnsKmsKeyArn` to a
+symmetric customer-managed key ARN. The stack then sets `KmsMasterKeyId` on both
+topics and grants the `ExecutionRole` the KMS actions needed to publish.
 
 **The key policy is your responsibility, and publishes fail without it.** Add
 both statements to the key referenced by `SnsKmsKeyArn`:

@@ -219,7 +219,7 @@ role. Completion tracking never accesses the destination account or Region.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `LFAdminRoleArn` | _(empty)_ | ARN of an existing Lake Formation data lake administrator role. Leave empty to let the Solution self-elevate when the catalog is in LF mode |
+| `LFAdminRoleArn` | _(empty)_ | ARN of an existing Lake Formation data lake administrator role. Leave empty to let the Solution register its own granter role as an administrator, which it does only when the catalog is in Lake Formation mode. In IAM mode, the default, it registers no administrator |
 
 The `solution-config.json` `processing_interval` is not a parameter. It is derived automatically from `CheckFrequencyMinutes` (e.g. `30` → `30m`, `60` → `1h`).
 

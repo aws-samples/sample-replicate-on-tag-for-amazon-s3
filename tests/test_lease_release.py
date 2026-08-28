@@ -347,10 +347,14 @@ class TestLeaseReleaseOnSubmissionStreakDisable:
 class TestLeaseReleaseFailureHandled:
     def test_release_failure_logged_and_original_outcome_preserved(self, caplog):
         """When release_lease raises, the failure is logged and the original
-        outcome is preserved (not masked by the release exception).
+        outcome is preserved (not masked by the release exception), and the
+        bucket is marked errored.
 
         Requirement 5.3: release failure SHALL be logged and SHALL NOT mask
         the original error that caused the early return.
+
+        scan-aa27a832-remediation Requirement 6.1: a release failure SHALL set
+        result.errored, so a stranded lease publishes a BucketErrors datum.
         """
         (
             mock_factory_cls, mock_store_cls, mock_get_rules,
@@ -383,10 +387,16 @@ class TestLeaseReleaseFailureHandled:
         assert mock_store.release_lease.call_count == 1
 
         # The original outcome is preserved — run_interval returns normally,
-        # not raising the release exception. The bucket was not errored by the
-        # preflight failure (that path is a skip, not an error).
+        # not raising the release exception. The preflight failure on its own is
+        # a skip rather than an error; what marks the bucket errored here is the
+        # failed release, which left the lease persisted in the state object.
         assert outcome is not None
         assert len(outcome.buckets) == 1
+        assert outcome.buckets[0].errored is True, (
+            "A failed lease release strands the lease and causes silent "
+            "non-replication, so it must publish a BucketErrors datum "
+            "(Requirement 6.1)"
+        )
         # Crucially: the release failure did NOT propagate as an unhandled exception.
         # The run completed and produced a result (Requirement 5.3).
 
@@ -415,7 +425,7 @@ class TestNonVacuous:
         from src.orchestrator import _LeaseHolder
 
         @contextlib.contextmanager
-        def noop_lease_scope(writer, ctx, candidate_hwm, lookback):
+        def noop_lease_scope(writer, ctx, candidate_hwm, lookback, result):
             """A _lease_scope that acquires but does NOT release."""
             from src.core.models import Lease, LeaseStatus
             import uuid

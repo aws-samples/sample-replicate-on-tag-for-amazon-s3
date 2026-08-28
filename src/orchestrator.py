@@ -216,10 +216,20 @@ _PERMISSION_SHAPED_ERROR_CODES = frozenset({
 #
 # The code is generic — the message names no storage class, and the same code
 # covers other ineligibility conditions — so the diagnostic for it names
-# archived storage classes as the most likely cause without asserting it.
+# archived storage classes as one possibility rather than as the cause.
 #
-# Two properties of that failure are worth recording, because both are
-# counter-intuitive and both were confirmed rather than assumed:
+# A second cause was confirmed by probe on 2026-08-28 (job
+# a5fb3a8c-cea7-4668-b80b-0336c3d6c1ce, recorded in
+# experiments/scan-aa27a832-probes/README.md): an object matched only by a
+# replication rule whose ``Status`` is ``Disabled`` fails with the identical
+# code and message. ``derive_rules`` now excludes such a rule, so the
+# Solution no longer submits those objects, but a job submitted before that
+# change can still report this. Treating the code as an archival signal
+# therefore points an operator at the wrong thing.
+#
+# Two properties of the archived case are worth recording, because both are
+# counter-intuitive and both were confirmed rather than assumed. They are
+# specific to that case and are not claimed for the others:
 #
 # 1. It is reported with HTTP 500, but it is permanent and deterministic. No
 #    retry can succeed while the object remains archived. Nothing should
@@ -259,9 +269,10 @@ def _log_report_task_errors(
       ``BatchOperationsRoleArn`` output, matching README.md's "Every task in
       a job fails on a permission error" section.
     * ``SrcObjectNotEligible`` — the source object was not eligible for
-      replication, most commonly because it is in an archived storage class.
-      The message names that cause without asserting it, since the service
-      code is generic.
+      replication. The service code covers several conditions and its
+      message names none of them, so the diagnostic lists the causes known
+      to produce it — an archived storage class, and a rule whose ``Status``
+      is ``Disabled`` — as possibilities rather than asserting either.
     * anything else — reported with the code, the count, and the report's
       own ``ResultMessage`` verbatim, so an unanticipated failure is visible
       rather than silently dropped. This is the case that previously
@@ -309,18 +320,25 @@ def _log_report_task_errors(
             )
         elif code == _SRC_OBJECT_NOT_ELIGIBLE:
             cause = prefix + (
-                "The most common cause is an object in an archived storage "
-                "class: S3 does not replicate objects in GLACIER or "
-                "DEEP_ARCHIVE, or in the S3 Intelligent-Tiering Archive "
-                "Access or Deep Archive Access tiers, until they are "
-                "restored and copied to another storage class. The object "
-                "was left unchanged and no replication was initiated, so it "
-                "carries no replication status and its lifecycle rules are "
-                "unaffected. Objects the Solution can identify as archived "
-                "from the journal are excluded before submission and "
-                "reported as archived_objects_excluded instead; this code "
-                "covers the objects it could not, and other ineligibility "
-                "conditions. See README.md, Objects That Are Not Replicated."
+                "S3 reports this code for several ineligibility conditions "
+                "and its message names none of them, so read it as one of "
+                "the following rather than as a storage class problem. One "
+                "possibility is an object in an archived storage class: S3 "
+                "does not replicate objects in GLACIER or DEEP_ARCHIVE, or "
+                "in the S3 Intelligent-Tiering Archive Access or Deep "
+                "Archive Access tiers, until they are restored and copied to "
+                "another storage class. Objects the Solution can identify as "
+                "archived from the journal are excluded before submission "
+                "and reported as archived_objects_excluded instead, so this "
+                "code covers the objects it could not. In that case the "
+                "object is left unchanged and no replication is initiated, "
+                "so it carries no replication status and its lifecycle rules "
+                "are unaffected. Another is an object matched only by a "
+                "replication rule whose Status is Disabled; the Solution no "
+                "longer derives such a rule, so a job submitted before that "
+                "change can still report this. Other ineligibility "
+                "conditions produce the same code. See README.md, Objects "
+                "That Are Not Replicated."
             )
         else:
             detail = f" Reported message: {messages[code]!r}." if messages[code] else ""
@@ -703,24 +721,33 @@ class StateWriter:
             reason=reason, now=now, current_etag=self._etag,
         )
 
-    def claim_journal_unavailable_alert(
+    def journal_unavailable_alert_due(
         self, bucket_name: str, now: datetime,
     ) -> bool:
-        """Claim the right to alert that this bucket's journal is missing.
+        """Whether this bucket's journal-unavailable alert is due to be sent.
 
-        Returns True when the caller should send the alert. Writes only when
-        the claim succeeds, and is reached only on a path that abandons the
-        bucket for this run, so it never contributes a link to the ETag chain
-        used by a subsequent write.
+        Reads only, so nothing is committed before delivery is attempted. The
+        matching :meth:`record_journal_unavailable_alert` does the write.
         """
-        should_alert, new_etag = self._store.claim_journal_unavailable_alert(
+        return self._store.journal_unavailable_alert_due(
             self._s3_client, self._state_bucket, self._source_bucket,
             bucket_name, now=now,
             min_interval=JOURNAL_UNAVAILABLE_REALERT_INTERVAL,
-            current_etag=self._etag,
         )
-        self._etag = new_etag
-        return should_alert
+
+    def record_journal_unavailable_alert(
+        self, bucket_name: str, now: datetime,
+    ) -> None:
+        """Record that this bucket's journal-unavailable alert was sent.
+
+        Reached only on a path that abandons the bucket for this run, so this
+        write never contributes a link to the ETag chain used by a subsequent
+        write.
+        """
+        self._etag = self._store.record_journal_unavailable_alert(
+            self._s3_client, self._state_bucket, self._source_bucket,
+            bucket_name, now=now, current_etag=self._etag,
+        )
 
     def mark_report_diagnosed(
         self,
@@ -1075,6 +1102,15 @@ class _JobCheckResult:
     # record's own `status` field is written as SUBMITTED and never updated, so it
     # cannot answer that.
     terminal_job_ids: list[str] = field(default_factory=list)
+    # Job IDs scored for the first time this run, whose `recovery_scored` flag has
+    # NOT been committed yet. The flag is a durable once-only gate on work that is
+    # not itself durable — the rollback it authorizes is an in-memory mutation of
+    # `last_processed_watermark` that only becomes real once the readmitted range
+    # is resubmitted — so committing it here would let any early return between
+    # this loop and submission consume the readmission and drop the range for
+    # good. The caller commits these once the work has landed; see
+    # `_commit_recovery_scored`. Requirements 5.1, 5.2.
+    newly_scored_job_ids: list[str] = field(default_factory=list)
 
 
 def _describe_prior_jobs(
@@ -1102,9 +1138,12 @@ def _describe_prior_jobs(
     ``src.core.job_recovery`` — this function collects the raw outcomes and
     the caller passes them to that pure decision function.
 
-    Returns a _JobCheckResult with the loop's collected state.
+    Returns a _JobCheckResult with the loop's collected state, including the ids
+    of the jobs scored for the first time this run. Their ``recovery_scored``
+    flags are deliberately left uncommitted here — see ``_commit_recovery_scored``
+    for why the caller commits them instead.
 
-    Requirements: 1.3, 2.1
+    Requirements: 1.3, 2.1, 5.1, 5.2
     """
     bucket_name = ctx.bucket_name
     s3_client = ctx.s3_client
@@ -1117,6 +1156,7 @@ def _describe_prior_jobs(
     outcomes: list[JobOutcome] = []
     outstanding: list[_InFlightJob] = []
     terminal_job_ids: list[str] = []
+    newly_scored_job_ids: list[str] = []
 
     for rec in prev_submissions.values():
         if not rec.job_id:
@@ -1335,16 +1375,25 @@ def _describe_prior_jobs(
                 ),
             ))
 
-        # One write for both flags. They are set on different conditions — a job
-        # whose report is unreadable is scored but not diagnosed, which is the
-        # case that makes re-scoring reachable at all — so both are passed and
-        # the store sets only the ones that are true.
-        if diagnosed_now or newly_scored:
+        # `report_diagnosed` is committed here and `recovery_scored` is not, even
+        # though the store can set both in one write. They are set on different
+        # conditions — a job whose report is unreadable is scored but not
+        # diagnosed, which is the case that makes re-scoring reachable at all —
+        # and, more importantly, they gate work of different durability.
+        #
+        # Diagnosis is complete the moment its log entry is emitted, so a flag
+        # written now can only ever suppress a duplicate log. Scoring authorizes a
+        # watermark rollback that lives in memory until a resubmission persists
+        # it, so a flag written now would suppress the rollback on every later run
+        # while the range it readmitted was never resubmitted. The scored ids are
+        # carried out for the caller to commit after the work lands.
+        if diagnosed_now:
             writer.mark_report_diagnosed(
                 rec.job_id,
-                report_diagnosed=diagnosed_now,
-                recovery_scored=newly_scored,
+                report_diagnosed=True,
             )
+        if newly_scored:
+            newly_scored_job_ids.append(rec.job_id)
 
         if not newly_scored:
             # Already scored on an earlier run. Everything below is a
@@ -1392,7 +1441,36 @@ def _describe_prior_jobs(
         outcomes=outcomes,
         outstanding=outstanding,
         terminal_job_ids=terminal_job_ids,
+        newly_scored_job_ids=newly_scored_job_ids,
     )
+
+
+def _commit_recovery_scored(
+    writer: StateWriter,
+    job_ids: list[str],
+) -> None:
+    """Commit the `recovery_scored` flag for jobs whose scoring has taken effect.
+
+    Called only from a point past which the work the flag authorizes has
+    happened: either the readmitted range has been resubmitted, or the bucket has
+    been disabled by a threshold breach and will submit nothing again until an
+    operator intervenes. Committing earlier is the defect Requirement 5 describes
+    — `advance_checkpoint` is monotonic by design (design R3), so nothing persists
+    a rollback, and a flag committed before the resubmission would leave the
+    readmitted range gated out on every later run.
+
+    Best-effort, like every other call into `mark_report_diagnosed`: a failed
+    write costs one duplicate rollback and resubmission on the next run, which is
+    the pre-existing cost of that path and not worth failing a run over.
+
+    Requirements: 5.1, 5.2
+    """
+    for job_id in job_ids:
+        writer.mark_report_diagnosed(
+            job_id,
+            report_diagnosed=False,
+            recovery_scored=True,
+        )
 
 
 def _disable_bucket(
@@ -1714,13 +1792,14 @@ def _read_journal_window(
     """Steps d and d0: split the row budget and read the journal window.
 
     Sizes the lookback tail, divides ``Journal_Read_Row_Cap`` between it and the
-    rows above the watermark, finds the row-cap boundary over the new rows
-    (best-effort), raises the read's lower bound when the tail will not fit its
+    rows above the watermark, finds the row-cap boundary over the new rows,
+    raises the read's lower bound when the tail will not fit its
     allowance, emits the journal_read_capped audit when capped, calls
     read_journal, reports journal errors, and returns early on fatal errors.
 
     Returns (ops, since_timestamp, journal_until) on success, or None when a
-    fatal journal error means this bucket should be skipped. The returned
+    fatal journal error, a failed boundary lookup, or a failed tail-floor lookup
+    means this bucket should be skipped for the interval. The returned
     ``since_timestamp`` is the lower bound actually used, which is what the
     preflight count and the delete scan need so they cover the same range this
     read did. Sets result.capped and result.tail_shortened as side-effects.
@@ -1765,15 +1844,24 @@ def _read_journal_window(
             athena_workgroup=athena_workgroup,
             output_location=athena_output_location,
         )
-    except Exception as exc:  # noqa: BLE001
-        # Best-effort: if the boundary check itself fails, proceed
-        # uncapped rather than blocking the whole run on a check that
-        # exists purely to prevent an unusual, rare condition.
+    except Exception as exc:  # noqa: BLE001 — see _raise_tail_floor's docstring
+        # Same posture as a failed tail-floor lookup: the read window cannot be
+        # established, so the bucket is skipped for this interval with its
+        # checkpoint unchanged. Proceeding with journal_until at None reads every
+        # row tagged since the watermark in one invocation, and read_journal
+        # emits no LIMIT, so the only bound would be the predicate just lost.
         observability.emit(observability.log_error(
             component=_COMPONENT,
             bucket=bucket_name,
-            cause=f"Row-count boundary check failed (proceeding uncapped): {exc}",
+            cause=(
+                f"Row-count boundary lookup failed: {exc}. Skipping this bucket "
+                f"for this interval. Reading without the boundary would be "
+                f"unbounded in memory, and the checkpoint is left unchanged, so "
+                f"nothing ages out and the next interval reads the window whole."
+            ),
         ))
+        result.errored = True
+        return None
 
     # Requirement 4 tripwire. Unreachable: a boundary anchored at the watermark
     # is strictly above it, which is the whole point of the anchor above. It
@@ -1983,7 +2071,13 @@ class _LeaseHolder:
 
 
 @contextlib.contextmanager
-def _lease_scope(writer: StateWriter, ctx: _BucketContext, candidate_hwm, lookback):
+def _lease_scope(
+    writer: StateWriter,
+    ctx: _BucketContext,
+    candidate_hwm,
+    lookback,
+    result: _BucketResult,
+):
     """Acquire the lease on entry, release it unconditionally on exit.
 
     Yields a ``_LeaseHolder`` whose ``submitted_refs`` attribute is initially
@@ -1997,6 +2091,13 @@ def _lease_scope(writer: StateWriter, ctx: _BucketContext, candidate_hwm, lookba
 
     If release itself fails, the exception is caught and logged — it never
     replaces the outcome of the path that triggered the exit (Requirement 5.3).
+    ``result.errored`` is set in that case, which is why ``result`` is passed
+    in: a failed release leaves the lease persisted in the state object, and
+    every operation at or below its watermark is then filtered out of the
+    healing run and ages out of the lookback window — silent non-replication.
+    Without a ``BucketErrors`` datum the alarm is blind to it, and the accepted
+    lease-TTL risk (scan-aa27a832-remediation Requirement 11.1) rests on this
+    being visible.
     """
     lease = Lease(
         lease_id=str(uuid.uuid4()),
@@ -2025,6 +2126,7 @@ def _lease_scope(writer: StateWriter, ctx: _BucketContext, candidate_hwm, lookba
                 bucket=ctx.bucket_name,
                 cause=f"Failed to release lease (checkpoint not advanced): {exc}",
             ))
+            result.errored = True
         else:
             holder.release_ok = True
 
@@ -2221,9 +2323,18 @@ def _escalate_journal_unavailable(
     A missing journal fails identically on every subsequent interval, so
     without rate limiting the alert would repeat for as long as the
     prerequisite went unmet: every 15 minutes by default, indefinitely.
-    :meth:`StateWriter.claim_journal_unavailable_alert` bounds that to one
+    :meth:`StateWriter.journal_unavailable_alert_due` bounds that to one
     notification per :data:`JOURNAL_UNAVAILABLE_REALERT_INTERVAL`, which both
     keeps an unmet prerequisite visible and stops it flooding an inbox.
+
+    The interval is recorded only after delivery has been attempted and did not
+    raise, matching the report-missing path in
+    :mod:`src.lambda_handler`. Recording it first would spend the interval on an
+    alert a failed SNS or CloudWatch Logs call never delivered, leaving a
+    stalled bucket unannounced for a whole interval while the condition
+    persisted every run. The write is safe in that position because this
+    function is reached only from :func:`_read_journal_window` on a path that
+    abandons the bucket, so no later write depends on the ETag it advances.
 
     Unlike :func:`_escalate_submission_failure`, this never disables the
     bucket. A submission failure of that class is a defect in the Solution that
@@ -2235,15 +2346,17 @@ def _escalate_journal_unavailable(
     if ctx.on_journal_unavailable is None:
         return
 
+    now = datetime.now(tz=UTC)
+
     try:
-        should_alert = writer.claim_journal_unavailable_alert(
-            bucket_name, now=datetime.now(tz=UTC),
+        should_alert = writer.journal_unavailable_alert_due(
+            bucket_name, now=now,
         )
     except Exception as exc:  # noqa: BLE001
         observability.emit(observability.log_error(
             component=_COMPONENT,
             bucket=bucket_name,
-            cause=f"Failed to claim journal-unavailable alert: {exc}",
+            cause=f"Failed to read journal-unavailable alert record: {exc}",
         ))
         # A duplicate notification is a smaller failure than a lost one.
         should_alert = True
@@ -2259,6 +2372,18 @@ def _escalate_journal_unavailable(
             bucket=bucket_name,
             cause=f"Journal-unavailable alert callback failed: {cb_exc}",
         ))
+        # Suppression stays unset, so the next interval alerts again rather
+        # than going quiet for an interval over an alert nobody received.
+        return
+
+    try:
+        writer.record_journal_unavailable_alert(bucket_name, now=now)
+    except Exception as exc:  # noqa: BLE001
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=bucket_name,
+            cause=f"Failed to record journal-unavailable alert: {exc}",
+        ))
 
 
 def _escalate_submission_failure(
@@ -2272,6 +2397,15 @@ def _escalate_submission_failure(
 
     Increments the failure streak, fires the first-occurrence alert, and
     disables the bucket at the configured threshold.
+
+    The increment stays *before* the alert here, unlike
+    :func:`_escalate_journal_unavailable`, because the streak is not a
+    suppression token: it is also the counter the circuit breaker disables on.
+    Withholding it when a publish fails would keep re-alerting but would also
+    stop the streak ever reaching ``max_batch_job_failures``, so a permanent
+    client defect would retry forever and never disable the bucket. A failed
+    first-occurrence publish therefore costs the early warning only; the
+    threshold alert still fires, on a streak this function keeps advancing.
 
     Returns True if the bucket was disabled at threshold.
     """
@@ -2440,6 +2574,7 @@ def _persist_submission(
     ctx: _BucketContext,
     writer: StateWriter,
     last_submission: SubmissionRecord | None,
+    result: _BucketResult,
     *,
     terminal_job_ids: Collection[str] = (),
     completion_tracking_enabled: bool = True,
@@ -2454,10 +2589,18 @@ def _persist_submission(
     ``StateStore.record_submission``.
 
     Best-effort: the job is already submitted and the checkpoint already
-    advanced, so a persistence failure here is non-fatal. It costs the audit
-    convenience of the in-state record (the job id is also captured in the
-    submission and audit log entries) and defers pruning to the next successful
-    submission.
+    advanced, so a persistence failure here is non-fatal — it never replaces the
+    outcome of the run. It costs the audit convenience of the in-state record
+    (the job id is also captured in the submission and audit log entries) and
+    defers pruning to the next successful submission.
+
+    Non-fatal is not invisible, which is why ``result`` is passed in:
+    ``result.errored`` is set so the failure publishes a ``BucketErrors`` datum.
+    Because the checkpoint advanced before this write was attempted, the lost
+    record leaves a billed job that nothing tracks, over a range the watermark
+    has already passed, and there is no rollback available. The accepted
+    persist-before-advance ordering risk (scan-aa27a832-remediation Requirement
+    11.3) rests on that being visible.
     """
     if last_submission is None:
         return
@@ -2478,6 +2621,7 @@ def _persist_submission(
             ),
         )
         observability.emit(entry)
+        result.errored = True
 
 
 # ---------------------------------------------------------------------------
@@ -2673,25 +2817,61 @@ def run_interval(
                 bucket_results.append(skip.metrics)
             continue
 
-        result = _process_bucket(
-            bucket=bucket,
-            store=store,
-            factory=factory,
-            state_bucket=state_bucket,
-            athena_workgroup=athena_workgroup,
-            athena_output_location=athena_output_location,
-            account_id=account_id,
-            batch_operations_role_arn=batch_operations_role_arn,
-            kms_key_arn=kms_key_arn,
-            lookback=lookback,
-            on_bucket_disabled=on_bucket_disabled,
-            on_submission_failure=on_submission_failure,
-            on_journal_unavailable=on_journal_unavailable,
-            max_batch_job_failures=max_batch_job_failures,
-            completion_report_topic_arn=completion_report_topic_arn,
-            journal_read_row_cap=journal_read_row_cap,
-            max_concurrent_jobs=max_concurrent_jobs,
-        )
+        # _process_bucket documents that any skip or error is logged and the
+        # function returns with partial counters, without raising. This handler
+        # enforces that contract at the boundary instead of trusting it: without
+        # it, one unexpected exception — a malformed watermark_low escaping
+        # deserialize_submission_record is the known trigger — aborts every
+        # remaining bucket in the run, so a fault in one bucket's state object
+        # silently stops replication for all the others.
+        try:
+            result = _process_bucket(
+                bucket=bucket,
+                store=store,
+                factory=factory,
+                state_bucket=state_bucket,
+                athena_workgroup=athena_workgroup,
+                athena_output_location=athena_output_location,
+                account_id=account_id,
+                batch_operations_role_arn=batch_operations_role_arn,
+                kms_key_arn=kms_key_arn,
+                lookback=lookback,
+                on_bucket_disabled=on_bucket_disabled,
+                on_submission_failure=on_submission_failure,
+                on_journal_unavailable=on_journal_unavailable,
+                max_batch_job_failures=max_batch_job_failures,
+                completion_report_topic_arn=completion_report_topic_arn,
+                journal_read_row_cap=journal_read_row_cap,
+                max_concurrent_jobs=max_concurrent_jobs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            observability.emit(observability.log_error(
+                component=_COMPONENT,
+                bucket=bucket.name,
+                cause=(
+                    f"Processing raised unexpectedly: {exc}. Skipping the "
+                    f"bucket this run; the remaining buckets are unaffected."
+                ),
+            ))
+            # An errored BucketMetrics entry, matching the shape
+            # _check_bucket_disabled uses for its read-failure path, so
+            # BucketErrors is not silently zero for a run that lost a bucket.
+            bucket_results.append(
+                BucketMetrics(
+                    source_bucket=bucket.name,
+                    ops_read=0,
+                    matched=0,
+                    submitted=0,
+                    errored=True,
+                )
+            )
+            # outstanding_jobs stays None — unknown, not zero. Processing blew up
+            # at an unknown point, so whether the DescribeJob loop ran is not
+            # known, and a report claiming nothing remains in tracking would be
+            # a false all-clear.
+            bucket_run_state[bucket.name] = _BucketRunState()
+            continue
+
         bucket_run_state[bucket.name] = _BucketRunState(
             outstanding_jobs=result.outstanding_jobs,
             submission_deferred=result.submission_deferred,
@@ -3051,6 +3231,12 @@ def _prepare_state_and_recovery(
             ctx, state_writer, state, recovery, result
         )
         if new_watermark is None:
+            # Threshold breach: the bucket has been disabled, which is durable and
+            # is the whole of the work this scoring authorized — there is no
+            # rollback on this path, and the bucket submits nothing again until an
+            # operator re-enables it. Commit the flag so a re-enabled bucket is not
+            # re-disabled by the same historical failures.
+            _commit_recovery_scored(state_writer, job_check.newly_scored_job_ids)
             return None
         checkpoint_watermark = new_watermark
 
@@ -3220,7 +3406,7 @@ def _process_bucket(
     # Acquire lease after dedup — when candidate_hwm is None there is nothing
     # to lease, so use a no-op context manager.
     lease_cm = (
-        _lease_scope(writer, ctx, candidate_hwm, lookback)
+        _lease_scope(writer, ctx, candidate_hwm, lookback, result)
         if candidate_hwm is not None
         else contextlib.nullcontext(_LeaseHolder())
     )
@@ -3264,10 +3450,20 @@ def _process_bucket(
         if holder.submitted_refs is not None:
             result.progressed = True
         _persist_submission(
-            ctx, writer, sub_outcome.last_submission,
+            ctx, writer, sub_outcome.last_submission, result,
             terminal_job_ids=job_check.terminal_job_ids,
             completion_tracking_enabled=bool(completion_report_topic_arn),
         )
+
+    # The readmission is consumed here and nowhere earlier: a job has been
+    # submitted for the window the rollback widened, so the rolled-back range is
+    # covered by billed work whether or not the record persisted above. Every
+    # earlier return — the concurrency deferral, a journal read failure, a
+    # preflight or manifest write failure, a submission failure, a lease failure —
+    # leaves the flag uncommitted, so the next run scores the job again and
+    # readmits the same range. Requirements 5.1, 5.2.
+    if sub_outcome.succeeded:
+        _commit_recovery_scored(writer, job_check.newly_scored_job_ids)
 
     # A job submitted by this run is outstanding too, and the completion report is
     # built after this returns, so the count a subscriber sees has to include it.

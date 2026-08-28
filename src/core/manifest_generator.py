@@ -237,6 +237,13 @@ class ManifestGenerator:
 
         Used by the orchestrator to enrich TrackedObjects with timestamps
         for the completion report email.
+
+        A null version is keyed ``""`` rather than ``None`` because this dict is
+        typed ``tuple[str, str]``. That is a transport form, not a second
+        identity — real S3 version IDs are never empty — and
+        ``StateStore.store_completion_timestamps`` normalizes it back to ``None``
+        before building the state-object key, so it matches what the BOPS report
+        reader holds on the read side.
         """
         bucket_entries = self._entries.get(source_bucket, {})
         ts_map = self._timestamps.get(source_bucket, {})

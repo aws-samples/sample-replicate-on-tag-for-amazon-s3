@@ -2,6 +2,89 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.0] — 2026-08-28
+
+> **Behavior change.** The Solution no longer submits objects that are matched
+> only by a disabled replication rule. See
+> [A Disabled replication rule no longer drives replication](#a-disabled-replication-rule-no-longer-drives-replication).
+
+- **Security.** The stack's setup functions take every privileged value from the
+  stack's own parameters, never from the caller, and refuse a request carrying
+  another stack's identifier. An in-account caller cannot choose the principal
+  given Lake Formation administrator rights, the permissions given up, the buckets
+  the Solution monitors, the Region, the check frequency, or the KMS key, so it can
+  neither grant itself those rights nor drop a bucket out of replication. Which
+  principals may invoke those functions at all is an account control rather than a
+  stack one: deny `lambda:InvokeFunction` on them outside the deployment role.
+  See [Required AWS Permissions](docs/permissions.md).
+- **Security.** The stack takes Lake Formation administrator rights only in an
+  account whose Glue Data Catalog uses Lake Formation. In IAM mode, the
+  documented default, it takes none. A stack deletion that cannot give those
+  rights up logs an error naming the ARN left behind and the call that removes it.
+- The Solution acts on a tag-scoped replication rule only while its `Status` reads
+  `Enabled`, ignoring case and surrounding spaces. Any other value, a missing one
+  included, means the rule is ignored. A bucket left with no enabled tag-scoped
+  rule is skipped, and the log gives that as the reason.
+- The log entry for a task that fails with `SrcObjectNotEligible` names both known
+  causes, since S3's own error names none: the object is in an archived storage
+  class, or the rule that matched it is disabled.
+- A bucket with a replication rule that scopes both a key prefix and object tags
+  replicates. The count query the Solution runs before submitting such a bucket is
+  valid Athena SQL, so the bucket is no longer skipped every run with an
+  `Escape string must be a single character` error.
+- When the Athena query that bounds a run's journal read fails, the bucket is
+  skipped for that interval with its journal position unchanged, and the run
+  publishes a `BucketErrors` datum alongside a `Row-count boundary lookup failed`
+  error entry. The next interval reads the window whole. See
+  [Journal read budget errors](docs/monitoring.md#journal-read-budget-errors).
+- Three further failures publish the same datum with an error entry naming the
+  cause: a lease the run cannot release, which otherwise filters every operation
+  below its watermark out of later runs; a submission record it cannot write,
+  leaving a billed Batch Operations job untracked; and an unexpected error in one
+  bucket's processing, which is confined to that bucket so the rest of the run
+  continues.
+- Objects from a failed Batch Operations job count as handled only once their
+  resubmission has gone out, so a run that stops short of submitting leaves the
+  work for the next run.
+- Each of the three completion tracking maps holds at most 10,000 entries per
+  bucket, evicting oldest first and logging every eviction. A write never discards
+  its own entries, so an interval writing more than that leaves the map above the
+  ceiling and logs how many entries it holds, with tagging fewer objects per
+  interval or a lower `JournalReadRowCap` as the levers.
+- The journal-unavailable alert is limited to one a day, counted from a delivered
+  alert. If sending the alert fails, the next run tries again instead of waiting
+  out the day.
+- `docs/hardening.md` and `docs/kms.md` describe the completion report body
+  correctly: per-bucket counts, outcomes, rule IDs, destination bucket names, and
+  tag and last-modified timestamp ranges, with no object keys or version IDs. The
+  `SnsKmsKeyArn` recommendation stands. See
+  [Completion Reporting](docs/completion-reporting.md).
+
+### A Disabled replication rule no longer drives replication
+
+S3 does not replicate an object matched only by a disabled rule, so nothing that
+was reaching a destination stops reaching it. What stops is the wasted effort: one
+billed failing task per matched object, the `FAILED` rows and "action needed"
+emails those tasks produce, and those failures counting toward
+`MaxBatchJobFailures`, which can auto-disable the bucket along with its enabled
+rules.
+
+To replicate against a rule, set its `Status` to `Enabled` in the bucket's
+replication configuration and tag the objects.
+
+### Upgrading from 1.1.0
+
+An ordinary stack update. No parameters are added or removed, and the State
+Bucket, every source bucket's checkpoint, and every object still being tracked for
+a completion email are preserved.
+
+An account that already has a data lake administrator registered by an earlier
+version keeps it. Registration is evaluated only when the stack is created, so the
+new IAM-mode rule applies to a new stack; an existing stack still gives those
+rights up when it is deleted. To drop the entry sooner, remove it with
+`aws lakeformation put-data-lake-settings` and confirm with
+`aws lakeformation get-data-lake-settings`.
+
 ## [1.1.0] — 2026-08-27
 
 > **Action required before upgrading.**

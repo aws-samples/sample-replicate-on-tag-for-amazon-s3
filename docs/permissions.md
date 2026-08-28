@@ -83,6 +83,31 @@ is conditional on the object not already existing, so it cannot overwrite a
 checkpoint the Lambda has since advanced. Deleting the stack removes only the
 config object; checkpoints remain.
 
+## Custom resource caller trust
+
+Nothing in CloudFormation stops an in-account principal holding
+`lambda:InvokeFunction` from calling a custom resource function with an event of
+its own. Two controls apply to the three that change something, the config
+resource and both Lake Formation granters:
+
+- Each privileged value comes from an environment variable the template sets, not
+  from the invoking event. The principal registered as a Lake Formation
+  administrator, the principal and namespace list the journal grants name, and the
+  State Bucket and config key the config resource writes are all fixed at deploy
+  time.
+- Each handler compares the event's `StackId` against the stack's own and stops
+  before any change when they differ, responding `FAILED` with a non-specific
+  reason. Both Lake Formation granters also log the rejection at `ERROR` in their
+  own log groups.
+
+The [code package validation](#code-package-validation-role) resource only reads,
+so it carries neither control.
+
+Neither control is visible during a normal deployment. They matter when some
+other principal in the account can invoke the functions, which is the case
+whenever `lambda:InvokeFunction` is granted broadly, as it often is to a
+deployment automation role.
+
 ## Code package validation role
 
 Before the stack builds a Lambda around the zip that `CodeLocation` names, a
@@ -148,7 +173,24 @@ Formation data lake administrator.
 | Scenario | What to do |
 |---|---|
 | You manage Lake Formation administrators centrally | Set `LFAdminRoleArn` to an existing Lake Formation administrator role ARN. It must carry the IAM permissions listed below. |
-| No dedicated Lake Formation administrator role | Leave `LFAdminRoleArn` empty. The Solution elevates `LFGranterRole` automatically with exponential backoff retry. The elevation is reversed on stack DELETE. |
+| No dedicated Lake Formation administrator role | Leave `LFAdminRoleArn` empty. In Lake Formation mode the Solution registers `LFGranterRole` as an administrator itself, retrying with exponential backoff. In IAM mode, the default, it registers nothing. The registration is removed on stack DELETE. |
+
+The registration is gated on catalog mode, detected the same way as the grant
+path above. An IAM-mode account therefore gains no account-wide Lake Formation
+administrator, because it needs no grants. If mode detection cannot complete, the
+custom resource fails rather than assuming a mode, which fails the deployment.
+
+On stack DELETE the removal is attempted whatever the current mode, so an
+administrator registered while the catalog was in Lake Formation mode stays
+removable after a mode change. A removal failure is logged at `ERROR` in the
+`LFAdminGranter` function's log group and stack deletion continues, so the stack
+does not wedge in `DELETE_FAILED`. An account-wide administrator entry then
+outlives the stack, with that log line as the only signal, so confirm the
+account's administrators after deleting a stack that registered one:
+
+```bash
+aws lakeformation get-data-lake-settings --region "$REGION" --no-cli-pager
+```
 
 ### Permissions required on a supplied `LFAdminRoleArn`
 

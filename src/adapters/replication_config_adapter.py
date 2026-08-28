@@ -7,7 +7,7 @@ along the way.
 
 Report-and-skip conditions (Requirements 3.4, 3.5, 3.6, 12.5, 13.5):
 - No Replication_Configuration attached to the bucket.
-- Zero tag-scoped replication rules in the configuration.
+- Zero enabled tag-scoped replication rules in the configuration.
 - Configuration is unreadable (any non-permission exception).
 - Missing ``s3:GetBucketReplication`` permission (AccessDenied).
 
@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import botocore.exceptions
 
 from src.core.models import DerivedReplicationRule, MonitoredBucket
-from src.core.rule_deriver import derive_rules
+from src.core.rule_deriver import count_disabled_tag_scoped_rules, derive_rules
 
 # Component identifier embedded in every SkipReport emitted by this adapter.
 _COMPONENT = "GetBucketReplication adapter"
@@ -69,8 +69,11 @@ def get_replication_rules(
       (Req. 12.5)
     * **Unreadable configuration** (any other exception):
       The configuration could not be read for any other reason. (Req. 3.6)
-    * **Zero tag-scoped rules**: The configuration exists but contains no
-      replication rules that specify a tag filter. (Req. 3.5)
+    * **Zero enabled tag-scoped rules**: The configuration exists but contains
+      no ``Enabled`` replication rules that specify a tag filter. (Req. 3.5)
+      When rules were excluded only for not being ``Enabled``, the skip reason
+      says so, since that is a different operator action from an untagged
+      configuration. (Req. 3.1)
 
     Parameters
     ----------
@@ -143,15 +146,24 @@ def get_replication_rules(
     derived = derive_rules(bucket_name, response)
 
     if not derived:
-        # Req. 3.5 — configuration exists but has zero tag-scoped rules.
-        return [], [
-            SkipReport(
-                source_bucket=bucket_name,
-                reason=(
-                    "Replication_Configuration contains zero"
-                    " tag-scoped replication rules."
-                ),
+        # Req. 3.5 — configuration exists but has zero tag-scoped rules that
+        # can drive replication. A rule carrying a tag filter but not Enabled
+        # is excluded by derive_rules (Req. 3.1), and rule_deriver is pure and
+        # logs nothing, so name that cause here rather than leaving the
+        # operator to read this as an untagged configuration.
+        disabled_tag_scoped = count_disabled_tag_scoped_rules(response)
+        reason = (
+            "Replication_Configuration contains zero enabled"
+            " tag-scoped replication rules."
+        )
+        if disabled_tag_scoped:
+            reason += (
+                f" {disabled_tag_scoped} tag-scoped rule(s) were excluded for"
+                " not having Status Enabled; S3 replicates nothing against a"
+                " Disabled rule."
             )
+        return [], [
+            SkipReport(source_bucket=bucket_name, reason=reason)
         ]
 
     return derived, []

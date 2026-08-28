@@ -103,6 +103,13 @@ from src.core.models import (
 # with the "\x00" key/version separator.
 _NULL_VERSION_SENTINEL = "\x01"
 
+#: Public alias of :data:`_NULL_VERSION_SENTINEL`, for the same reason
+#: :func:`item_key` aliases :func:`_item_key`: ``src.adapters.state_store`` has
+#: to recognize a null-version item key in order to find an enrichment entry
+#: written under the pre-Requirement-8.2 ``""`` form, and should not reach into
+#: a private name to do it.
+NULL_VERSION_SENTINEL = _NULL_VERSION_SENTINEL
+
 
 def _item_key(object_key: str, version_id: str | None) -> str:
     """Build the ``"<object_key>\\x00<version_id-or-sentinel>"`` item key.

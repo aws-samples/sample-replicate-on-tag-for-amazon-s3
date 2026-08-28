@@ -19,6 +19,10 @@ from src.core.rule_matcher import _rule_satisfies
 
 _DEST = DestinationRef(bucket_arn="arn:aws:s3:::dst")
 
+# One backslash character.  Spelled as a named constant so the LIKE/ESCAPE
+# assertions below read unambiguously at the character level.
+_BACKSLASH = "\\"
+
 
 def _rule(
     tag_filter: dict,
@@ -55,6 +59,48 @@ class TestBuildRulePredicate:
         pred = build_rule_predicate([_rule({"env": "prod"}, key_prefix="data/")])
         assert "LIKE" in pred
         assert "data/" in pred
+
+    def test_prefix_emits_single_character_escape_clause(self):
+        """The emitted ESCAPE value is exactly one backslash character.
+
+        Athena rejects a two-character ESCAPE value outright with
+        ``INVALID_FUNCTION_ARGUMENT: Escape string must be a single
+        character``, so the whole preflight query fails and the bucket makes
+        no progress.  Asserted at the character level rather than with
+        ``"ESCAPE" in pred`` so a regression to four source backslashes fails
+        here.
+        """
+        pred = build_rule_predicate([_rule({"env": "prod"}, key_prefix="data/")])
+
+        expected = (
+            "((element_at(object_tags, 'env') = 'prod'"
+            " AND key LIKE 'data/%' ESCAPE '" + _BACKSLASH + "'))"
+        )
+        assert pred == expected
+        assert "ESCAPE '" + _BACKSLASH + "'" in pred
+        assert _BACKSLASH * 2 not in pred
+
+    def test_prefix_with_like_metacharacters_keeps_single_character_escape(self):
+        r"""A prefix carrying ``\``, ``%``, and ``_`` is escaped against one escape char.
+
+        ``_escape_like_pattern`` doubles a literal backslash and prefixes ``%``
+        and ``_`` with one, all of which is read against a single-character
+        ESCAPE value.  This pins that interaction: the doubling appears in the
+        pattern, and does not leak into the ESCAPE clause.
+        """
+        prefix = "a" + _BACKSLASH + "b%c_d"
+        pred = build_rule_predicate([_rule({"env": "prod"}, key_prefix=prefix)])
+
+        expected_pattern = (
+            "a" + _BACKSLASH * 2 + "b" + _BACKSLASH + "%c" + _BACKSLASH + "_d%"
+        )
+        expected = (
+            "((element_at(object_tags, 'env') = 'prod'"
+            " AND key LIKE '" + expected_pattern + "' ESCAPE '" + _BACKSLASH + "'))"
+        )
+        assert pred == expected
+        assert "ESCAPE '" + _BACKSLASH + "'" in pred
+        assert "ESCAPE '" + _BACKSLASH * 2 not in pred
 
     def test_two_rules_are_ored(self):
         r1 = _rule({"env": "prod"}, rule_id="r1")

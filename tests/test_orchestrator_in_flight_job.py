@@ -1144,12 +1144,15 @@ class TestATerminalOutcomeIsScoredOnlyOnce:
 
         assert check.terminal_job_ids == ["job-failed"]
 
-    def test_scoring_a_job_persists_the_flag(self):
-        _, _, writer = self._run("Failed", recovery_scored=False)
+    def test_scoring_a_job_reports_it_rather_than_committing_the_flag(self):
+        """The flag authorizes a rollback that is in memory until a resubmission
+        makes it durable, so this loop reports the id and the caller commits it
+        once that work has landed (Requirements 5.1, 5.2)."""
+        check, _, writer = self._run("Failed", recovery_scored=False)
 
-        writer.mark_report_diagnosed.assert_called_once()
-        kwargs = writer.mark_report_diagnosed.call_args.kwargs
-        assert kwargs["recovery_scored"] is True
+        assert check.newly_scored_job_ids == ["job-failed"]
+        for call in writer.mark_report_diagnosed.call_args_list:
+            assert call.kwargs.get("recovery_scored") is not True
 
     def test_an_already_scored_and_diagnosed_job_writes_nothing(self):
         """Neither flag changes, so the write is skipped: a conditional write per
@@ -1182,10 +1185,11 @@ class TestATerminalOutcomeIsScoredOnlyOnce:
 
         writer.mark_report_diagnosed.assert_not_called()
 
-    def test_the_flag_is_persisted_even_when_the_report_cannot_be_read(self):
+    def test_an_unreadable_report_still_scores_and_still_defers_the_flag(self):
         """The case that makes re-scoring reachable at all: an unreadable report
-        leaves report_diagnosed False, so without a separate flag there is nothing
-        recording that the outcome was already acted on."""
+        leaves report_diagnosed False, so the separate recovery_scored flag is
+        what records that the outcome was acted on. It is still not written here —
+        neither flag is, since diagnosis did not happen either."""
         from src import orchestrator
         from src.adapters import bops_report_reader
 
@@ -1219,9 +1223,8 @@ class TestATerminalOutcomeIsScoredOnlyOnce:
             )
 
         assert len(check.outcomes) == 1  # scored this run
-        kwargs = writer.mark_report_diagnosed.call_args.kwargs
-        assert kwargs["recovery_scored"] is True
-        assert kwargs["report_diagnosed"] is False
+        assert check.newly_scored_job_ids == ["job-unreadable"]
+        writer.mark_report_diagnosed.assert_not_called()
 
 
 class TestTheSeedComesFromTheNewestRecords:

@@ -542,13 +542,43 @@ class TestFailureFallbacks:
         assert w.result.errored is True
         w.read_journal.assert_not_called()
 
-    def test_boundary_failure_proceeds_uncapped(self):
-        """Existing behavior, unchanged."""
+    def test_boundary_failure_skips_the_bucket_and_reads_nothing(self):
+        """A failed boundary lookup gets the same answer as a failed tail-floor
+        lookup: the read window cannot be established, so the bucket is skipped
+        for the interval with its checkpoint unchanged.
+
+        The alternative this replaces proceeded with ``until_timestamp`` at
+        ``None``, which reads every row tagged since the watermark in one
+        invocation. ``read_journal`` emits no ``LIMIT``, so the predicate just
+        lost was the only bound on the read, and the row cap the ceilings in
+        ``row_cap_validation`` are enforced against no longer holds.
+        """
         w = _read_window(boundary=RuntimeError("boom"))
-        assert w.until is None
+        assert w.returned is None
+        assert w.result.errored is True
         assert w.result.capped is False
-        assert w.returned is not None
-        assert w.errors("Row-count boundary check failed") != []
+        w.read_journal.assert_not_called()
+
+    def test_boundary_failure_leaves_the_checkpoint_able_to_retry(self):
+        """Nothing was read and no capping is claimed, so the next interval
+        reads the window whole. The backlog is untouched rather than partially
+        consumed."""
+        w = _read_window(boundary=RuntimeError("boom"))
+        assert w.returned is None
+        assert w.result.capped is False
+        assert w.audits("journal_read_capped") == []
+
+    def test_boundary_failure_names_the_cause_and_the_reasoning(self):
+        w = _read_window(boundary=RuntimeError("boom"))
+        assert w.returned is None, (
+            "the message below describes a skip, so it has to be a skip"
+        )
+        errors = w.errors("Row-count boundary lookup failed")
+        assert len(errors) == 1
+        cause = errors[0]["cause"]
+        assert "Skipping this bucket" in cause
+        assert "unbounded in memory" in cause
+        assert "checkpoint is left unchanged" in cause
 
 
 # ---------------------------------------------------------------------------

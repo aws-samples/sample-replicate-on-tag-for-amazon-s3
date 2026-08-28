@@ -1,8 +1,13 @@
 """Pure rule derivation logic for tag-based S3 replication.
 
 Accepts a parsed ``GetBucketReplication`` response dict and emits one
-``DerivedReplicationRule`` for every replication rule that carries a tag
-filter.  Rules with no tag filter are excluded per Requirement 3.3.
+``DerivedReplicationRule`` for every enabled replication rule that carries a
+tag filter.  Rules with no tag filter are excluded per Requirement 3.3, and
+rules whose ``Status`` is not ``Enabled`` are excluded because S3 will not
+replicate against them: a Batch Replication task for an object matched only by
+a ``Disabled`` rule fails with ``SrcObjectNotEligible`` and moves no data, so
+submitting one is a billed failure that also feeds the consecutive-failure
+circuit breaker.
 
 Results are naturally grouped by ``(source_bucket, replication_config_id)``
 via the fields on each returned ``DerivedReplicationRule`` — the
@@ -36,9 +41,10 @@ def derive_rules(
     Returns
     -------
     list[DerivedReplicationRule]
-        One entry per rule in *replication_config* that specifies at least
-        one tag key-value pair in its filter.  Rules with no tag filter
-        (prefix-only or absent filter) are excluded (Req. 3.3).
+        One entry per rule in *replication_config* that is ``Enabled`` and
+        specifies at least one tag key-value pair in its filter.  Rules with
+        no tag filter (prefix-only or absent filter) are excluded (Req. 3.3),
+        as are rules whose ``Status`` is not ``Enabled``.
 
         Each ``DerivedReplicationRule`` carries:
 
@@ -52,12 +58,15 @@ def derive_rules(
         Results preserve the ordering of rules in the configuration and are
         grouped implicitly by ``(source_bucket, replication_config_id)``.
     """
-    # Accept both the full boto3 response and the inner config dict.
-    inner: dict = replication_config.get("ReplicationConfiguration", replication_config)
-    rules: list[dict] = inner.get("Rules", [])
+    rules: list[dict] = _inner_config(replication_config).get("Rules", [])
 
     derived: list[DerivedReplicationRule] = []
     for rule in rules:
+        if not is_rule_enabled(rule):
+            # Status is not "Enabled" — S3 replicates nothing against this
+            # rule, so exclude it (Req. 3.1).
+            continue
+
         rule_id: str = rule.get("ID", "")
         tag_filter, key_prefix = _extract_tag_filter_and_prefix(rule)
 
@@ -83,8 +92,52 @@ def derive_rules(
 
 
 # ---------------------------------------------------------------------------
-# Internal helper
+# Helpers
 # ---------------------------------------------------------------------------
+
+
+def _inner_config(replication_config: dict) -> dict:
+    """Accept both the full boto3 response and the inner config dict."""
+    return replication_config.get("ReplicationConfiguration", replication_config)
+
+
+def count_disabled_tag_scoped_rules(replication_config: dict) -> int:
+    """Count rules that carry a tag filter but are excluded for not being enabled.
+
+    This module is pure and logs nothing, so a rule dropped by
+    :func:`is_rule_enabled` leaves no trace. When the dropped rule was the
+    bucket's only tag-scoped rule, the bucket is skipped for the interval and
+    the only operator-facing signal is the caller's skip report — which would
+    otherwise say the configuration carries no tag-scoped rules at all, naming
+    the wrong cause. ``replication_config_adapter`` calls this to distinguish
+    the two (Req. 3.1).
+    """
+    count = 0
+    for rule in _inner_config(replication_config).get("Rules", []):
+        if is_rule_enabled(rule):
+            continue
+        tag_filter, _ = _extract_tag_filter_and_prefix(rule)
+        if tag_filter:
+            count += 1
+    return count
+
+
+def is_rule_enabled(rule: dict) -> bool:
+    """Return ``True`` iff *rule* carries ``Status: "Enabled"`` (Req. 3.1).
+
+    ``GetBucketReplication`` always returns ``Status`` for every rule, and the
+    API accepts only ``"Enabled"`` and ``"Disabled"``. Anything else —
+    including an absent ``Status`` — is treated as not enabled, so an
+    unexpected rendering excludes the rule rather than driving replication
+    against a rule S3 will not honour. Comparison is whitespace-tolerant and
+    case-insensitive: a value differing only in case still names the enabled
+    state, and reading it as disabled would drop rules the Solution is
+    supposed to act on.
+    """
+    status = rule.get("Status")
+    if not isinstance(status, str):
+        return False
+    return status.strip().upper() == "ENABLED"
 
 
 def _extract_tag_filter_and_prefix(rule: dict) -> tuple[dict[str, str], str | None]:

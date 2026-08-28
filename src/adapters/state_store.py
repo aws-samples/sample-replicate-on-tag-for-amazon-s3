@@ -106,8 +106,10 @@ whether to submit.
 ``completion_timestamps`` and ``completion_routing`` are side maps written at
 manifest-generation time and read back by :meth:`StateStore.merge_completion_configs`,
 which creates the ``TrackedObject`` on a later invocation once the job's BOPS
-report arrives. Both are keyed identically to ``completion_items`` and are
-pruned by :meth:`StateStore.delete_completion_items` when the item they
+report arrives. Both are keyed identically to ``completion_items`` — see
+:func:`_side_map_key`, which normalizes the ``""`` version the manifest
+generator's transport dicts carry to the ``None`` form the reader holds — and
+are pruned by :meth:`StateStore.delete_completion_items` when the item they
 describe is published and removed.
 
 ``completion_items`` is keyed by an item key (not a ``job_id``), since one
@@ -116,6 +118,17 @@ rules — see ``src.core.completion_serializer`` and design.md Decision 2.
 ``completion_processed_job_ids`` is the flat idempotency-gate set: it
 records every ``job_id`` that has already had its manifest entries merged
 into ``completion_items`` (design.md Decision 6).
+
+All three per-object maps are capped at :data:`COMPLETION_SIDE_MAP_CEILING`
+entries per bucket, oldest first, with an error logged per eviction. The cap is
+enforced where each map is written: ``completion_items`` in
+:meth:`StateStore.merge_completion_report`, the two enrichment maps in
+:meth:`StateStore.store_completion_timestamps`. That split matters because
+``delete_completion_items`` — the only prune path — is reached only from the
+publish phase, which returns early when completion tracking is unconfigured.
+On that default stack ``store_completion_timestamps`` still runs, so the
+enrichment maps are the pair that would otherwise grow for the life of the
+stack inside an object read and rewritten several times per interval.
 
 A record whose job has settled — terminal, diagnosed, and either merged or with
 completion tracking switched off — is pruned by the next
@@ -217,6 +230,42 @@ def submission_record_ceiling(max_concurrent_jobs: int) -> int:
     return max_concurrent_jobs + SUBMISSION_RECORD_CEILING_HEADROOM
 
 
+# How many entries each of the three per-object completion side maps may hold
+# for one bucket before the oldest are evicted. One ceiling per map rather than
+# one shared across all three, and the same value for each so an operator has a
+# single number to reason about.
+#
+# Why per-map. ``completion_items`` is the tracking state the publish phase
+# drains; ``completion_timestamps`` and ``completion_routing`` are enrichment
+# for an object that may or may not have an item. A shared budget would let a
+# burst of enrichment writes — the path that runs on a default stack, where no
+# item is ever written — force eviction of items, which is the only one of the
+# three whose loss costs a Completion_Report row. Separate ceilings mean each
+# map's growth is bounded by its own writers.
+#
+# Why 10,000. The binding constraint is the size of the state object, not the
+# entry count: it carries the checkpoint, the lease, and ``submission_records``
+# in the same body, and is read and rewritten several times per interval, so
+# every byte here is paid for repeatedly in ``GetObject``/``PutObject`` and in
+# ``json.loads``. A ``completion_timestamps`` entry serializes to its item key
+# plus two ISO 8601 timestamps (~60 bytes); a ``completion_items`` entry to its
+# key plus one ``ConfigContext`` per rule and the enrichment fields (~400 bytes
+# at one rule). Item keys are object keys, which S3 permits up to 1,024 bytes.
+# At 10,000 entries per map that is roughly 10 MB of JSON for typical
+# 200-byte keys and about 35 MB with keys at the S3 maximum — parseable well
+# inside the smallest supported ``LambdaMemoryMB`` of 1,024, where
+# ``IN_MEMORY_MEMORY_CEILING`` already allows 250,000 materialized journal
+# rows, each far larger than a side-map entry.
+#
+# As with ``submission_records``, reaching the ceiling is not part of the
+# normal lifecycle. The publish path deletes an item and both of its enrichment
+# entries as soon as its report is published, so on a stack with completion
+# tracking configured the maps drain every interval. Eviction is the backstop
+# for the two cases that never drain: an object whose report never arrives, and
+# a default stack, where nothing calls ``delete_completion_items`` at all.
+COMPLETION_SIDE_MAP_CEILING = 10_000
+
+
 def _submitted_at_sort_key(record: SubmissionRecord) -> datetime:
     """``record.submitted_at``, made comparable across records.
 
@@ -257,6 +306,174 @@ def _discard_alert_suppression(
     remaining = [entry for entry in existing if entry not in set(removed_job_ids)]
     if len(remaining) != len(existing):
         payload["completion_report_alerted_configs"] = remaining
+
+
+def _journal_alert_is_due(
+    last_raw: Any,
+    now: datetime,
+    min_interval: timedelta,
+) -> bool:
+    """Whether *min_interval* has elapsed since the recorded alert *last_raw*.
+
+    An absent or unparseable value is due, so a hand-edited or truncated
+    timestamp costs an extra alert rather than silence. A value without a
+    timezone is read in *now*'s.
+    """
+    if not last_raw:
+        return True
+    try:
+        last = datetime.fromisoformat(str(last_raw))
+    except (TypeError, ValueError):
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=now.tzinfo)
+    return now - last >= min_interval
+
+
+def _side_map_key(object_key: str, version_id: str | None) -> str:
+    """The enrichment-map key for *object_key*, normalizing ``""`` to ``None``.
+
+    ``ManifestGenerator.get_timestamps`` / ``get_routing`` key their transport
+    dicts on ``(object_key, version_id or "")``, because those dicts are typed
+    ``tuple[str, str]``. ``completion_serializer.item_key`` treats ``""`` and
+    ``None`` as distinct identities, so passing the transport form straight
+    through wrote a null-version object's entry under ``"a.txt\\x00"`` while
+    :meth:`StateStore.merge_completion_report`, which reads ``version_id`` from
+    the BOPS report and therefore holds ``None``, looked it up under
+    ``"a.txt\\x00\\x01"``. The entry was neither readable nor prunable.
+
+    A real S3 version ID is never the empty string, so ``""`` here can only mean
+    "no version" — the transport form's ``""`` is an artifact of the dict's type,
+    not a second identity. Normalizing it makes both sides agree on the ``None``
+    form.
+
+    Requirements: 8.2
+    """
+    return completion_serializer.item_key(object_key, version_id or None)
+
+
+def _read_side_map_entry(
+    side_map: dict[str, dict],
+    object_key: str,
+    version_id: str | None,
+) -> dict:
+    """Read one enrichment entry, tolerating a legacy ``""``-keyed null version.
+
+    Chosen from design R6's options table: **the reader looks up both keys and
+    the writer emits the ``None`` form**. The alternatives were a one-shot
+    normalizing rewrite, which costs a migration write on an object rewritten
+    several times per interval, and relying on the Requirement 8.1 ceiling
+    alone, which leaves the enrichment miss in place for as long as an orphan
+    survives. This option costs one extra dict lookup, only on a miss, and only
+    for a null-version object; entries written under the old key stay readable
+    until the ceiling evicts them, so nothing has to be migrated and no orphan
+    is created by the fix itself.
+
+    The ceiling from task 7.1 evicts oldest-first regardless of key, so it is the
+    floor under this: an old ``""``-keyed entry drains whether or not it is ever
+    read.
+
+    Requirements: 8.2
+    """
+    entry = side_map.get(_side_map_key(object_key, version_id))
+    if entry is None and not version_id:
+        # Written before this fix: ``item_key(object_key, "")``, no sentinel.
+        entry = side_map.get(completion_serializer.item_key(object_key, ""))
+    return entry or {}
+
+
+def _side_map_key_variants(item_key: str) -> tuple[str, ...]:
+    """*item_key* plus, for a null version, the legacy ``""``-keyed form.
+
+    Used when discarding an evicted item's enrichment entries: an entry written
+    before the Requirement 8.2 fix carries the old key, and popping only the
+    current one would leave exactly the orphan that fix exists to stop creating.
+
+    Requirements: 8.2
+    """
+    sentinel = completion_serializer.NULL_VERSION_SENTINEL
+    if item_key.endswith("\x00" + sentinel):
+        return (item_key, item_key[: -len(sentinel)])
+    return (item_key,)
+
+
+def _evict_side_map_above_ceiling(
+    entries: dict[str, Any],
+    *,
+    source_bucket: str,
+    map_name: str,
+    consequence: str,
+    ceiling: int = COMPLETION_SIDE_MAP_CEILING,
+    protected: Collection[str] = (),
+) -> list[str]:
+    """Evict from *entries*, in place, down to *ceiling*. Returns evicted keys.
+
+    Oldest first, where "oldest" is insertion order. That is arrival order and
+    it survives the JSON round trip, since ``json.loads`` preserves object member
+    order into a ``dict``. The alternative — sorting on a stored timestamp, as
+    ``submission_records`` does on ``submitted_at`` — is not available here:
+    ``completion_routing`` carries no timestamp at all, a ``completion_timestamps``
+    entry can carry ``last_modified`` without ``tagged_at`` or the reverse, and
+    ``tagged_at`` is when the object was tagged rather than when the entry was
+    written. Insertion order is the one ordering all three maps share.
+
+    *protected* keys are never evicted. The caller passes the keys it is writing
+    in this same call, so a write can never discard its own work and leave the
+    caller believing it persisted.
+
+    Each eviction is reported as an error, not an audit entry, for the same reason
+    :meth:`StateStore._evict_above_ceiling` does: it discards tracking state for an
+    object whose replication outcome will now never be reported. Keys are passed
+    through :func:`~src.core.observability.redact_object_key`, since an item key is
+    an object key.
+
+    Requirements: 8.1
+    """
+    if len(entries) <= ceiling:
+        return []
+    protected_keys = set(protected)
+    evicted: list[str] = []
+    for item_key in list(entries):
+        if len(entries) <= ceiling:
+            break
+        if item_key in protected_keys:
+            continue
+        del entries[item_key]
+        evicted.append(item_key)
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=source_bucket,
+            cause=(
+                f"Evicted {map_name} entry for "
+                f"{observability.redact_object_key(item_key)}: more than "
+                f"{ceiling} entries are stored for this bucket, which means "
+                f"entries are being written faster than the publish phase "
+                f"removes them, or nothing is removing them at all — the "
+                f"latter is the case whenever completion tracking is "
+                f"unconfigured. {consequence}"
+            ),
+        ))
+    if len(entries) > ceiling:
+        # Reached only when the keys this write protects are themselves at or
+        # above the ceiling, since every other key is evictable. Protecting them
+        # is deliberate -- a write must not discard its own work -- so the map is
+        # left over the cap, and saying so is the alternative to leaving the
+        # breach silent.
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=source_bucket,
+            cause=(
+                f"{map_name} holds {len(entries)} entries for this bucket, above "
+                f"the {ceiling} ceiling, because this write protects "
+                f"{len(protected_keys)} of them and a write is never allowed to "
+                f"discard its own entries. The state object grows with the "
+                f"overshoot, and it also carries the checkpoint, the lease, and "
+                f"the submission records. Reduce the number of objects tagged per "
+                f"interval, or lower JournalReadRowCap, so a single interval "
+                f"writes fewer than {ceiling} entries."
+            ),
+        ))
+    return evicted
 
 
 def _submission_records_by_job_id(
@@ -1329,6 +1546,14 @@ class StateStore:
         ``job_id`` to the processed set. It then writes both fields in one
         ETag-guarded state payload, so a mapping, serialization, or conditional
         write failure cannot record a processed job without its outcomes.
+
+        ``completion_items`` is capped at :data:`COMPLETION_SIDE_MAP_CEILING`
+        entries for this bucket in the same write, oldest first, excluding the
+        items this report resolved. An evicted item's ``completion_timestamps``
+        and ``completion_routing`` entries go with it, since nothing can publish
+        them once the item is gone. See :func:`_evict_side_map_above_ceiling`.
+
+        Requirements: 8.1
         """
         key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
@@ -1354,12 +1579,14 @@ class StateStore:
                 if timestamps and (timestamp := timestamps.get((object_key, version_id or ""))):
                     tagged_at, last_modified = timestamp
                 if tagged_at is None and last_modified is None:
-                    ts_entry = stored_ts.get(merge_key) or {}
+                    ts_entry = _read_side_map_entry(stored_ts, object_key, version_id)
                     if tagged_at_raw := ts_entry.get("tagged_at"):
                         tagged_at = datetime.fromisoformat(tagged_at_raw)
                     if last_modified_raw := ts_entry.get("last_modified"):
                         last_modified = datetime.fromisoformat(last_modified_raw)
-                routing_entry = stored_routing.get(merge_key) or {}
+                routing_entry = _read_side_map_entry(
+                    stored_routing, object_key, version_id
+                )
                 existing_item = TrackedObject(
                     source_bucket=source_bucket,
                     object_key=object_key,
@@ -1403,6 +1630,36 @@ class StateStore:
                 destinations=existing_item.destinations,
             )
 
+        # Bound the map before serializing, protecting the keys this report just
+        # resolved: they are the ones the publish phase is about to read, and
+        # evicting them would discard the outcome this call exists to record.
+        evicted_items = _evict_side_map_above_ceiling(
+            existing_items,
+            source_bucket=source_bucket,
+            map_name="completion_items",
+            protected=[
+                completion_serializer.item_key(object_key, version_id)
+                for object_key, version_id in seen_identities
+            ],
+            consequence=(
+                "That object's replication outcome will not appear in any "
+                "Completion_Report."
+            ),
+        )
+        # Coordinated one way only. An evicted item can never be published, so
+        # its enrichment entries are orphans by construction and go with it.
+        # Eviction from the enrichment maps does not touch the item, because an
+        # item without enrichment still publishes — with empty tagged_at and
+        # matched_rules columns, which is cosmetic.
+        for evicted_key in evicted_items:
+            for key in _side_map_key_variants(evicted_key):
+                stored_ts.pop(key, None)
+                stored_routing.pop(key, None)
+        if stored_ts:
+            payload["completion_timestamps"] = stored_ts
+        if stored_routing:
+            payload["completion_routing"] = stored_routing
+
         serialized_items = completion_serializer.serialize_completion_items(existing_items)
         processed_ids = completion_serializer.deserialize_processed_job_ids(payload)
         processed_ids.add(job_id)
@@ -1428,16 +1685,28 @@ class StateStore:
 
         Stores (tagged_at, last_modified) under ``completion_timestamps`` and,
         when *routing* is supplied, (matched_rules, destinations) under
-        ``completion_routing`` — both keyed by
-        ``completion_serializer.item_key`` so that merge_completion_configs can
-        enrich TrackedObjects on a later invocation when the BOPS report
-        arrives.
+        ``completion_routing`` — both keyed by :func:`_side_map_key` so that
+        merge_completion_configs can enrich TrackedObjects on a later invocation
+        when the BOPS report arrives. That is
+        ``completion_serializer.item_key`` with the transport dicts' ``""``
+        version normalized to ``None``, so a null-version object's entry is
+        written under the key the reader looks it up by (Requirement 8.2).
 
         Both maps are written in one read-modify-write so a single ETag hop
         covers them; they are produced together at manifest-generation time.
 
         Merges into existing entries (does not overwrite previously stored
         entries for objects already in either map).
+
+        Each map is capped at :data:`COMPLETION_SIDE_MAP_CEILING` entries for
+        this bucket, oldest first, with an error logged per eviction — see
+        :func:`_evict_side_map_above_ceiling`. This is the write path that runs
+        on a stack with completion tracking unconfigured, where nothing ever
+        prunes these maps, so it is where the cap has to be enforced to be
+        enforced at all. Entries written by this call are never the ones
+        evicted.
+
+        Requirements: 8.1
         """
         key = state_object_key(source_bucket)
         payload, _ = _read_state_payload(s3_client, state_bucket, key)
@@ -1446,8 +1715,9 @@ class StateStore:
             payload = json.loads(serialize(state))
 
         stored: dict[str, dict] = payload.get("completion_timestamps", {})
+        written_ts: list[str] = []
         for (object_key, version_id), (tagged_at, last_modified) in timestamps.items():
-            merge_key = completion_serializer.item_key(object_key, version_id)
+            merge_key = _side_map_key(object_key, version_id)
             if merge_key not in stored:
                 entry: dict[str, str | None] = {}
                 if tagged_at is not None:
@@ -1456,13 +1726,25 @@ class StateStore:
                     entry["last_modified"] = last_modified.isoformat()
                 if entry:
                     stored[merge_key] = entry
+                    written_ts.append(merge_key)
 
+        _evict_side_map_above_ceiling(
+            stored,
+            source_bucket=source_bucket,
+            map_name="completion_timestamps",
+            protected=written_ts,
+            consequence=(
+                "The tagged_at and last_modified columns will be empty for that "
+                "object if a Completion_Report ever covers it."
+            ),
+        )
         payload["completion_timestamps"] = stored
 
+        stored_routing: dict[str, dict] = payload.get("completion_routing", {})
+        written_routing: list[str] = []
         if routing:
-            stored_routing: dict[str, dict] = payload.get("completion_routing", {})
             for (object_key, version_id), (rules, destinations) in routing.items():
-                merge_key = completion_serializer.item_key(object_key, version_id)
+                merge_key = _side_map_key(object_key, version_id)
                 if merge_key not in stored_routing:
                     routing_entry: dict[str, list[str]] = {}
                     if rules:
@@ -1471,6 +1753,23 @@ class StateStore:
                         routing_entry["destinations"] = sorted(destinations)
                     if routing_entry:
                         stored_routing[merge_key] = routing_entry
+                        written_routing.append(merge_key)
+
+        # Outside the ``if routing`` guard deliberately: a caller that stops
+        # supplying routing must not leave an already-oversized map uncapped.
+        # An absent map stays absent, since eviction on an empty dict is a
+        # no-op and the key is only written back when it holds something.
+        _evict_side_map_above_ceiling(
+            stored_routing,
+            source_bucket=source_bucket,
+            map_name="completion_routing",
+            protected=written_routing,
+            consequence=(
+                "The matched_rules and destinations columns will be empty "
+                "for that object if a Completion_Report ever covers it."
+            ),
+        )
+        if stored_routing:
             payload["completion_routing"] = stored_routing
 
         return _write_state_payload(
@@ -1534,11 +1833,17 @@ class StateStore:
         stored_routing: dict = payload.get("completion_routing", {})
         for item_key in item_keys:
             existing_items.pop(item_key, None)
-            stored_ts.pop(item_key, None)
-            # Pruned alongside the timestamps: both are per-item side maps that
-            # would otherwise grow without bound, since nothing else removes
-            # them once the item they describe has been published and deleted.
-            stored_routing.pop(item_key, None)
+            # Both key forms, per :func:`_side_map_key_variants`: a null-version
+            # object's enrichment entry written before Requirement 8.2 carries
+            # the legacy ``""`` key, and popping only the current form is what
+            # made those entries unprunable in the first place.
+            for side_map_key in _side_map_key_variants(item_key):
+                stored_ts.pop(side_map_key, None)
+                # Pruned alongside the timestamps: both are per-item side maps
+                # that would otherwise grow without bound, since nothing else
+                # removes them once the item they describe has been published
+                # and deleted.
+                stored_routing.pop(side_map_key, None)
         payload["completion_items"] = completion_serializer.serialize_completion_items(
             existing_items
         )
@@ -1980,7 +2285,7 @@ class StateStore:
             s3_client, state_bucket, key, payload, current_etag, self._kms_key_arn
         )
 
-    def claim_journal_unavailable_alert(
+    def journal_unavailable_alert_due(
         self,
         s3_client: Any,
         state_bucket: str,
@@ -1988,14 +2293,15 @@ class StateStore:
         bucket_name: str,
         now: datetime,
         min_interval: timedelta,
-        current_etag: str | None = None,
-    ) -> tuple[bool, str | None]:
-        """Claim the right to send one journal-unavailable alert for a bucket.
+    ) -> bool:
+        """Report whether a journal-unavailable alert is due for a bucket.
 
-        Returns ``(True, new_etag)`` when no alert has been recorded for
-        *bucket_name* within *min_interval* of *now*, having recorded *now* as
-        the latest alert time. Returns ``(False, current_etag)`` otherwise,
-        without writing.
+        Returns ``True`` when no alert has been recorded for *bucket_name*
+        within *min_interval* of *now*. Reads only, and writes nothing, so the
+        caller can attempt delivery first and call
+        :meth:`record_journal_unavailable_alert` afterwards. Suppression that is
+        committed before delivery is attempted spends the interval on an alert
+        that may never have been sent.
 
         A recorded timestamp that expires on its own is what makes this
         self-clearing. The alternative, a counter cleared on the next
@@ -2008,10 +2314,37 @@ class StateStore:
         A timestamp that cannot be parsed is treated as absent, so a
         hand-edited or truncated value produces an extra alert rather than
         suppressing alerts indefinitely.
+        """
+        key = state_object_key(source_bucket)
+
+        payload, _ = _read_state_payload(s3_client, state_bucket, key)
+        if payload is None:
+            return True
+
+        alerts = payload.get(_JOURNAL_UNAVAILABLE_ALERT_FIELD) or {}
+        return _journal_alert_is_due(alerts.get(bucket_name), now, min_interval)
+
+    def record_journal_unavailable_alert(
+        self,
+        s3_client: Any,
+        state_bucket: str,
+        source_bucket: str,
+        bucket_name: str,
+        now: datetime,
+        current_etag: str | None = None,
+    ) -> str:
+        """Record *now* as the latest journal-unavailable alert time.
+
+        Called only after delivery has been attempted and did not raise, which
+        is what makes a failed publish retry on the next interval instead of
+        being suppressed for a whole :meth:`journal_unavailable_alert_due`
+        interval.
 
         Returns:
-            A tuple of (alert_should_be_sent, etag). The ETag is *current_etag*
-            unchanged when nothing was written.
+            The new ETag returned by S3.
+
+        Raises:
+            ConditionalWriteError: On ETag mismatch (concurrent modification).
         """
         key = state_object_key(source_bucket)
 
@@ -2021,23 +2354,10 @@ class StateStore:
             payload = json.loads(serialize(state))
 
         alerts = payload.setdefault(_JOURNAL_UNAVAILABLE_ALERT_FIELD, {})
-        last_raw = alerts.get(bucket_name)
-        if last_raw:
-            try:
-                last = datetime.fromisoformat(str(last_raw))
-            except (TypeError, ValueError):
-                last = None
-            if last is not None:
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=now.tzinfo)
-                if now - last < min_interval:
-                    return False, current_etag
-
         alerts[bucket_name] = now.isoformat()
-        new_etag = _write_state_payload(
+        return _write_state_payload(
             s3_client, state_bucket, key, payload, current_etag, self._kms_key_arn
         )
-        return True, new_etag
 
     def mark_report_diagnosed(
         self,

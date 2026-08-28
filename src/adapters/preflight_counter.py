@@ -97,7 +97,13 @@ def build_rule_predicate(rules: list[DerivedReplicationRule]) -> str:
             # Use _escape_like_pattern (not _escape_sql_string) so that % and _
             # in the prefix are treated as literals rather than LIKE wildcards.
             escaped_prefix = _escape_like_pattern(rule.key_prefix)
-            conjuncts.append(f"key LIKE '{escaped_prefix}%' ESCAPE '\\\\'")
+            # ESCAPE takes a single character.  Trino does not process
+            # backslash escapes inside a single-quoted literal, so the two
+            # backslashes below emit one at runtime: ESCAPE '\'.  A
+            # two-character value is rejected with
+            # INVALID_FUNCTION_ARGUMENT: Escape string must be a single
+            # character.
+            conjuncts.append(f"key LIKE '{escaped_prefix}%' ESCAPE '\\'")
 
         if conjuncts:
             rule_clauses.append("(" + " AND ".join(conjuncts) + ")")

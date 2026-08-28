@@ -18,10 +18,14 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from src.adapters.bops_report_reader import BopsCompletionReport
+from src.adapters.state_store import (
+    COMPLETION_SIDE_MAP_CEILING as CEILING,
+)
 from src.adapters.state_store import ConditionalWriteError, StateStore
 from src.core.checkpoint_serializer import deserialize, serialize
 from src.core.completion_serializer import item_key as _item_key_fn
 from src.core.completion_serializer import serialize_completion_items
+from src.core.observability import redact_object_key
 from src.core.models import (
     CheckpointState,
     CompletionState,
@@ -3886,3 +3890,539 @@ class TestMarkJobFlags(_RecordFixtures):
         records = self._written_records(client)
         assert records["job-abc-123"]["recovery_scored"] is True
         assert records["job-sibling"]["recovery_scored"] is False
+
+
+class TestCompletionSideMapCeiling:
+    """The three per-object completion maps are bounded (Requirement 8.1).
+
+    Before this, none of them had a ceiling, TTL, or eviction, and the only
+    prune path (``delete_completion_items``) is reached from the publish phase,
+    which returns early when completion tracking is unconfigured — the default.
+    A default stack therefore grew ``completion_timestamps`` and
+    ``completion_routing`` for the life of the stack, inside the same object
+    that carries the checkpoint, the lease, and the submission records.
+    """
+
+    @staticmethod
+    def _written(client) -> dict:
+        return json.loads(client.put_object.call_args.kwargs["Body"])
+
+    @staticmethod
+    def _ts_entries(count: int, *, start: int = 0) -> dict[str, dict]:
+        return {
+            _item_key_fn(f"key-{index:06d}", "v1"): {"tagged_at": _NOW.isoformat()}
+            for index in range(start, start + count)
+        }
+
+    @staticmethod
+    def _routing_entries(count: int, *, start: int = 0) -> dict[str, dict]:
+        return {
+            _item_key_fn(f"key-{index:06d}", "v1"): {"matched_rules": ["rule-a"]}
+            for index in range(start, start + count)
+        }
+
+    # Beyond any key the pre-existing-entry helpers generate, so a "new" key
+    # is genuinely new rather than a no-op merge into an entry already stored.
+    _NEW_BASE = CEILING + 1000
+
+    def _store_timestamps(self, client, *, new_keys: int = 1, routing: bool = False):
+        timestamps = {
+            (f"key-{self._NEW_BASE + index:06d}", "v1"): (_NOW, None)
+            for index in range(new_keys)
+        }
+        routing_arg = (
+            {ident: (["rule-new"], ["dest-new"]) for ident in timestamps}
+            if routing
+            else None
+        )
+        return StateStore().store_completion_timestamps(
+            client, _STATE_BUCKET, _SRC_BUCKET, timestamps, _ETAG, routing=routing_arg,
+        )
+
+    # -- the ceiling itself ------------------------------------------------
+
+    def test_the_ceiling_is_the_same_for_all_three_maps(self):
+        """One number for an operator to reason about; per-map so a burst of
+        enrichment writes cannot evict the items that carry report outcomes."""
+        assert CEILING == 10_000
+
+    def test_no_eviction_at_the_ceiling(self):
+        payload = _payload_with_completion_items({})
+        payload["completion_timestamps"] = self._ts_entries(CEILING - 1)
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit") as emit:
+            self._store_timestamps(client, new_keys=1)
+
+        assert len(self._written(client)["completion_timestamps"]) == CEILING
+        assert emit.call_count == 0
+
+    def test_above_the_ceiling_the_oldest_timestamps_are_evicted(self):
+        payload = _payload_with_completion_items({})
+        payload["completion_timestamps"] = self._ts_entries(CEILING)
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            self._store_timestamps(client, new_keys=1)
+
+        stored = self._written(client)["completion_timestamps"]
+        assert len(stored) == CEILING
+        assert _item_key_fn("key-000000", "v1") not in stored  # oldest by arrival
+        assert _item_key_fn("key-000001", "v1") in stored
+
+    def test_above_the_ceiling_the_oldest_routing_entries_are_evicted(self):
+        payload = _payload_with_completion_items({})
+        payload["completion_routing"] = self._routing_entries(CEILING)
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            self._store_timestamps(client, new_keys=1, routing=True)
+
+        stored = self._written(client)["completion_routing"]
+        assert len(stored) == CEILING
+        assert _item_key_fn("key-000000", "v1") not in stored
+        assert _item_key_fn("key-000001", "v1") in stored
+
+    def test_routing_is_capped_even_when_this_call_supplies_none(self):
+        """A caller that stops supplying routing must not leave an
+        already-oversized map uncapped, since nothing else would trim it."""
+        payload = _payload_with_completion_items({})
+        payload["completion_routing"] = self._routing_entries(CEILING + 5)
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            self._store_timestamps(client, new_keys=1, routing=False)
+
+        assert len(self._written(client)["completion_routing"]) == CEILING
+
+    def test_an_absent_routing_map_stays_absent(self):
+        payload = _payload_with_completion_items({})
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            self._store_timestamps(client, new_keys=1, routing=False)
+
+        assert "completion_routing" not in self._written(client)
+
+    def test_the_entries_written_by_this_call_survive_eviction(self):
+        """The write cannot discard its own work and return an ETag implying it
+        persisted — the same protection ``record_submission`` gives its record."""
+        payload = _payload_with_completion_items({})
+        payload["completion_timestamps"] = self._ts_entries(CEILING + 50)
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            self._store_timestamps(client, new_keys=3)
+
+        stored = self._written(client)["completion_timestamps"]
+        assert len(stored) == CEILING
+        for index in range(3):
+            assert _item_key_fn(f"key-{self._NEW_BASE + index:06d}", "v1") in stored
+
+    # -- the eviction log --------------------------------------------------
+
+    def test_each_eviction_emits_an_error_with_a_redacted_key(self):
+        """An error, not an audit entry: eviction discards tracking state, so it
+        is a loss rather than a decision. The key is redacted because an item
+        key is an object key."""
+        payload = _payload_with_completion_items({})
+        payload["completion_timestamps"] = self._ts_entries(CEILING + 2)
+        client = _mock_s3_get_raw_payload(payload)
+
+        emitted: list = []
+        with patch(
+            "src.adapters.state_store.observability.emit",
+            side_effect=emitted.append,
+        ):
+            self._store_timestamps(client, new_keys=1)
+
+        errors = [e for e in emitted if e.get("event") == "error"]
+        assert len(errors) == 3  # CEILING + 2 stored, 1 written, down to CEILING
+        assert all(e["bucket"] == _SRC_BUCKET for e in errors)
+        assert all("completion_timestamps" in e["cause"] for e in errors)
+        joined = " ".join(e["cause"] for e in errors)
+        assert "key-000000" not in joined
+        for index in range(3):
+            fingerprint = redact_object_key(_item_key_fn(f"key-{index:06d}", "v1"))
+            assert fingerprint in joined
+
+    def test_a_write_larger_than_the_ceiling_reports_the_overshoot(self):
+        """A single write protecting more entries than the ceiling leaves the map
+        above it, since a write never discards its own entries. That breach is
+        reported rather than silent (diff scan scan-f1927e8a, f-a26a46fc)."""
+        payload = _payload_with_completion_items({})
+        payload["completion_timestamps"] = self._ts_entries(5)
+        client = _mock_s3_get_raw_payload(payload)
+
+        emitted: list = []
+        with patch(
+            "src.adapters.state_store.observability.emit",
+            side_effect=emitted.append,
+        ):
+            self._store_timestamps(client, new_keys=CEILING + 10)
+
+        stored = self._written(client)["completion_timestamps"]
+        assert len(stored) == CEILING + 10, "the write's own entries all persist"
+        overshoot = [
+            e for e in emitted
+            if e.get("event") == "error"
+            and "above the" in e["cause"]
+            and "completion_timestamps" in e["cause"]
+        ]
+        assert len(overshoot) == 1
+        assert str(CEILING + 10) in overshoot[0]["cause"]
+        assert overshoot[0]["bucket"] == _SRC_BUCKET
+
+    def test_no_overshoot_report_when_the_ceiling_is_reached(self):
+        """The check is not vacuous: an ordinary eviction down to the ceiling
+        reports evictions and no overshoot."""
+        payload = _payload_with_completion_items({})
+        payload["completion_timestamps"] = self._ts_entries(CEILING + 2)
+        client = _mock_s3_get_raw_payload(payload)
+
+        emitted: list = []
+        with patch(
+            "src.adapters.state_store.observability.emit",
+            side_effect=emitted.append,
+        ):
+            self._store_timestamps(client, new_keys=1)
+
+        assert not [
+            e for e in emitted
+            if e.get("event") == "error" and "above the" in e["cause"]
+        ]
+
+    # -- completion_items, on the path that writes it ----------------------
+
+    def test_completion_items_is_capped_on_merge(self):
+        items = {
+            _item_key_fn(f"key-{index:06d}", "v1"): _make_item(
+                object_key=f"key-{index:06d}", version_id="v1",
+            )
+            for index in range(CEILING)
+        }
+        payload = _payload_with_completion_items(items)
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().merge_completion_report(
+                client, _STATE_BUCKET, _SRC_BUCKET,
+                report=BopsCompletionReport(
+                    created_at=_NOW,
+                    entries=(
+                        ManifestEntry(_SRC_BUCKET, "key-new", "v1",
+                                      task_status="succeeded"),
+                    ),
+                ),
+                replication_config_id="cfg-1",
+                job_id="job-report",
+                job_created_at=_NOW,
+                current_etag=_ETAG,
+            )
+
+        stored = self._written(client)["completion_items"]
+        assert len(stored) == CEILING
+        # The item this report resolved is protected; the oldest goes instead.
+        assert _item_key_fn("key-new", "v1") in stored
+        assert _item_key_fn("key-000000", "v1") not in stored
+
+    def test_evicting_an_item_takes_its_enrichment_entries_with_it(self):
+        """An evicted item can never be published, so its timestamps and
+        routing entries are orphans by construction."""
+        oldest = _item_key_fn("key-000000", "v1")
+        items = {
+            _item_key_fn(f"key-{index:06d}", "v1"): _make_item(
+                object_key=f"key-{index:06d}", version_id="v1",
+            )
+            for index in range(CEILING)
+        }
+        payload = _payload_with_completion_items(items)
+        payload["completion_timestamps"] = {oldest: {"tagged_at": _NOW.isoformat()}}
+        payload["completion_routing"] = {oldest: {"matched_rules": ["rule-a"]}}
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().merge_completion_report(
+                client, _STATE_BUCKET, _SRC_BUCKET,
+                report=BopsCompletionReport(
+                    created_at=_NOW,
+                    entries=(
+                        ManifestEntry(_SRC_BUCKET, "key-new", "v1",
+                                      task_status="succeeded"),
+                    ),
+                ),
+                replication_config_id="cfg-1",
+                job_id="job-report",
+                job_created_at=_NOW,
+                current_etag=_ETAG,
+            )
+
+        written = self._written(client)
+        assert oldest not in written["completion_items"]
+        assert oldest not in written.get("completion_timestamps", {})
+        assert oldest not in written.get("completion_routing", {})
+
+class TestNullVersionSideMapKey:
+    """A null version keys the enrichment maps the same on write and read (Req 8.2).
+
+    ``ManifestGenerator.get_timestamps``/``get_routing`` key their transport
+    dicts on ``version_id or ""``, while ``merge_completion_report`` reads
+    ``version_id`` from the BOPS report and holds ``None``.
+    ``completion_serializer.item_key`` treats the two as distinct identities, so
+    an unversioned object's entry was written under ``"a.txt\\x00"`` and looked
+    up under ``"a.txt\\x00\\x01"`` — neither readable nor prunable.
+
+    Design R6, option 1: the writer emits the ``None`` form and the reader looks
+    up both, so entries already in a deployed state object stay readable rather
+    than becoming orphans the moment the fix ships.
+    """
+
+    @staticmethod
+    def _written(client) -> dict:
+        return json.loads(client.put_object.call_args.kwargs["Body"])
+
+    def test_the_two_key_forms_are_distinct(self):
+        """The premise. If these were equal there would be no defect."""
+        assert _item_key_fn("a.txt", None) == "a.txt\x00\x01"
+        assert _item_key_fn("a.txt", "") == "a.txt\x00"
+
+    def test_a_null_version_entry_is_written_under_the_none_form(self):
+        client = _mock_s3_get_raw_payload(_payload_with_completion_items({}))
+
+        StateStore().store_completion_timestamps(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            {("a.txt", ""): (_JOB_T0, _JOB_T1)}, _ETAG,
+            routing={("a.txt", ""): (["rule-a"], ["dest-a"])},
+        )
+
+        written = self._written(client)
+        assert _item_key_fn("a.txt", None) in written["completion_timestamps"]
+        assert _item_key_fn("a.txt", "") not in written["completion_timestamps"]
+        assert _item_key_fn("a.txt", None) in written["completion_routing"]
+        assert _item_key_fn("a.txt", "") not in written["completion_routing"]
+
+    def test_a_real_version_id_is_unaffected(self):
+        client = _mock_s3_get_raw_payload(_payload_with_completion_items({}))
+
+        StateStore().store_completion_timestamps(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            {("a.txt", "v1"): (_JOB_T0, _JOB_T1)}, _ETAG,
+        )
+
+        assert _item_key_fn("a.txt", "v1") in (
+            self._written(client)["completion_timestamps"]
+        )
+
+    def _merge_null_version_row(self, client):
+        StateStore().merge_completion_report(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            report=BopsCompletionReport(
+                created_at=_NOW,
+                entries=(
+                    ManifestEntry(_SRC_BUCKET, "a.txt", None, task_status="succeeded"),
+                ),
+            ),
+            replication_config_id="cfg-1",
+            job_id="job-report",
+            job_created_at=_JOB_T1,
+            current_etag=_ETAG,
+        )
+
+    def test_merge_reads_the_entry_the_writer_wrote(self):
+        payload = _payload_with_completion_items({})
+        current = _item_key_fn("a.txt", None)
+        payload["completion_timestamps"] = {
+            current: {
+                "tagged_at": _JOB_T0.isoformat(),
+                "last_modified": _JOB_T1.isoformat(),
+            }
+        }
+        payload["completion_routing"] = {
+            current: {"matched_rules": ["rule-a"], "destinations": ["dest-a"]}
+        }
+        client = _mock_s3_get_raw_payload(payload)
+
+        self._merge_null_version_row(client)
+
+        item = self._written(client)["completion_items"][current]
+        assert item["tagged_at"] == _JOB_T0.isoformat()
+        assert item["last_modified"] == _JOB_T1.isoformat()
+        assert item["matched_rules"] == ["rule-a"]
+        assert item["destinations"] == ["dest-a"]
+
+    def test_merge_still_reads_a_legacy_empty_string_key(self):
+        """Entries already in a deployed state object carry the old key."""
+        payload = _payload_with_completion_items({})
+        legacy = _item_key_fn("a.txt", "")
+        payload["completion_timestamps"] = {
+            legacy: {"tagged_at": _JOB_T0.isoformat()}
+        }
+        payload["completion_routing"] = {legacy: {"matched_rules": ["rule-legacy"]}}
+        client = _mock_s3_get_raw_payload(payload)
+
+        self._merge_null_version_row(client)
+
+        item = self._written(client)["completion_items"][_item_key_fn("a.txt", None)]
+        assert item["tagged_at"] == _JOB_T0.isoformat()
+        assert item["matched_rules"] == ["rule-legacy"]
+
+    def test_a_versioned_object_does_not_fall_back_to_the_legacy_key(self):
+        """The fallback is scoped to a null version; ``"a.txt\\x00v1"`` has no
+        second spelling, and a miss must stay a miss."""
+        payload = _payload_with_completion_items({})
+        payload["completion_timestamps"] = {
+            _item_key_fn("a.txt", ""): {"tagged_at": _JOB_T0.isoformat()}
+        }
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().merge_completion_report(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            report=BopsCompletionReport(
+                created_at=_NOW,
+                entries=(
+                    ManifestEntry(_SRC_BUCKET, "a.txt", "v1", task_status="succeeded"),
+                ),
+            ),
+            replication_config_id="cfg-1",
+            job_id="job-report",
+            job_created_at=_JOB_T1,
+            current_etag=_ETAG,
+        )
+
+        item = self._written(client)["completion_items"][_item_key_fn("a.txt", "v1")]
+        assert "tagged_at" not in item
+
+    def test_delete_prunes_both_key_forms(self):
+        """The leak half. A legacy-keyed entry survived every prune path, so it
+        sat in the state object until the Requirement 8.1 ceiling evicted it."""
+        item_key = _item_key_fn("a.txt", None)
+        legacy = _item_key_fn("a.txt", "")
+        payload = _payload_with_completion_items(
+            {item_key: _make_item(object_key="a.txt", version_id=None)}
+        )
+        payload["completion_timestamps"] = {legacy: {"tagged_at": _JOB_T0.isoformat()}}
+        payload["completion_routing"] = {legacy: {"matched_rules": ["rule-a"]}}
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().delete_completion_items(
+            client, _STATE_BUCKET, _SRC_BUCKET, [item_key], current_etag=_ETAG,
+        )
+
+        written = self._written(client)
+        assert written["completion_items"] == {}
+        assert written["completion_timestamps"] == {}
+        assert written["completion_routing"] == {}
+
+    def test_delete_leaves_a_sibling_objects_entries_alone(self):
+        """The legacy-key variant is derived from the item key being deleted, so
+        it cannot reach another object's entries."""
+        payload = _payload_with_completion_items(
+            {_item_key_fn("a.txt", None): _make_item(
+                object_key="a.txt", version_id=None,
+            )}
+        )
+        payload["completion_timestamps"] = {
+            _item_key_fn("b.txt", ""): {"tagged_at": _JOB_T0.isoformat()},
+            _item_key_fn("a.txt", ""): {"tagged_at": _JOB_T0.isoformat()},
+        }
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().delete_completion_items(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            [_item_key_fn("a.txt", None)], current_etag=_ETAG,
+        )
+
+        stored = self._written(client)["completion_timestamps"]
+        assert list(stored) == [_item_key_fn("b.txt", "")]
+
+
+class TestEnrichmentRoundTrip:
+    """One state object, three calls in sequence (Req 8.2).
+
+    ``TestNullVersionSideMapKey`` asserts each method's keying in isolation
+    against a hand-built payload. This drives the whole sequence a real interval
+    runs — ``store_completion_timestamps`` at manifest generation,
+    ``merge_completion_report`` when the BOPS report arrives, then
+    ``delete_completion_items`` after publish — against a single evolving state
+    object, so the write key and the read key have to agree for the enrichment
+    to arrive, rather than agreeing because the test wrote both of them.
+
+    ``_FakeConditionalS3`` carries the payload from each call to the next under
+    real If-Match semantics, so the ETag chain is exercised too: a call reading
+    a stale payload would fail the precondition instead of quietly enriching
+    from nothing.
+
+    The unversioned case is the one the defect hid in. The versioned case is a
+    control, so a future change that breaks the ordinary path fails here too.
+
+    What this pins, checked by reverting each half of the R6 option 1 fix: with
+    both the writer normalization and the reader's legacy-key fallback removed —
+    the genuine pre-fix state — the unversioned case fails on the enrichment miss
+    while the versioned control still passes. Removing the writer normalization
+    alone does not fail, because the reader's fallback then finds the ``""``-keyed
+    entry the writer just produced. So this asserts the round trip works, not that
+    both halves are present; the writer half is pinned separately by
+    ``TestNullVersionSideMapKey.test_a_null_version_entry_is_written_under_the_none_form``.
+    """
+
+    _KEY = "a.txt"
+
+    @staticmethod
+    def _state(client: _FakeConditionalS3) -> dict:
+        assert client._body is not None
+        return json.loads(client._body)
+
+    def _round_trip(self, version_id: str | None) -> None:
+        store = StateStore()
+        client = _FakeConditionalS3()
+        # The transport form the manifest generator produces: its dicts are
+        # typed tuple[str, str], so a null version arrives as "".
+        transport_id = version_id or ""
+        item_key = _item_key_fn(self._KEY, version_id)
+
+        etag = store.store_completion_timestamps(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            {(self._KEY, transport_id): (_JOB_T0, _JOB_T1)},
+            current_etag=None,
+            routing={(self._KEY, transport_id): (["rule-a"], ["dest-a"])},
+        )
+
+        etag = store.merge_completion_report(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            report=BopsCompletionReport(
+                created_at=_NOW,
+                entries=(
+                    ManifestEntry(
+                        _SRC_BUCKET, self._KEY, version_id, task_status="succeeded",
+                    ),
+                ),
+            ),
+            replication_config_id="cfg-1",
+            job_id="job-report",
+            job_created_at=_JOB_T1,
+            current_etag=etag,
+        )
+
+        items = store.get_all_completion_items(client, _STATE_BUCKET, _SRC_BUCKET)
+        assert set(items) == {item_key}
+        item = items[item_key]
+        assert item.version_id == version_id
+        assert item.tagged_at == _JOB_T0
+        assert item.last_modified == _JOB_T1
+        assert item.matched_rules == frozenset({"rule-a"})
+        assert item.destinations == frozenset({"dest-a"})
+
+        store.delete_completion_items(
+            client, _STATE_BUCKET, _SRC_BUCKET, [item_key], current_etag=etag,
+        )
+
+        final = self._state(client)
+        assert final["completion_items"] == {}
+        assert final["completion_timestamps"] == {}
+        assert final["completion_routing"] == {}
+
+    def test_an_unversioned_object_round_trips(self) -> None:
+        self._round_trip(None)
+
+    def test_a_versioned_object_round_trips(self) -> None:
+        self._round_trip("v1")

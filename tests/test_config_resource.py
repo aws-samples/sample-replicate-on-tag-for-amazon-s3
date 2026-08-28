@@ -10,6 +10,7 @@ Requirements: 7.2, 7.3, 7.4, 7.5, 7.6, 11.2, 11.3, 11.4
 from __future__ import annotations
 
 import json
+import os
 import string
 import sys
 from pathlib import Path
@@ -27,13 +28,26 @@ from src.core.config_loader import ConfigError, load_config
 
 _HANDLER_PATH = Path(__file__).parent.parent / "deploy" / "config_resource" / "index.py"
 
+# The privileged parameters come from the function's environment, so the
+# template's Environment block is simulated here (scan-aa27a832 Req 1.3).
+STATE_BUCKET = "example-state-bucket"
+CONFIG_KEY = "config/solution-config.json"
+STACK_ID = (
+    "arn:aws:cloudformation:us-east-1:123456789012:stack/s3rot/"
+    "11111111-2222-3333-4444-555555555555"
+)
+
 
 def _run_handler(
-    event: dict, *, s3_client: MagicMock | None = None
+    event: dict,
+    *,
+    s3_client: MagicMock | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[MagicMock, MagicMock]:
     """Execute the standalone handler with mocked boto3 and cfnresponse.
 
     Returns (cfnresponse_mock, s3_mock) so callers can assert on both.
+    Pass ``env`` to override the simulated template environment.
     """
     from botocore.exceptions import ClientError as _BotocoreClientError
 
@@ -49,16 +63,34 @@ def _run_handler(
     def make_client(service, **kwargs):
         return s3_mock if service == "s3" else MagicMock()
 
+    props = event.get("ResourceProperties", {})
+    handler_env = {
+        "STATE_BUCKET": STATE_BUCKET,
+        "CONFIG_KEY": CONFIG_KEY,
+        "STACK_ID": STACK_ID,
+        # The template resolves each of these from the same expression as the
+        # matching custom-resource property, so by default the simulated
+        # environment agrees with the event. Tests that need them to disagree
+        # pass ``env`` or use _foreign_props.
+        "SOURCE_BUCKET_NAMES": ",".join(props.get("Buckets") or []),
+        "REGION": str(props.get("Region", "us-east-1")),
+        "CHECK_FREQUENCY_MINUTES": str(props.get("CheckFrequencyMinutes", 60)),
+        "KMS_KEY_ARN": str(props.get("KmsKeyArn", "")),
+    }
+    if env is not None:
+        handler_env.update(env)
+
     code = _HANDLER_PATH.read_text()
     context = MagicMock()
-    with patch.dict(sys.modules, {"cfnresponse": cfnresponse_mock}):
-        with patch("boto3.client", side_effect=make_client):
-            ns: dict = {}
-            exec(compile(code, str(_HANDLER_PATH), "exec"), ns)
-            try:
-                ns["handler"](event, context)
-            except Exception:
-                pass  # handler re-raises after cfnresponse.send(FAILED) — expected
+    with patch.dict(os.environ, handler_env):
+        with patch.dict(sys.modules, {"cfnresponse": cfnresponse_mock}):
+            with patch("boto3.client", side_effect=make_client):
+                ns: dict = {}
+                exec(compile(code, str(_HANDLER_PATH), "exec"), ns)
+                try:
+                    ns["handler"](event, context)
+                except Exception:
+                    pass  # handler re-raises after cfnresponse.send(FAILED) — expected
     return cfnresponse_mock, s3_mock
 
 
@@ -71,11 +103,12 @@ def _create_event(
     buckets: list[str] | None = None,
     region: str = "us-east-1",
     check_frequency_minutes: object = 60,
-    state_bucket: str = "example-state-bucket",
-    config_key: str = "config/solution-config.json",
+    state_bucket: str = STATE_BUCKET,
+    config_key: str = CONFIG_KEY,
 ) -> dict:
     return {
         "RequestType": "Create",
+        "StackId": STACK_ID,
         "ResourceProperties": {
             "StateBucket": state_bucket,
             "ConfigKey": config_key,
@@ -99,11 +132,12 @@ def _update_event(*, old_buckets: list[str] | None = None, **kwargs) -> dict:
 
 
 def _delete_event(
-    state_bucket: str = "example-state-bucket",
-    config_key: str = "config/solution-config.json",
+    state_bucket: str = STATE_BUCKET,
+    config_key: str = CONFIG_KEY,
 ) -> dict:
     return {
         "RequestType": "Delete",
+        "StackId": STACK_ID,
         "PhysicalResourceId": config_key,
         "ResourceProperties": {
             "StateBucket": state_bucket,
@@ -584,3 +618,213 @@ class TestCheckpointSeedDelete:
         _run_handler(_delete_event(), s3_client=s3_mock)
         seeds = _seed_put_calls(s3_mock)
         assert seeds == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: privileged-parameter source and StackId gate
+# scan-aa27a832 remediation, Req 1.2, 1.3
+# ---------------------------------------------------------------------------
+
+FOREIGN_BUCKET = "attacker-bucket"
+FOREIGN_KEY = "config/attacker.json"
+FOREIGN_STACK_ID = (
+    "arn:aws:cloudformation:us-east-1:123456789012:stack/other/"
+    "99999999-8888-7777-6666-555555555555"
+)
+
+
+def _foreign_props(event: dict) -> dict:
+    """Point the event's StateBucket and ConfigKey at attacker-chosen values."""
+    event["ResourceProperties"]["StateBucket"] = FOREIGN_BUCKET
+    event["ResourceProperties"]["ConfigKey"] = FOREIGN_KEY
+    return event
+
+
+# The environment a stack deployed for two buckets on an hourly interval sets.
+_STACK_ENV = {
+    "SOURCE_BUCKET_NAMES": "bucket-a,bucket-b",
+    "REGION": "us-east-1",
+    "CHECK_FREQUENCY_MINUTES": "60",
+    "KMS_KEY_ARN": "",
+}
+
+
+class TestPrivilegedParameterSource:
+    """StateBucket and ConfigKey come from the environment, not the event.
+
+    scan-aa27a832 remediation, Req 1.3: the Delete branch removes the config
+    object, which halts every scheduled run, so a caller holding
+    lambda:InvokeFunction on this function must not be able to name the object
+    that is written or deleted.
+    """
+
+    def test_event_state_bucket_and_config_key_never_reach_put_object(self):
+        """A foreign StateBucket/ConfigKey in the event is ignored on Create (Req 1.3)."""
+        s3_mock = MagicMock()
+        _run_handler(_foreign_props(_create_event()), s3_client=s3_mock)
+        kwargs = s3_mock.put_object.call_args_list[0][1]
+        assert kwargs["Bucket"] == STATE_BUCKET
+        assert kwargs["Key"] == CONFIG_KEY
+        buckets = {c[1]["Bucket"] for c in s3_mock.put_object.call_args_list}
+        assert FOREIGN_BUCKET not in buckets
+
+    def test_event_config_key_never_reaches_delete_object(self):
+        """A foreign ConfigKey in the event is ignored on Delete (Req 1.3)."""
+        s3_mock = MagicMock()
+        _run_handler(_foreign_props(_delete_event()), s3_client=s3_mock)
+        s3_mock.delete_object.assert_called_once_with(
+            Bucket=STATE_BUCKET, Key=CONFIG_KEY
+        )
+
+    def test_seed_writes_use_the_environment_bucket(self):
+        """Checkpoint seeds land in the template's bucket, not the event's (Req 1.3)."""
+        s3_mock = MagicMock()
+        _run_handler(
+            _foreign_props(_create_event(buckets=["alpha"])), s3_client=s3_mock
+        )
+        seeds = _seed_put_calls(s3_mock)
+        assert seeds, "no seed write observed"
+        assert all(s["Bucket"] == STATE_BUCKET for s in seeds)
+
+    def test_physical_resource_id_is_the_environment_key(self):
+        """The physical id follows the environment, keeping the resource stable (Req 1.3)."""
+        cfnr, _ = _run_handler(_foreign_props(_create_event()))
+        assert cfnr.send.call_args[1]["physicalResourceId"] == CONFIG_KEY
+
+
+class TestStackIdCheck:
+    """An event from anything other than this stack is rejected.
+
+    scan-aa27a832 remediation, Req 1.2: the handler compares the event's
+    StackId with the STACK_ID environment variable before any S3 mutation.
+    """
+
+    def _mismatched(self, event: dict) -> dict:
+        event["StackId"] = FOREIGN_STACK_ID
+        return event
+
+    def test_mismatched_stack_id_writes_nothing(self):
+        """A foreign StackId reaches neither put_object nor delete_object (Req 1.2)."""
+        s3_mock = MagicMock()
+        _run_handler(self._mismatched(_create_event()), s3_client=s3_mock)
+        s3_mock.put_object.assert_not_called()
+        s3_mock.delete_object.assert_not_called()
+
+    def test_mismatched_stack_id_deletes_nothing(self):
+        """The Delete branch is gated too, so the config object survives (Req 1.2)."""
+        s3_mock = MagicMock()
+        cfnr, _ = _run_handler(self._mismatched(_delete_event()), s3_client=s3_mock)
+        s3_mock.delete_object.assert_not_called()
+        assert cfnr.send.call_args[0][2] == "FAILED"
+
+    def test_mismatched_stack_id_responds_failed_without_specifics(self):
+        """The FAILED reason names neither the expected nor the supplied value (Req 1.2)."""
+        cfnr, _ = _run_handler(self._mismatched(_create_event()))
+        cfnr.send.assert_called_once()
+        assert cfnr.send.call_args[0][2] == "FAILED"
+        reason = cfnr.send.call_args[0][3]["Error"]
+        assert STACK_ID not in reason
+        assert FOREIGN_STACK_ID not in reason
+        assert STATE_BUCKET not in reason
+        assert "StackId" not in reason
+
+    def test_missing_stack_id_is_rejected(self):
+        """An event carrying no StackId at all is rejected (Req 1.2)."""
+        event = _create_event()
+        del event["StackId"]
+        s3_mock = MagicMock()
+        cfnr, _ = _run_handler(event, s3_client=s3_mock)
+        s3_mock.put_object.assert_not_called()
+        assert cfnr.send.call_args[0][2] == "FAILED"
+
+    def test_matching_stack_id_still_writes(self):
+        """The check is not vacuous: the matching StackId path still writes (Req 1.2)."""
+        s3_mock = MagicMock()
+        cfnr, _ = _run_handler(_create_event(), s3_client=s3_mock)
+        assert s3_mock.put_object.call_count > 0
+        assert cfnr.send.call_args[0][2] == "SUCCESS"
+
+
+# ---------------------------------------------------------------------------
+# Tests: the config object's content is env-sourced
+# diff scan scan-972cfd4f, f-77d789f5
+# ---------------------------------------------------------------------------
+
+
+class TestConfigContentSource:
+    """The written config is built from the environment, not the event.
+
+    A caller holding lambda:InvokeFunction can forge a Create or Update event
+    carrying this stack's readable StackId. If the bucket list, Region, interval
+    or KMS key came from the event, that caller could rewrite
+    config/solution-config.json: dropping a bucket stops the orchestrator
+    monitoring it, which is silent non-replication, and the poisoned object
+    survives until the next legitimate stack update.
+    """
+
+    def _forged(self, request_type: str = "Create") -> dict:
+        event = _create_event(
+            buckets=["attacker-bucket"],
+            region="eu-west-3",
+            check_frequency_minutes=1440,
+        )
+        event["RequestType"] = request_type
+        event["ResourceProperties"]["KmsKeyArn"] = (
+            "arn:aws:kms:eu-west-3:123456789012:key/attacker"
+        )
+        return event
+
+    def test_event_buckets_and_region_never_reach_the_config_object(self):
+        """Forged Buckets and Region in the event do not appear in the config."""
+        s3_mock = MagicMock()
+        _run_handler(self._forged(), s3_client=s3_mock, env=_STACK_ENV)
+        body = json.loads(s3_mock.put_object.call_args_list[0][1]["Body"])
+        assert body["buckets"] == [
+            {"name": "bucket-a", "region": "us-east-1"},
+            {"name": "bucket-b", "region": "us-east-1"},
+        ]
+
+    def test_event_check_frequency_never_reaches_the_processing_interval(self):
+        """The interval follows CHECK_FREQUENCY_MINUTES, not the event."""
+        s3_mock = MagicMock()
+        cfnr, _ = _run_handler(self._forged(), s3_client=s3_mock, env=_STACK_ENV)
+        body = json.loads(s3_mock.put_object.call_args_list[0][1]["Body"])
+        assert body["processing_interval"] == "1h"
+        assert cfnr.send.call_args[0][3]["CheckFrequencySeconds"] == "3600"
+
+    def test_event_kms_key_never_reaches_put_object(self):
+        """A forged KmsKeyArn does not encrypt the config object under it."""
+        s3_mock = MagicMock()
+        _run_handler(self._forged(), s3_client=s3_mock, env=_STACK_ENV)
+        kwargs = s3_mock.put_object.call_args_list[0][1]
+        assert "SSEKMSKeyId" not in kwargs
+        assert "ServerSideEncryption" not in kwargs
+
+    def test_event_buckets_never_seed_a_state_object(self):
+        """Seeds are written for the environment's bucket names only."""
+        s3_mock = MagicMock()
+        _run_handler(self._forged(), s3_client=s3_mock, env=_STACK_ENV)
+        seeded = {s["Key"] for s in _seed_put_calls(s3_mock)}
+        assert seeded == {"state/bucket-a.json", "state/bucket-b.json"}
+
+    def test_environment_kms_key_is_still_applied(self):
+        """The check is not vacuous: the environment's KMS key does reach S3."""
+        s3_mock = MagicMock()
+        key_arn = "arn:aws:kms:us-east-1:123456789012:key/abc"
+        _run_handler(
+            self._forged(),
+            s3_client=s3_mock,
+            env={**_STACK_ENV, "KMS_KEY_ARN": key_arn},
+        )
+        kwargs = s3_mock.put_object.call_args_list[0][1]
+        assert kwargs["SSEKMSKeyId"] == key_arn
+        assert kwargs["ServerSideEncryption"] == "aws:kms"
+
+    def test_forged_update_cannot_reduce_the_monitored_bucket_set(self):
+        """An Update naming one bucket still writes both environment buckets."""
+        s3_mock = MagicMock()
+        event = self._forged("Update")
+        event["OldResourceProperties"] = {"Buckets": ["bucket-a", "bucket-b"]}
+        _run_handler(event, s3_client=s3_mock, env=_STACK_ENV)
+        body = json.loads(s3_mock.put_object.call_args_list[0][1]["Body"])
+        assert [b["name"] for b in body["buckets"]] == ["bucket-a", "bucket-b"]

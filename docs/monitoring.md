@@ -26,13 +26,14 @@ A run that fails before the handler executes emits none of these. An init failur
 
 ### Journal read budget errors
 
-`JournalReadRowCap` covers the whole journal read: the `JournalLookbackSeconds` window below the Solution's journal position that each run re-scans for late-arriving records, and the new rows above it. Four `error` entries report how a run divided that budget. Each carries the ordinary `component`, `bucket`, and `cause` fields; the `cause` text distinguishes them.
+`JournalReadRowCap` covers the whole journal read: the `JournalLookbackSeconds` window below the Solution's journal position that each run re-scans for late-arriving records, and the new rows above it. Five `error` entries report how a run divided that budget. Each carries the ordinary `component`, `bucket`, and `cause` fields; the `cause` text distinguishes them.
 
 | `cause` begins | Meaning | What to do |
 |---|---|---|
 | `Lookback tail shortened to fit the row budget` | The re-scan window held more rows than its 80% share of the cap, so the read's lower bound was raised and the oldest part of the window was skipped this run. Names the row count, the allowance, the bound used, and the configured lookback | Nothing, if occasional. If sustained, the bucket has a backlog: see the `JournalTailShortened` metric below |
 | `Lookback-tail row count failed` | The Athena query sizing the re-scan window failed, so the run assumed the window was exactly at its allowance. The run still progressed | Nothing. Transient Athena failures clear on the next run |
 | `Lookback-tail floor lookup failed` | The Athena query locating the raised lower bound failed, so the bucket was skipped for the interval with its checkpoint unchanged. Neither reading the window unbounded nor skipping it whole is safe, so the run declines to read. Raises `BucketErrors` | Nothing if isolated: the next interval picks up the whole backlog. If it repeats, the bucket is not draining — investigate Athena |
+| `Row-count boundary lookup failed` | The Athena query locating the upper bound over the new rows failed, so the bucket was skipped for the interval with its checkpoint unchanged. Reading without that bound is unbounded in memory, and the unchanged checkpoint means nothing ages out. Raises `BucketErrors` | Nothing if isolated: the next interval reads the window whole. If it repeats, the bucket is not draining — investigate Athena |
 | `Row-cap boundary did not advance` | A regression tripwire. The bucket was skipped for the interval. The Solution's read window is constructed so this cannot happen | Report it. No configuration change fixes it |
 
 A shortened re-scan window can lose a late-arriving journal record, not only delay
@@ -105,7 +106,7 @@ For the auto-disable case, alarm on `DisabledBuckets >= 1` instead. It is a plai
 
 A Batch Operations job can reach `Complete` while individual tasks in it failed, and the job's status does not reveal that. Every task failure in a job's completion report raises an `error` log entry naming the error code, how many tasks carried it, and the message S3 reported for it. Two codes get cause-specific guidance, described below; the rest are reported with the service's own wording, because a code this Solution does not recognize still means the object was not replicated.
 
-The error code alone is often not enough to identify a cause. An object in an archived storage class is reported only as `SrcObjectNotEligible` with the message "Object is not eligible for replication", which names no storage class and also covers other conditions, so the reported message is worth reading. See [Objects That Are Not Replicated](../README.md#objects-that-are-not-replicated).
+The error code alone is often not enough to identify a cause. `SrcObjectNotEligible` carries the message "Object is not eligible for replication", which names no condition, and S3 uses it for several. Two are known: an object in an archived storage class, and an object matched only by a replication rule whose `Status` is `Disabled`. The Solution excludes the archived objects it can identify from the journal, and no longer derives a `Disabled` rule, so this code covers the archived objects it could not identify, jobs submitted before rule status was honored, and conditions the Solution does not know about. The log entry lists the known causes as possibilities; the reported message is still worth reading. See [Objects That Are Not Replicated](../README.md#objects-that-are-not-replicated).
 
 ### Permission failures
 

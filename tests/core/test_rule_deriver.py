@@ -6,6 +6,7 @@ Covers the core derive_rules() function for:
 - Prefix-only rules excluded (Filter.Prefix)
 - Rules with no Filter key excluded
 - Mixed configurations: only tag-filtered rules emitted
+- Rules whose Status is not Enabled excluded (Req. 3.1)
 - Field preservation: tag pairs, prefix, destination ARN, role ARN
 - Full boto3 response wrapper accepted (top-level ReplicationConfiguration key)
 - Inner config dict accepted directly
@@ -16,7 +17,11 @@ from __future__ import annotations
 import pytest
 
 from src.core.models import DerivedReplicationRule, DestinationRef
-from src.core.rule_deriver import derive_rules
+from src.core.rule_deriver import (
+    count_disabled_tag_scoped_rules,
+    derive_rules,
+    is_rule_enabled,
+)
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
@@ -247,6 +252,127 @@ class TestNoTagFilterExcluded:
         config = {"ReplicationConfiguration": {"Role": _ROLE_ARN, "Rules": []}}
         result = derive_rules(_SRC_BUCKET, config)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Excluded: rules that are not Enabled (Req. 3.1)
+# ---------------------------------------------------------------------------
+
+
+_TAG_FILTER = {"Tag": {"Key": "env", "Value": "prod"}}
+
+
+class TestDisabledRulesExcluded:
+    """A tag-scoped rule that is not ``Enabled`` drives no replication.
+
+    S3 fails a Batch Replication task for an object matched only by a
+    ``Disabled`` rule with ``SrcObjectNotEligible``, so deriving the rule buys
+    a billed failure and nothing else. ``_make_rule`` has always accepted
+    ``status``; until these tests nothing overrode it, which is why the gap was
+    invisible.
+    """
+
+    def test_disabled_tag_scoped_rule_excluded(self):
+        config = _make_config(
+            _make_rule("rule-disabled", _TAG_FILTER, status="Disabled")
+        )
+        assert derive_rules(_SRC_BUCKET, config) == []
+
+    def test_disabled_and_filter_rule_excluded(self):
+        config = _make_config(
+            _make_rule(
+                "rule-and-disabled",
+                {"And": {"Prefix": "logs/", "Tags": [{"Key": "app", "Value": "svc"}]}},
+                status="Disabled",
+            )
+        )
+        assert derive_rules(_SRC_BUCKET, config) == []
+
+    def test_absent_status_excluded(self):
+        """``GetBucketReplication`` always returns ``Status``; absent means exclude."""
+        rule = _make_rule("rule-no-status", _TAG_FILTER)
+        del rule["Status"]
+        assert derive_rules(_SRC_BUCKET, _make_config(rule)) == []
+
+    @pytest.mark.parametrize("status", [None, True, 1, ["Enabled"], {"Status": "Enabled"}])
+    def test_non_string_status_excluded(self, status):
+        config = _make_config(_make_rule("rule-odd-status", _TAG_FILTER, status=status))
+        assert derive_rules(_SRC_BUCKET, config) == []
+
+    @pytest.mark.parametrize(
+        "status", ["Enabled", "enabled", "ENABLED", " Enabled ", "\tenabled\n"]
+    )
+    def test_case_and_whitespace_tolerated(self, status):
+        """A value differing only in case or padding still names the enabled state."""
+        config = _make_config(_make_rule("rule-1", _TAG_FILTER, status=status))
+        result = derive_rules(_SRC_BUCKET, config)
+        assert [r.rule_id for r in result] == ["rule-1"]
+
+    @pytest.mark.parametrize("status", ["Disabled", "disabled", " DISABLED ", "Suspended", ""])
+    def test_non_enabled_strings_excluded(self, status):
+        config = _make_config(_make_rule("rule-1", _TAG_FILTER, status=status))
+        assert derive_rules(_SRC_BUCKET, config) == []
+
+    def test_mixed_config_keeps_enabled_and_drops_disabled(self):
+        config = _make_config(
+            _make_rule("rule-enabled-1", _TAG_FILTER),
+            _make_rule("rule-disabled", {"Tag": {"Key": "env", "Value": "dev"}},
+                       status="Disabled"),
+            _make_rule(
+                "rule-enabled-2",
+                {"And": {"Prefix": "logs/", "Tags": [{"Key": "app", "Value": "svc"}]}},
+            ),
+        )
+        result = derive_rules(_SRC_BUCKET, config)
+        assert [r.rule_id for r in result] == ["rule-enabled-1", "rule-enabled-2"]
+
+
+class TestIsRuleEnabled:
+    """Direct coverage of the predicate, independent of the filter logic."""
+
+    @pytest.mark.parametrize("status", ["Enabled", "enabled", " ENABLED "])
+    def test_true_for_enabled(self, status):
+        assert is_rule_enabled({"Status": status}) is True
+
+    @pytest.mark.parametrize("status", ["Disabled", "", "Enable", "Enabledd"])
+    def test_false_for_other_strings(self, status):
+        assert is_rule_enabled({"Status": status}) is False
+
+    def test_false_when_absent(self):
+        assert is_rule_enabled({}) is False
+
+    @pytest.mark.parametrize("status", [None, 0, True, ["Enabled"]])
+    def test_false_for_non_string(self, status):
+        assert is_rule_enabled({"Status": status}) is False
+
+
+class TestDisabledTagScopedRuleCount:
+    """``count_disabled_tag_scoped_rules`` is what makes the drop visible."""
+
+    def test_counts_only_disabled_tag_scoped_rules(self):
+        config = _make_config(
+            _make_rule("enabled-tag", _TAG_FILTER),
+            _make_rule("disabled-tag", _TAG_FILTER, status="Disabled"),
+            _make_rule(
+                "disabled-and-tag",
+                {"And": {"Prefix": "logs/", "Tags": [{"Key": "app", "Value": "svc"}]}},
+                status="Disabled",
+            ),
+            # Not counted: no tag filter, so its Status is irrelevant.
+            _make_rule("disabled-prefix", {"Prefix": "data/"}, status="Disabled"),
+        )
+        assert count_disabled_tag_scoped_rules(config) == 2
+
+    def test_zero_when_all_enabled(self):
+        config = _make_config(_make_rule("enabled-tag", _TAG_FILTER))
+        assert count_disabled_tag_scoped_rules(config) == 0
+
+    def test_accepts_inner_config_dict(self):
+        inner = {
+            "Role": _ROLE_ARN,
+            "Rules": [_make_rule("disabled-tag", _TAG_FILTER, status="Disabled")],
+        }
+        assert count_disabled_tag_scoped_rules(inner) == 1
 
 
 # ---------------------------------------------------------------------------

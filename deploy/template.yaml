@@ -820,10 +820,20 @@ Resources:
       Role: !GetAtt LFGranterRole.Arn
       Timeout: 300
       Architectures: [arm64]
+      Environment:
+        Variables:
+          # Privileged parameters are supplied by the template, not by the
+          # invoking event, so a caller able to invoke this function cannot
+          # choose which principal becomes a data lake administrator.
+          PRINCIPAL_ARN: !GetAtt LFGranterRole.Arn
+          STACK_ID: !Ref AWS::StackId
+          # Catalog id for the mode check below.
+          ACCOUNT_ID: !Ref AWS::AccountId
       Code:
         ZipFile: |
           import json
           import logging
+          import os
           import boto3
           import random
           import time
@@ -833,6 +843,43 @@ Resources:
           logger.setLevel(logging.INFO)
 
           lf = boto3.client("lakeformation")
+          glue = boto3.client("glue")
+
+
+          # detect_mode is duplicated from LFPermissionsGranterFunction rather
+          # than shared. CloudFormation inline ZipFile code cannot be imported
+          # across two functions; sharing it would mean a Lambda layer or an S3
+          # artifact, and the Solution's one-template, no-prebuilt-asset
+          # deployment shape is worth more than de-duplicating twenty lines.
+          # The two copies are read-only against the same Glue API and are
+          # expected to agree; if one changes, change both.
+          def detect_mode():
+              # Never assume a mode when GetCatalog fails. Raising fails the
+              # resource, which matches LFPermissionsGranterFunction and adds
+              # no new failure mode: that function performs the same check on
+              # every deploy and already fails the stack when it cannot
+              # determine the mode.
+              account_id = os.environ["ACCOUNT_ID"]
+              last_exc = None
+              for attempt in range(5):
+                  try:
+                      cat = glue.get_catalog(
+                          CatalogId=f"{account_id}:s3tablescatalog/aws-s3"
+                      )
+                      principals = [
+                          p["Principal"]["DataLakePrincipalIdentifier"]
+                          for p in cat["Catalog"].get("CreateTableDefaultPermissions", [])
+                      ]
+                      return "IAM" if "IAM_ALLOWED_PRINCIPALS" in principals else "LF"
+                  except Exception as exc:
+                      last_exc = exc
+                      logger.warning("GetCatalog attempt %d failed: %s", attempt + 1, exc)
+                      if attempt < 4:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(
+                  "Cannot determine whether %s:s3tablescatalog/aws-s3 is in IAM or "
+                  "LF mode; last GetCatalog error: %s" % (account_id, last_exc)
+              )
 
 
           def put_with_retry(new_settings, max_attempts=10):
@@ -863,26 +910,98 @@ Resources:
               response = lf.get_data_lake_settings()
               settings = response["DataLakeSettings"]
               admins = settings.get("DataLakeAdmins", [])
-              settings["DataLakeAdmins"] = [
+              remaining = [
                   a for a in admins
                   if a.get("DataLakePrincipalIdentifier") != principal_arn
               ]
+              if len(remaining) == len(admins):
+                  # Nothing to remove, so no settings write. The Delete branch
+                  # is deliberately not gated on catalog mode -- an admin
+                  # registered while the catalog was in LF mode must stay
+                  # removable even if the mode has since changed -- and this
+                  # keeps an IAM-mode stack from rewriting account-wide
+                  # DataLakeSettings on delete when it registered nothing.
+                  logger.info("%s is not a data lake admin; nothing to remove", principal_arn)
+                  return
+              settings["DataLakeAdmins"] = remaining
               logger.info("Removing %s from data lake admins", principal_arn)
               put_with_retry({"DataLakeSettings": settings})
 
 
           def handler(event, context):
               try:
-                  principal_arn = event["ResourceProperties"]["PrincipalArn"]
+                  # Defence in depth behind the environment reads below: an
+                  # invocation that did not come from this stack's own
+                  # CloudFormation operations is rejected before any mutation.
+                  # The response reason is deliberately non-specific so a
+                  # caller probing the function learns nothing about the
+                  # expected value.
+                  if event.get("StackId") != os.environ["STACK_ID"]:
+                      logger.error("LFAdminGranter: request rejected")
+                      cfnresponse.send(
+                          event, context, cfnresponse.FAILED,
+                          {"Error": "Request rejected"},
+                      )
+                      return
+                  # PRINCIPAL_ARN comes from the environment, never from
+                  # event["ResourceProperties"], which an in-account caller
+                  # holding lambda:InvokeFunction controls.
+                  principal_arn = os.environ["PRINCIPAL_ARN"]
                   request_type = event.get("RequestType")
                   logger.info("LFAdminGranter: %s principal=%s", request_type, principal_arn)
                   if request_type == "Create":
-                      append_admin(principal_arn)
+                      # An IAM-mode catalog -- the documented default -- needs
+                      # no Lake Formation grants, so registering an
+                      # account-wide data lake administrator for it buys
+                      # nothing. LFPermissionsGranterFunction makes the same
+                      # check and issues no grant in IAM mode.
+                      mode = detect_mode()
+                      logger.info("LFAdminGranter: catalog mode=%s", mode)
+                      if mode == "IAM":
+                          logger.info(
+                              "LFAdminGranter: IAM mode, no admin registration needed"
+                          )
+                      else:
+                          append_admin(principal_arn)
                   elif request_type == "Delete":
                       try:
                           remove_admin(principal_arn)
                       except Exception as exc:
-                          logger.warning("Remove admin best-effort failed: %s", exc)
+                          # Judgement call, scan-aa27a832 Req 2.2: log at ERROR
+                          # and still respond SUCCESS, rather than responding
+                          # FAILED.
+                          #
+                          # Responding FAILED here puts the stack in
+                          # DELETE_FAILED, which this template is already prone
+                          # to for other reasons (the Athena workgroup and a
+                          # non-empty State Bucket both block a plain delete),
+                          # and it blocks the deletion of every other resource
+                          # rather than just this one. The failure it would be
+                          # reporting is also self-limiting: CloudFormation
+                          # deletes LFGranterRole regardless, so a stale
+                          # DataLakeAdmins entry names an ARN with no principal
+                          # behind it, and the role's physical name carries a
+                          # CloudFormation-generated suffix, so a later
+                          # same-named role is implausible.
+                          #
+                          # What Req 2.2 asks for is that the entry cannot
+                          # outlive the stack *unnoticed*. An ERROR naming the
+                          # exact ARN left behind and the API call to remove it
+                          # satisfies that: it is picked up by log-level alarms
+                          # and metric filters, where the previous WARNING was
+                          # not, and it hands the operator a one-command
+                          # remediation instead of a wedged stack.
+                          logger.error(
+                              "LFAdminGranter: failed to remove %s from the "
+                              "account's Lake Formation data lake "
+                              "administrators: %s. Stack deletion continues, so "
+                              "this entry may outlive the stack -- remove it by "
+                              "hand with lakeformation:PutDataLakeSettings, or "
+                              "confirm with 'aws lakeformation "
+                              "get-data-lake-settings'.",
+                              principal_arn,
+                              exc,
+                          )
                   cfnresponse.send(
                       event, context, cfnresponse.SUCCESS,
                       {"PrincipalArn": principal_arn},
@@ -919,10 +1038,32 @@ Resources:
       Role: !GetAtt LFGranterRole.Arn
       Timeout: 300
       Architectures: [arm64]
+      Environment:
+        Variables:
+          # Privileged parameters are supplied by the template, not by the
+          # invoking event, so a caller able to invoke this function cannot
+          # choose which principal is granted Lake Formation access, over which
+          # namespaces, or which role is assumed to issue the grant.
+          #
+          # Reconciling this with change detection (scan-aa27a832 Req 1.3):
+          # CloudFormation sends ExecuteLFPermissionsGranter an Update only when
+          # one of the custom resource's own properties changes, so
+          # SourceBucketNames has to stay listed there -- adding a source bucket
+          # must re-invoke this function or the new namespace never gets its
+          # grants. The same holds for LFAdminRoleArn and ExecutionRoleArn.
+          # Those properties are therefore retained as change triggers while the
+          # handler reads only these variables. Both sides resolve from the same
+          # template expressions, so they cannot disagree.
+          PRINCIPAL_ARN: !GetAtt ExecutionRole.Arn
+          SOURCE_BUCKET_NAMES: !Join [",", !Ref SourceBucketNames]
+          LF_ADMIN_ROLE_ARN: !If [HasLFAdminRole, !Ref LFAdminRoleArn, ""]
+          ACCOUNT_ID: !Ref AWS::AccountId
+          STACK_ID: !Ref AWS::StackId
       Code:
         ZipFile: |
           import json
           import logging
+          import os
           import time
           import boto3
           import cfnresponse
@@ -986,22 +1127,39 @@ Resources:
           def handler(event, context):
               physical_id = event.get("PhysicalResourceId", "lf-grants")
               try:
-                  props = event["ResourceProperties"]
+                  # Defence in depth behind the environment reads below: an
+                  # invocation that did not come from this stack's own
+                  # CloudFormation operations is rejected before any grant or
+                  # revocation. The response reason is deliberately
+                  # non-specific so a caller probing the function learns
+                  # nothing about the expected value.
+                  if event.get("StackId") != os.environ["STACK_ID"]:
+                      logger.error("LFPermissionsGranter: request rejected")
+                      cfnresponse.send(
+                          event, context, cfnresponse.FAILED,
+                          {"Error": "Request rejected"}, physical_id,
+                      )
+                      return
+                  # Every privileged value comes from the environment, never
+                  # from event["ResourceProperties"], which an in-account
+                  # caller holding lambda:InvokeFunction controls.
+                  account_id = os.environ["ACCOUNT_ID"]
+                  execution_role_arn = os.environ["PRINCIPAL_ARN"]
+                  lf_admin_role_arn = os.environ["LF_ADMIN_ROLE_ARN"]
+                  source_bucket_names = os.environ["SOURCE_BUCKET_NAMES"]
                   request_type = event.get("RequestType")
-                  logger.info("LFPermissionsGranter: %s account=%s", request_type, props.get("AccountId"))
+                  logger.info("LFPermissionsGranter: %s account=%s", request_type, account_id)
                   if request_type in ("Create", "Update"):
-                      lf, glue = get_clients(props.get("LFAdminRoleArn", ""))
-                      mode = detect_mode(glue, props["AccountId"])
+                      lf, glue = get_clients(lf_admin_role_arn)
+                      mode = detect_mode(glue, account_id)
                       logger.info("LFPermissionsGranter: catalog mode=%s", mode)
                       if mode == "IAM":
                           logger.info("LFPermissionsGranter: IAM mode, no grants needed")
                           cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
                           return
                       grants = []
-                      execution_role_arn = props["ExecutionRoleArn"]
-                      account_id = props["AccountId"]
                       catalog_id = f"{account_id}:s3tablescatalog/aws-s3"
-                      for bucket in props["SourceBucketNames"].split(","):
+                      for bucket in source_bucket_names.split(","):
                           namespace = "b_" + bucket.strip().replace(".", "_")
                           lf.grant_permissions(
                               Principal={"DataLakePrincipalIdentifier": execution_role_arn},
@@ -1027,16 +1185,27 @@ Resources:
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
                   elif request_type == "Delete":
                       try:
-                          grant_data = json.loads(physical_id)
-                          lf, _ = get_clients(props.get("LFAdminRoleArn", ""))
-                          for grant in grant_data.get("grants", []):
+                          # The revocation list is rebuilt from the environment
+                          # rather than parsed out of event["PhysicalResourceId"],
+                          # which an in-account caller controls. Parsing it there
+                          # let a forged Delete name any principal, catalog and
+                          # namespace in the account and have them revoked under
+                          # the assumed Lake Formation admin role -- the one path
+                          # where a forged event could reach beyond this stack's
+                          # own resources (diff scan scan-f1927e8a, f-756c9994).
+                          # It names the same grants the Create branch issued,
+                          # since both read the same variables.
+                          lf, _ = get_clients(lf_admin_role_arn)
+                          catalog_id = f"{account_id}:s3tablescatalog/aws-s3"
+                          for bucket in source_bucket_names.split(","):
+                              namespace = "b_" + bucket.strip().replace(".", "_")
                               try:
                                   lf.revoke_permissions(
-                                      Principal={"DataLakePrincipalIdentifier": grant["principal"]},
+                                      Principal={"DataLakePrincipalIdentifier": execution_role_arn},
                                       Resource={
                                           "Database": {
-                                              "CatalogId": grant["catalog_id"],
-                                              "Name": grant["namespace"],
+                                              "CatalogId": catalog_id,
+                                              "Name": namespace,
                                           }
                                       },
                                       Permissions=["DESCRIBE"],
@@ -1045,11 +1214,11 @@ Resources:
                                   logger.warning("Revoke database DESCRIBE failed (best-effort): %s", exc)
                               try:
                                   lf.revoke_permissions(
-                                      Principal={"DataLakePrincipalIdentifier": grant["principal"]},
+                                      Principal={"DataLakePrincipalIdentifier": execution_role_arn},
                                       Resource={
                                           "Table": {
-                                              "CatalogId": grant["catalog_id"],
-                                              "DatabaseName": grant["namespace"],
+                                              "CatalogId": catalog_id,
+                                              "DatabaseName": namespace,
                                               "TableWildcard": {},
                                           }
                                       },
@@ -1081,6 +1250,10 @@ Resources:
       - LFPermissionsGranterLogGroup
     Properties:
       ServiceToken: !GetAtt LFPermissionsGranterFunction.Arn
+      # ExecutionRoleArn, SourceBucketNames, AccountId, and LFAdminRoleArn are
+      # change-detection triggers only. The handler reads their values from its
+      # environment instead -- see the Environment block on
+      # LFPermissionsGranterFunction for why they appear in both places.
       ExecutionRoleArn: !GetAtt ExecutionRole.Arn
       SourceBucketNames: !Join [",", !Ref SourceBucketNames]
       AccountId: !Ref AWS::AccountId
@@ -1152,6 +1325,37 @@ Resources:
       Role: !GetAtt ConfigResourceRole.Arn
       Timeout: 300
       Architectures: [arm64]
+      Environment:
+        Variables:
+          # Privileged parameters are supplied by the template, not by the
+          # invoking event, so a caller able to invoke this function cannot
+          # choose which object is written or deleted. The Delete branch
+          # removes config/solution-config.json, which halts every scheduled
+          # run, so the target of that delete is the value most worth taking
+          # out of the caller's hands.
+          #
+          # The config object's whole content is here too, so a forged event
+          # can only reproduce what a legitimate deploy writes. Sourcing the
+          # bucket list, Region, and interval from the event would let a caller
+          # drop a bucket from monitoring -- silent non-replication -- or set a
+          # degenerate interval, and the poisoned object outlives the call
+          # (diff scan scan-972cfd4f, f-77d789f5).
+          #
+          # Reconciling this with change detection (scan-aa27a832 Req 1.3):
+          # CloudFormation sends SolutionConfig an Update only when one of the
+          # custom resource's own properties changes, so these values have to
+          # stay listed there as change triggers -- moving them here alone
+          # would leave the resource uninvoked when any of them changes. They
+          # are therefore in both places, and the handler reads only these.
+          # Both sides resolve from the same template expressions, so they
+          # cannot disagree; the properties are a trigger, not an input.
+          STATE_BUCKET: !Ref StateBucket
+          CONFIG_KEY: config/solution-config.json
+          SOURCE_BUCKET_NAMES: !Join [",", !Ref SourceBucketNames]
+          REGION: !Ref AWS::Region
+          CHECK_FREQUENCY_MINUTES: !Ref CheckFrequencyMinutes
+          KMS_KEY_ARN: !If [HasKmsKey, !Ref KmsKeyArn, ""]
+          STACK_ID: !Ref AWS::StackId
       Code:
         ZipFile: |
           """Config-writing custom resource handler (deploy/template.yaml ConfigResourceFunction).
@@ -1163,6 +1367,7 @@ Resources:
           checkpoint for each new source bucket. DELETE: removes config only.
           """
           import json
+          import os
           from datetime import datetime, timezone
 
           import boto3
@@ -1210,18 +1415,23 @@ Resources:
 
 
           def handler(event, context):
-              props = event.get("ResourceProperties", {})
-              bucket = props["StateBucket"]
-              key = props["ConfigKey"]
+              # Every value written comes from the environment, not the event; see template.
+              bucket = os.environ["STATE_BUCKET"]
+              key = os.environ["CONFIG_KEY"]
+              minutes = os.environ["CHECK_FREQUENCY_MINUTES"]
               try:
+                  if event.get("StackId") != os.environ["STACK_ID"]:
+                      cfnresponse.send(event, context, cfnresponse.FAILED,
+                                       {"Error": "Request rejected"})
+                      return
                   if event["RequestType"] == "Delete":
                       s3.delete_object(Bucket=bucket, Key=key)  # idempotent: 204 even if absent
                   else:  # Create or Update
-                      region = props["Region"]
-                      names = props["Buckets"]  # list from CommaDelimitedList parameter
+                      region = os.environ["REGION"]
+                      names = [n for n in os.environ["SOURCE_BUCKET_NAMES"].split(",") if n]
                       config = {
                           "buckets": [{"name": n, "region": region} for n in names],
-                          "processing_interval": _interval_from_minutes(props["CheckFrequencyMinutes"]),
+                          "processing_interval": _interval_from_minutes(minutes),
                       }
                       put_kwargs = {
                           "Bucket": bucket,
@@ -1229,12 +1439,12 @@ Resources:
                           "Body": json.dumps(config).encode("utf-8"),
                           "ContentType": "application/json",
                       }
-                      kms_key_arn = props.get("KmsKeyArn", "").strip()
+                      kms_key_arn = os.environ.get("KMS_KEY_ARN", "").strip()
                       if kms_key_arn:
                           put_kwargs["ServerSideEncryption"] = "aws:kms"
                           put_kwargs["SSEKMSKeyId"] = kms_key_arn
                       s3.put_object(**put_kwargs)
-                      # Seed checkpoint for newly added buckets only.
+                      # Seed newly added buckets only; every seed write is conditional.
                       if event["RequestType"] == "Create":
                           to_seed = names
                       else:
@@ -1242,7 +1452,7 @@ Resources:
                           to_seed = [n for n in names if n not in old]
                       if to_seed:
                           _seed_checkpoints(bucket, to_seed, kms_key_arn)
-                  freq_seconds = str(int(props["CheckFrequencyMinutes"]) * 60)
+                  freq_seconds = str(int(minutes) * 60)
                   cfnresponse.send(
                       event, context, cfnresponse.SUCCESS,
                       {"CheckFrequencySeconds": freq_seconds},
@@ -1269,6 +1479,12 @@ Resources:
       - ConfigResourceLogGroup
     Properties:
       ServiceToken: !GetAtt ConfigResourceFunction.Arn
+      # Every property below is a change-detection trigger only. The handler
+      # reads all of them from its environment instead -- see the Environment
+      # block on ConfigResourceFunction for why they appear in both places.
+      # Buckets on an Update event is still read from here, and only narrows
+      # which of the environment's bucket names are seeded; a seed write is
+      # conditional on the state object not already existing.
       StateBucket: !Ref StateBucket
       ConfigKey: config/solution-config.json
       Buckets: !Ref SourceBucketNames

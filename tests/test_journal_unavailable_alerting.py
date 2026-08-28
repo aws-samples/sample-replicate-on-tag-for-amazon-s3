@@ -198,14 +198,20 @@ def _base_payload(alerts: dict | None = None) -> dict:
     return payload
 
 
-def _claim(client: MagicMock, now: datetime) -> tuple[bool, str | None]:
-    """Claim using the interval the orchestrator really passes, so these tests
+def _due(client: MagicMock, now: datetime) -> bool:
+    """Check using the interval the orchestrator really passes, so these tests
     keep testing the shipped behavior if that constant is retuned."""
-    return StateStore().claim_journal_unavailable_alert(
+    return StateStore().journal_unavailable_alert_due(
         client, _STATE_BUCKET, _SRC_BUCKET, _SRC_BUCKET,
         now=now,
         min_interval=JOURNAL_UNAVAILABLE_REALERT_INTERVAL,
-        current_etag=_ETAG,
+    )
+
+
+def _record(client: MagicMock, now: datetime) -> str:
+    return StateStore().record_journal_unavailable_alert(
+        client, _STATE_BUCKET, _SRC_BUCKET, _SRC_BUCKET,
+        now=now, current_etag=_ETAG,
     )
 
 
@@ -215,57 +221,42 @@ _WITHIN_INTERVAL = JOURNAL_UNAVAILABLE_REALERT_INTERVAL / 2
 _PAST_INTERVAL = JOURNAL_UNAVAILABLE_REALERT_INTERVAL + timedelta(minutes=1)
 
 
-class TestClaimJournalUnavailableAlert:
-    def test_first_claim_succeeds_and_records_the_time(self):
+class TestJournalUnavailableAlertDue:
+    def test_no_recorded_alert_is_due_without_writing(self):
         client = _s3_with_payload(_base_payload())
-        should_alert, etag = _claim(client, _NOW)
+        assert _due(client, _NOW) is True
+        client.put_object.assert_not_called()
 
-        assert should_alert is True
-        assert etag == _NEW_ETAG
-        written = json.loads(
-            client.put_object.call_args.kwargs["Body"].decode("utf-8")
-        )
-        assert written["journal_unavailable_alerts"] == {
-            _SRC_BUCKET: _NOW.isoformat()
-        }
-
-    def test_claim_with_no_state_object_succeeds(self):
+    def test_due_with_no_state_object(self):
         """A bucket failing its very first read has no state object yet."""
         client = _s3_with_payload(None)
-        should_alert, _ = _claim(client, _NOW)
-        assert should_alert is True
+        assert _due(client, _NOW) is True
 
-    def test_second_claim_inside_the_interval_is_refused_without_writing(self):
+    def test_inside_the_interval_is_not_due(self):
         """This is what stops one email per interval, indefinitely."""
         client = _s3_with_payload(
             _base_payload({_SRC_BUCKET: _NOW.isoformat()})
         )
-        should_alert, etag = _claim(client, _NOW + _WITHIN_INTERVAL)
-
-        assert should_alert is False
-        assert etag == _ETAG, "the held ETag must be returned unchanged"
+        assert _due(client, _NOW + _WITHIN_INTERVAL) is False
         client.put_object.assert_not_called()
 
-    def test_claim_after_the_interval_elapses_succeeds_again(self):
+    def test_due_again_after_the_interval_elapses(self):
         """An unmet prerequisite keeps reminding rather than going quiet."""
         client = _s3_with_payload(
             _base_payload({_SRC_BUCKET: _NOW.isoformat()})
         )
-        should_alert, _ = _claim(client, _NOW + _PAST_INTERVAL)
-        assert should_alert is True
+        assert _due(client, _NOW + _PAST_INTERVAL) is True
 
-    def test_a_different_bucket_claims_independently(self):
+    def test_a_different_bucket_is_due_independently(self):
         client = _s3_with_payload(
             _base_payload({"other-bucket": _NOW.isoformat()})
         )
-        should_alert, _ = _claim(client, _NOW)
-        assert should_alert is True
+        assert _due(client, _NOW) is True
 
     def test_unparseable_timestamp_is_treated_as_absent(self):
         """Fails toward an extra alert, not toward silence forever."""
         client = _s3_with_payload(_base_payload({_SRC_BUCKET: "not-a-date"}))
-        should_alert, _ = _claim(client, _NOW)
-        assert should_alert is True
+        assert _due(client, _NOW) is True
 
     def test_naive_timestamp_does_not_raise(self):
         """A hand-edited value without a timezone must not crash the alert
@@ -273,8 +264,33 @@ class TestClaimJournalUnavailableAlert:
         client = _s3_with_payload(
             _base_payload({_SRC_BUCKET: "2026-03-01T12:00:00"})
         )
-        should_alert, _ = _claim(client, _NOW + _WITHIN_INTERVAL)
-        assert should_alert is False
+        assert _due(client, _NOW + _WITHIN_INTERVAL) is False
+
+
+class TestRecordJournalUnavailableAlert:
+    def test_records_the_time_and_returns_the_new_etag(self):
+        client = _s3_with_payload(_base_payload())
+        assert _record(client, _NOW) == _NEW_ETAG
+
+        written = json.loads(
+            client.put_object.call_args.kwargs["Body"].decode("utf-8")
+        )
+        assert written["journal_unavailable_alerts"] == {
+            _SRC_BUCKET: _NOW.isoformat()
+        }
+
+    def test_records_against_a_missing_state_object(self):
+        client = _s3_with_payload(None)
+        assert _record(client, _NOW) == _NEW_ETAG
+
+    def test_recording_suppresses_the_next_check(self):
+        """The two halves compose: what record writes is what due reads."""
+        client = _s3_with_payload(_base_payload())
+        _record(client, _NOW)
+        written = json.loads(
+            client.put_object.call_args.kwargs["Body"].decode("utf-8")
+        )
+        assert _due(_s3_with_payload(written), _NOW + _WITHIN_INTERVAL) is False
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +300,9 @@ class TestClaimJournalUnavailableAlert:
 
 def _run_with_journal_errors(
     journal_errors: list[JournalReadError],
-    claim_result: tuple[bool, str] = (True, _NEW_ETAG),
+    alert_due: bool = True,
+    due_error: Exception | None = None,
+    record_error: Exception | None = None,
     on_journal_unavailable=None,
     on_bucket_disabled=None,
 ):
@@ -314,7 +332,12 @@ def _run_with_journal_errors(
         _ETAG,
     )
     mock_store.get_submission_records.return_value = {}
-    mock_store.claim_journal_unavailable_alert.return_value = claim_result
+    mock_store.journal_unavailable_alert_due.return_value = alert_due
+    mock_store.record_journal_unavailable_alert.return_value = _NEW_ETAG
+    if due_error is not None:
+        mock_store.journal_unavailable_alert_due.side_effect = due_error
+    if record_error is not None:
+        mock_store.record_journal_unavailable_alert.side_effect = record_error
 
     runtime_config = {
         "state_bucket": _STATE_BUCKET,
@@ -404,16 +427,18 @@ class TestJournalUnavailableEscalation:
         is what keeps the condition from being wholly silent."""
         emitted, mock_store = _run_with_journal_errors([_unavailable_error()])
         assert "journal_unavailable" in _audit_actions(emitted)
-        mock_store.claim_journal_unavailable_alert.assert_not_called()
+        mock_store.journal_unavailable_alert_due.assert_not_called()
+        mock_store.record_journal_unavailable_alert.assert_not_called()
 
-    def test_alert_suppressed_when_the_claim_is_refused(self):
+    def test_alert_suppressed_when_it_is_not_due(self):
         alerts: list = []
-        emitted, _ = _run_with_journal_errors(
+        emitted, mock_store = _run_with_journal_errors(
             [_unavailable_error()],
-            claim_result=(False, _ETAG),
+            alert_due=False,
             on_journal_unavailable=lambda b, c: alerts.append(b),
         )
         assert alerts == []
+        mock_store.record_journal_unavailable_alert.assert_not_called()
         # Still logged every interval, only the notification is rate-limited.
         assert "journal_unavailable" in _audit_actions(emitted)
 
@@ -436,61 +461,49 @@ class TestJournalUnavailableEscalation:
         )
         assert alerts == []
         assert "journal_unavailable" not in _audit_actions(emitted)
-        mock_store.claim_journal_unavailable_alert.assert_not_called()
+        mock_store.journal_unavailable_alert_due.assert_not_called()
 
-    def test_alert_still_sent_when_the_claim_write_fails(self):
+    def test_alert_still_sent_when_the_due_check_fails(self):
         """Losing the notification is worse than sending a duplicate."""
         alerts: list = []
-        mock_store = mock_state_store()
-        mock_store.get_checkpoint.return_value = (
-            CheckpointState(
-                source_bucket=_SRC_BUCKET,
-                last_processed_watermark="2026-01-01T00:00:00.000000Z",
-            ),
-            _ETAG,
+        _run_with_journal_errors(
+            [_unavailable_error()],
+            due_error=RuntimeError("state read failed"),
+            on_journal_unavailable=lambda b, c: alerts.append(b),
         )
-        mock_store.get_submission_records.return_value = {}
-        mock_store.claim_journal_unavailable_alert.side_effect = RuntimeError(
-            "state write failed"
-        )
+        assert alerts == [_SRC_BUCKET]
 
-        from src.core.models import DerivedReplicationRule, DestinationRef
-        rule = DerivedReplicationRule(
-            source_bucket=_SRC_BUCKET,
-            replication_config_id="rule-1",
-            rule_id="r1",
-            tag_filter={"repl": "true"},
-            destination=DestinationRef(bucket_arn="arn:aws:s3:::dest"),
+    def test_suppression_is_recorded_after_a_delivered_alert(self):
+        _, mock_store = _run_with_journal_errors(
+            [_unavailable_error()], on_journal_unavailable=lambda b, c: None,
+        )
+        mock_store.record_journal_unavailable_alert.assert_called_once()
+        assert (
+            mock_store.record_journal_unavailable_alert.call_args.args[3]
+            == _SRC_BUCKET
         )
 
-        with patch("src.orchestrator.ClientFactory", return_value=MagicMock()), \
-             patch(
-                 "src.orchestrator.replication_config_adapter.get_replication_rules",
-                 return_value=([rule], []),
-             ), \
-             patch(
-                 "src.orchestrator.state_store_module.StateStore",
-                 return_value=mock_store,
-             ), \
-             patch(
-                 "src.orchestrator.athena_journal_adapter.find_row_count_boundary",
-                 return_value=None,
-             ), \
-             patch(
-                 "src.orchestrator.athena_journal_adapter.read_journal",
-                 return_value=([], [_unavailable_error()]),
-             ), \
-             patch("src.orchestrator.MetricsPublisher"):
-            run_interval(_CONFIG, {
-                "state_bucket": _STATE_BUCKET,
-                "athena_workgroup": _WORKGROUP,
-                "athena_output_location": _OUTPUT,
-                "account_id": _ACCOUNT,
-                "batch_operations_role_arn": _BATCHOPS_ROLE_ARN,
-                "region": "us-west-2",
-                "on_journal_unavailable": lambda b, c: alerts.append(b),
-            })
+    def test_a_failed_publish_leaves_suppression_unset(self):
+        """The point of the ordering. A publish that raises must not spend the
+        interval, or a stalled bucket goes unannounced for a whole interval
+        while the condition recurs every run."""
+        def boom(bucket, cause):
+            raise RuntimeError("SNS down")
 
+        _, mock_store = _run_with_journal_errors(
+            [_unavailable_error()], on_journal_unavailable=boom,
+        )
+        mock_store.record_journal_unavailable_alert.assert_not_called()
+
+    def test_a_failed_suppression_write_does_not_break_the_run(self):
+        """It costs one duplicate alert on the next interval, which is the
+        direction this path already fails in."""
+        alerts: list = []
+        _run_with_journal_errors(
+            [_unavailable_error()],
+            record_error=RuntimeError("state write failed"),
+            on_journal_unavailable=lambda b, c: alerts.append(b),
+        )
         assert alerts == [_SRC_BUCKET]
 
     def test_callback_exception_does_not_break_the_run(self):
@@ -509,7 +522,8 @@ class TestJournalUnavailableEscalation:
         protect.
         """
         _, mock_store = _run_with_journal_errors([])
-        mock_store.claim_journal_unavailable_alert.assert_not_called()
+        mock_store.journal_unavailable_alert_due.assert_not_called()
+        mock_store.record_journal_unavailable_alert.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

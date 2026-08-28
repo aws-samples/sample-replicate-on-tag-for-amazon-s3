@@ -300,6 +300,74 @@ class TestZeroTagScopedRules:
 
 
 # ---------------------------------------------------------------------------
+# Skip: the only tag-scoped rule is Disabled (Req. 3.1)
+# ---------------------------------------------------------------------------
+
+
+def _disabled_tag_rule(rule_id: str, key: str = "env", value: str = "prod") -> dict:
+    rule = _tag_rule(rule_id, key, value)
+    rule["Status"] = "Disabled"
+    return rule
+
+
+class TestDisabledTagScopedRules:
+    """``rule_deriver`` drops a Disabled rule silently; the skip reason is the
+    only operator-facing signal, so it must not read as an untagged config."""
+
+    def test_disabled_only_config_produces_skip(self):
+        client = _s3_client_returning(
+            _replication_response(_disabled_tag_rule("rule-disabled"))
+        )
+        rules, skips = get_replication_rules(client, _bucket())
+
+        assert rules == []
+        assert len(skips) == 1
+
+    def test_skip_reason_names_the_disabled_rule_as_the_cause(self):
+        client = _s3_client_returning(
+            _replication_response(_disabled_tag_rule("rule-disabled"))
+        )
+        _, skips = get_replication_rules(client, _bucket())
+
+        reason = skips[0].reason
+        assert "1 tag-scoped rule(s) were excluded" in reason
+        assert "Status Enabled" in reason
+
+    def test_skip_reason_counts_every_excluded_rule(self):
+        client = _s3_client_returning(
+            _replication_response(
+                _disabled_tag_rule("d1"),
+                _disabled_tag_rule("d2", key="tier", value="hot"),
+                # Not counted: no tag filter, so Status is irrelevant to it.
+                _prefix_rule("p1"),
+            )
+        )
+        _, skips = get_replication_rules(client, _bucket())
+
+        assert "2 tag-scoped rule(s) were excluded" in skips[0].reason
+
+    def test_untagged_config_reason_does_not_mention_status(self):
+        """The prefix-only case must stay distinguishable from the Disabled case."""
+        client = _s3_client_returning(_replication_response(_prefix_rule("p1")))
+        _, skips = get_replication_rules(client, _bucket())
+
+        assert "excluded" not in skips[0].reason
+        assert "Status" not in skips[0].reason
+
+    def test_enabled_rule_alongside_disabled_still_derived(self):
+        client = _s3_client_returning(
+            _replication_response(
+                _disabled_tag_rule("rule-disabled"),
+                _tag_rule("rule-enabled"),
+            )
+        )
+        rules, skips = get_replication_rules(client, _bucket())
+
+        assert [r.rule_id for r in rules] == ["rule-enabled"]
+        assert skips == []
+
+
+# ---------------------------------------------------------------------------
 # SkipReport dataclass shape
 # ---------------------------------------------------------------------------
 
