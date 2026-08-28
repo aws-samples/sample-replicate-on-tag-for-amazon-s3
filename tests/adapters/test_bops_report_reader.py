@@ -1,616 +1,259 @@
-"""Unit tests for src/adapters/bops_report_reader.py — task 13.2.
-
-Covers Requirements 2.1, 2.7, 8.1:
-- List-then-read across one and several report CSV objects under a prefix.
-- Rows with mixed TaskStatus are all included.
-- Empty prefix returns [].
-- VersionId column parsed (including empty -> None).
-- report_object_exists existence-only check.
-"""
+"""Focused tests for manifest-led BOPS completion report reads."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import base64
+import hashlib
+import json
+from datetime import UTC, datetime
+from unittest.mock import MagicMock, call
 
 import pytest
+from botocore.exceptions import ClientError
 
 from src.adapters.bops_report_reader import (
+    BopsCompletionReport,
+    CompletionReportMalformed,
+    CompletionReportNotReady,
+    _manifest_key,
     read_bops_completion_report,
-    report_object_exists,
+    report_manifest_written_at,
 )
-from src.core.models import ManifestEntry
 
 _STATE_BUCKET = "state-bucket"
-_PREFIX = "completion-reports/cfg-1/job-abc/"
+_PREFIX = "completion-reports/cfg-1/manifest-1/"
+_JOB_ID = "abc"
+_MANIFEST_KEY = f"{_PREFIX}/job-{_JOB_ID}/manifest.json"
+_SCHEMA = "Bucket, Key, VersionId, TaskStatus, ErrorCode, HTTPStatusCode, ResultMessage"
 
 
-def _mock_body(text: str) -> MagicMock:
+def _body(contents: bytes) -> MagicMock:
     body = MagicMock()
-    body.read.return_value = text.encode("utf-8")
+    body.read.return_value = contents
     return body
 
 
-def _csv_row(
-    bucket: str,
-    key: str,
-    version_id: str,
-    task_status: str = "SUCCEEDED",
+def _result(key: str, contents: bytes) -> dict[str, str]:
+    # MD5 is the digest the S3 Batch Operations report manifest format specifies,
+    # so it is not a choice here; usedforsecurity=False says so, matching
+    # data_file_hasher and inventory_manifest_writer. See FP1 in
+    # .holmes/accepted-risks.md.
+    return {
+        "Key": key,
+        "MD5Checksum": base64.b64encode(
+            hashlib.md5(contents, usedforsecurity=False).digest()
+        ).decode("ascii"),
+    }
+
+
+def _s3_result(key: str, contents: bytes) -> dict[str, str]:
+    """Mirror the hexadecimal MD5 form emitted by S3 Batch Operations."""
+    return {
+        "Key": key,
+        "MD5Checksum": hashlib.md5(contents, usedforsecurity=False).hexdigest(),
+    }
+
+
+def _manifest(results: list[dict[str, str]], creation_date: str = "2026-08-26T12:34:56Z") -> bytes:
+    return json.dumps(
+        {
+            "Format": "Report_CSV_20180820",
+            "ReportCreationDate": creation_date,
+            "ReportSchema": _SCHEMA,
+            "Results": results,
+        }
+    ).encode("utf-8")
+
+
+def _row(
+    bucket: str = "source-bucket",
+    key: str = "object.txt",
+    version_id: str = "version-1",
+    status: str = "succeeded",
+    http_status: str = "200",
     error_code: str = "",
-    http_status_code: str = "200",
-    result_message: str = "",
-) -> str:
-    """Build one completion-report row in the order the service actually writes.
-
-    Columns are ``Bucket, Key, VersionId, TaskStatus, HTTPStatusCode,
-    ErrorCode, ResultMessage``. That transposes HTTPStatusCode and ErrorCode
-    relative to the order AWS documents; see ``_REPORT_COLUMN_ORDER_NOTE`` in
-    ``src/adapters/bops_report_reader.py`` for the evidence.
-
-    This helper previously emitted the documented order, which matched the
-    reader's own assumption at the time. The two agreed with each other and
-    disagreed with S3, so the suite passed while the reader parsed the HTTP
-    status code as the ErrorCode. Keep this helper aligned with the service,
-    never with the reader.
-    """
-    return (
-        f"{bucket},{key},{version_id},{task_status},"
-        f"{http_status_code},{error_code},{result_message}"
-    )
+    message: str = "success",
+) -> bytes:
+    return f"{bucket},{key},{version_id},{status},{http_status},{error_code},{message}".encode()
 
 
-class TestReadBopsCompletionReportSingleObject:
-    def test_single_object_single_row(self):
+def _client(manifest: bytes, results: dict[str, bytes]) -> MagicMock:
+    client = MagicMock()
+    client.get_object.side_effect = [
+        {"Body": _body(manifest)},
+        *({"Body": _body(contents)} for contents in results.values()),
+    ]
+    return client
+
+
+class TestReportManifestExists:
+    def test_preserves_trailing_prefix_separator_used_by_s3_batch_operations(self):
+        """S3 appends its job segment even when the configured prefix ends in /.
+
+        This matches the report placement observed from a real Batch Operations
+        job: ``<submitted-prefix>//job-<id>/manifest.json``.
+        """
+        trailing_prefix = "completion-reports/cfg-1/manifest-1/"
+
+        assert _manifest_key(trailing_prefix, _JOB_ID) == (
+            "completion-reports/cfg-1/manifest-1//job-abc/manifest.json"
+        )
+
+    def test_returns_the_manifests_last_modified(self):
+        written_at = datetime(2026, 8, 27, 9, 49, 46, tzinfo=UTC)
         client = MagicMock()
+        client.head_object.return_value = {"LastModified": written_at}
+
+        assert (
+            report_manifest_written_at(client, _STATE_BUCKET, _PREFIX, _JOB_ID)
+            == written_at
+        )
+
+        client.head_object.assert_called_once_with(Bucket=_STATE_BUCKET, Key=_MANIFEST_KEY)
+        client.list_objects_v2.assert_not_called()
+
+    def test_a_response_without_last_modified_yields_none(self):
+        """An unusable timestamp must not read as a freshly written report.
+
+        Returning something truthy here would make the unconsumed-report
+        escalation measure elapsed time from nothing.
+        """
+        client = MagicMock()
+        client.head_object.return_value = {}
+
+        assert report_manifest_written_at(client, _STATE_BUCKET, _PREFIX, _JOB_ID) is None
+
+    def test_sidecars_without_the_top_level_manifest_are_not_a_ready_report(self):
+        """Sidecar result objects cannot suppress a missing-report alert."""
+        client = MagicMock()
+        client.head_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "HeadObject"
+        )
         client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-            "IsTruncated": False,
+            "Contents": [{"Key": f"{_PREFIX}/job-{_JOB_ID}/results/part.csv"}]
         }
-        client.get_object.return_value = {
-            "Body": _mock_body(_csv_row("my-bucket", "key-a", "v1"))
-        }
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert entries == [
-            ManifestEntry(source_bucket="my-bucket", object_key="key-a", version_id="v1")
+
+        assert report_manifest_written_at(client, _STATE_BUCKET, _PREFIX, _JOB_ID) is None
+
+        client.head_object.assert_called_once_with(Bucket=_STATE_BUCKET, Key=_MANIFEST_KEY)
+        client.list_objects_v2.assert_not_called()
+
+
+class TestReadBopsCompletionReport:
+    def test_accepts_hex_md5_checksum_from_an_s3_completion_report(self):
+        result = _row()
+        result_key = f"{_PREFIX}/job-{_JOB_ID}/results/part.csv"
+        client = _client(_manifest([_s3_result(result_key, result)]), {result_key: result})
+
+        report = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 1)
+
+        assert [entry.object_key for entry in report.entries] == ["object.txt"]
+
+    def test_reads_only_manifest_declared_results_and_returns_typed_report(self):
+        first = _row(key="first.txt")
+        second = _row(key="second.txt", status="failed", http_status="500", error_code="AccessDenied")
+        first_key = f"{_PREFIX}/job-{_JOB_ID}/results/first.csv"
+        second_key = f"{_PREFIX}/job-{_JOB_ID}/results/second.csv"
+        client = _client(
+            _manifest([_result(first_key, first), _result(second_key, second)]),
+            {first_key: first, second_key: second},
+        )
+
+        report = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 2)
+
+        assert report == BopsCompletionReport(
+            created_at=datetime(2026, 8, 26, 12, 34, 56, tzinfo=UTC),
+            entries=tuple(report.entries),
+        )
+        assert [entry.object_key for entry in report.entries] == ["first.txt", "second.txt"]
+        assert report.entries[1].error_code == "AccessDenied"
+        assert client.get_object.call_args_list == [
+            call(Bucket=_STATE_BUCKET, Key=_MANIFEST_KEY),
+            call(Bucket=_STATE_BUCKET, Key=first_key),
+            call(Bucket=_STATE_BUCKET, Key=second_key),
+        ]
+        client.list_objects_v2.assert_not_called()
+
+    def test_missing_top_level_manifest_is_not_ready(self):
+        client = MagicMock()
+        client.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject"
+        )
+
+        with pytest.raises(CompletionReportNotReady):
+            read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 1)
+
+        client.get_object.assert_called_once_with(Bucket=_STATE_BUCKET, Key=_MANIFEST_KEY)
+
+    def test_missing_manifest_declared_result_is_not_ready(self):
+        result_key = f"{_PREFIX}/job-{_JOB_ID}/results/part.csv"
+        result = _row()
+        client = MagicMock()
+        client.get_object.side_effect = [
+            {"Body": _body(_manifest([_result(result_key, result)]))},
+            ClientError({"Error": {"Code": "404", "Message": "missing"}}, "GetObject"),
         ]
 
-    def test_single_object_multiple_rows(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-            "IsTruncated": False,
-        }
-        csv_text = "\n".join(
-            [
-                _csv_row("my-bucket", "key-a", "v1"),
-                _csv_row("my-bucket", "key-b", "v2", task_status="FAILED"),
-            ]
-        )
-        client.get_object.return_value = {"Body": _mock_body(csv_text)}
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert len(entries) == 2
-        assert entries[0].object_key == "key-a"
-        assert entries[1].object_key == "key-b"
+        with pytest.raises(CompletionReportNotReady):
+            read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 1)
 
-    def test_mixed_task_status_rows_all_included(self):
-        """Every listed object version is included regardless of TaskStatus."""
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-            "IsTruncated": False,
-        }
-        csv_text = "\n".join(
-            [
-                _csv_row("my-bucket", "key-ok", "v1", task_status="SUCCEEDED"),
-                _csv_row("my-bucket", "key-failed", "v2", task_status="FAILED"),
-            ]
-        )
-        client.get_object.return_value = {"Body": _mock_body(csv_text)}
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        keys = {e.object_key for e in entries}
-        assert keys == {"key-ok", "key-failed"}
+    def test_checksum_mismatch_is_malformed(self):
+        result_key = f"{_PREFIX}/job-{_JOB_ID}/results/part.csv"
+        expected = _row()
+        client = _client(_manifest([_result(result_key, expected)]), {result_key: _row(key="changed.txt")})
 
-    def test_empty_version_id_column_parsed_as_none(self):
-        """An unversioned bucket's report row has an empty VersionId column."""
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-            "IsTruncated": False,
-        }
-        client.get_object.return_value = {
-            "Body": _mock_body(_csv_row("my-bucket", "key-unversioned", ""))
-        }
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert len(entries) == 1
-        assert entries[0].version_id is None
-
-    def test_empty_error_code_column_parsed_as_none(self):
-        """A succeeded task's report row has an empty ErrorCode column."""
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-            "IsTruncated": False,
-        }
-        client.get_object.return_value = {
-            "Body": _mock_body(_csv_row("my-bucket", "key-a", "v1"))
-        }
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert len(entries) == 1
-        assert entries[0].error_code is None
-
-    def test_error_code_column_parsed(self):
-        """A failed task's report row carries its ErrorCode verbatim."""
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-            "IsTruncated": False,
-        }
-        client.get_object.return_value = {
-            "Body": _mock_body(
-                _csv_row(
-                    "my-bucket", "key-a", "v1",
-                    task_status="FAILED",
-                    error_code="InitiateReplicationNotPermitted",
-                )
-            )
-        }
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert len(entries) == 1
-        assert entries[0].error_code == "InitiateReplicationNotPermitted"
-
-
-class TestRetainedReportColumns:
-    """TaskStatus, HTTPStatusCode and ResultMessage are retained, not skipped.
-
-    These three columns were previously read past and discarded, which left
-    ErrorCode as the only evidence of a task failure. ErrorCode alone is often
-    too generic to identify a cause: an object in an archived storage class
-    reports only ``SrcObjectNotEligible``, a code that names no storage class
-    and covers unrelated conditions, so ResultMessage is frequently the sole
-    distinguishing column.
-    """
-
-    @staticmethod
-    def _read_one(row: str) -> ManifestEntry:
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-            "IsTruncated": False,
-        }
-        client.get_object.return_value = {"Body": _mock_body(row)}
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert len(entries) == 1
-        return entries[0]
-
-    def test_archived_object_failure_row_fully_parsed(self):
-        """The exact row shape S3 wrote for a GLACIER object.
-
-        Transcribed from the results CSV of job
-        17a27c3a-aa18-4bc7-91a6-caeaaa28dd8c in the us-west-2 test
-        deployment, including the counter-intuitive HTTP 500 on what is a
-        permanent, non-retryable condition.
-        """
-        row = (
-            "amzn-s3-demo-source,archived.txt,MPJOm_.lSga3Ql8P4u3oHCfdi3qsWvEJ,"
-            "failed,500,SrcObjectNotEligible,"
-            "Object is not eligible for replication"
-        )
-        entry = self._read_one(row)
-        assert entry.error_code == "SrcObjectNotEligible"
-        assert entry.task_status == "failed"
-        assert entry.http_status_code == "500"
-        assert entry.result_message == "Object is not eligible for replication"
-
-    def test_succeeded_row_retains_status_and_message(self):
-        """The control row from the same job."""
-        row = (
-            "amzn-s3-demo-source,control.txt,lIX2YStkv89bYPmWWEC_kjyko28mvprC,"
-            "succeeded,200,,success"
-        )
-        entry = self._read_one(row)
-        assert entry.error_code is None
-        assert entry.task_status == "succeeded"
-        assert entry.http_status_code == "200"
-        assert entry.result_message == "success"
-
-    def test_empty_trailing_result_message_parsed_as_none(self):
-        """A row whose ResultMessage column is present but empty."""
-        entry = self._read_one(_csv_row("my-bucket", "key-a", "v1"))
-        assert entry.result_message is None
-        assert entry.task_status == "SUCCEEDED"
-        assert entry.http_status_code == "200"
-
-    def test_declared_column_order_also_parses_correctly(self):
-        """A row in the documented order parses identically.
-
-        The layout belongs to the report schema version named by
-        ``Report.Format`` rather than being fixed, so a version this Solution
-        has not seen could order these two columns either way. The reader
-        resolves them by content, and both orders are asserted here so the
-        property cannot regress into a positional read.
-        """
-        emitted = self._read_one(
-            "my-bucket,key-a,v1,failed,500,SrcObjectNotEligible,"
-            "Object is not eligible for replication"
-        )
-        declared = self._read_one(
-            "my-bucket,key-a,v1,failed,SrcObjectNotEligible,500,"
-            "Object is not eligible for replication"
-        )
-        for entry in (emitted, declared):
-            assert entry.error_code == "SrcObjectNotEligible"
-            assert entry.http_status_code == "500"
-        assert emitted == declared
-
-    def test_succeeded_row_parses_under_either_order(self):
-        """The empty ErrorCode lands in a different column in each order."""
-        emitted = self._read_one("my-bucket,key-a,v1,succeeded,200,,success")
-        declared = self._read_one("my-bucket,key-a,v1,succeeded,,200,success")
-        for entry in (emitted, declared):
-            assert entry.error_code is None
-            assert entry.http_status_code == "200"
-
-    def test_non_numeric_error_codes_resolve_from_either_position(self):
-        """Symbolic error codes are separable from a status code wherever they sit."""
-        for code in ("PermanentFailure", "InitiateReplicationNotPermitted",
-                     "AccessDenied", "NoSuchKey"):
-            emitted = self._read_one(f"b,k,v,failed,400,{code},msg")
-            declared = self._read_one(f"b,k,v,failed,{code},400,msg")
-            assert emitted.error_code == code, code
-            assert declared.error_code == code, code
-            assert emitted.http_status_code == "400", code
-            assert declared.http_status_code == "400", code
-
-    def test_both_columns_empty_yields_no_error_code(self):
-        """Neither column looks like a status; the fallback choice cannot matter."""
-        entry = self._read_one("my-bucket,key-a,v1,succeeded,,,")
-        assert entry.error_code is None
-        assert entry.http_status_code is None
-
-    def test_ambiguous_numeric_pair_falls_back_to_observed_order(self):
-        """Two status-shaped values keep the layout of the requested version.
-
-        Not observed in any report or documented example, and it would need a
-        numeric ErrorCode. Pinned so the fallback is a decision rather than an
-        accident.
-        """
-        entry = self._read_one("my-bucket,key-a,v1,failed,500,404,msg")
-        assert entry.http_status_code == "500"
-        assert entry.error_code == "404"
-
-    def test_values_that_only_look_numeric_are_not_status_codes(self):
-        """The status test is strict: exactly three digits, 100 to 599."""
-        # Four digits, two digits, and a leading-plus form are all error codes.
-        for not_a_status in ("1000", "50", "600", "099"):
-            entry = self._read_one(f"b,k,v,failed,{not_a_status},200,msg")
-            # 200 is the only status-shaped value, so it resolves as the status
-            # regardless of which column it occupies.
-            assert entry.http_status_code == "200", not_a_status
-            assert entry.error_code == not_a_status, not_a_status
-
-    def test_http_status_is_not_mistaken_for_the_error_code(self):
-        """Regression guard for the transposed-column bug.
-
-        The reader read ErrorCode from index 4, which holds HTTPStatusCode, so
-        a succeeded task appeared to carry the error code "200" and no real
-        error code ever matched a known value. Both assertions below failed
-        before the fix.
-        """
-        succeeded = self._read_one(
-            _csv_row("my-bucket", "key-a", "v1",
-                     task_status="succeeded", http_status_code="200",
-                     error_code="", result_message="success")
-        )
-        assert succeeded.error_code is None
-        assert succeeded.http_status_code == "200"
-
-        failed = self._read_one(
-            _csv_row("my-bucket", "key-b", "v2",
-                     task_status="failed", http_status_code="500",
-                     error_code="SrcObjectNotEligible",
-                     result_message="Object is not eligible for replication")
-        )
-        assert failed.error_code == "SrcObjectNotEligible"
-        assert failed.http_status_code == "500"
-
-    def test_short_row_missing_trailing_columns_does_not_raise(self):
-        """A truncated row yields None for the columns it lacks.
-
-        The reader indexes columns defensively rather than assuming seven are
-        always present, so a malformed row degrades to missing detail instead
-        of raising and losing the whole report.
-        """
-        entry = self._read_one("my-bucket,key-a,v1")
-        assert entry.object_key == "key-a"
-        assert entry.version_id == "v1"
-        assert entry.task_status is None
-        assert entry.error_code is None
-        assert entry.http_status_code is None
-        assert entry.result_message is None
-
-    def test_retained_columns_excluded_from_equality(self):
-        """The three retained columns take no part in equality or hashing.
-
-        They are diagnostic detail about one task attempt, not part of an
-        entry's identity, and ManifestEntry instances are placed in sets and
-        used as dict keys on the manifest path. If a differing ResultMessage
-        made two otherwise identical entries unequal, that path's dedup
-        semantics would change silently.
-        """
-        base = ManifestEntry(
-            source_bucket="my-bucket", object_key="key-a", version_id="v1",
-        )
-        annotated = ManifestEntry(
-            source_bucket="my-bucket", object_key="key-a", version_id="v1",
-            task_status="failed", http_status_code="500",
-            result_message="Object is not eligible for replication",
-        )
-        assert base == annotated
-        assert hash(base) == hash(annotated)
-        assert len({base, annotated}) == 1
-        # error_code, by contrast, does distinguish entries.
-        assert base != ManifestEntry(
-            source_bucket="my-bucket", object_key="key-a", version_id="v1",
-            error_code="SrcObjectNotEligible",
-        )
-
-
-class TestReportKeyPercentDecoding:
-    """The report's Key column is percent-decoded back to the object key.
-
-    The Solution's manifest percent-encodes object keys (``/`` preserved) so a
-    comma or newline in a key cannot break the CSV row, and S3 Batch Operations
-    echoes the manifest key into the completion report. The reader must decode
-    it, or the report row never joins to the Tracked_Object it describes.
-
-    AWS does not document the report's key encoding; it was verified against a
-    real job — see the note at the decode site in
-    ``bops_report_reader._parse_report_csv``. A key containing a literal percent
-    sequence is the only shape that distinguishes an echoed manifest key from an
-    original key, because every other key decodes to the same string either way,
-    so ``test_a_literal_percent_sequence_is_the_discriminating_case`` is the
-    load-bearing test here. These tests pin the reader as the inverse of
-    ``ManifestEntry.to_csv_row``.
-    """
-
-    @staticmethod
-    def _read_one(csv_text: str) -> ManifestEntry:
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-            "IsTruncated": False,
-        }
-        client.get_object.return_value = {"Body": _mock_body(csv_text)}
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert len(entries) == 1
-        return entries[0]
+        with pytest.raises(CompletionReportMalformed, match="checksum"):
+            read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 1)
 
     @pytest.mark.parametrize(
-        "object_key",
+        ("field", "value"),
         [
-            "plain-key.txt",
-            "prefix/nested/key.txt",
-            "key with spaces.txt",
-            "key,with,commas.txt",
-            "key#with?reserved&chars.txt",
-            "unicode/ключ/文字.txt",
-            "key+with+plus.txt",
-            "pct%20literal.txt",
+            ("Format", "unexpected"),
+            ("ReportSchema", "Bucket, Key"),
+            ("ReportCreationDate", "not-a-date"),
         ],
     )
-    def test_round_trips_the_solutions_own_manifest_encoding(self, object_key):
-        """Encode with the real manifest encoder, then read it back.
+    def test_invalid_manifest_schema_or_creation_date_is_malformed(self, field, value):
+        result = _row()
+        result_key = f"{_PREFIX}/job-{_JOB_ID}/results/part.csv"
+        payload = json.loads(_manifest([_result(result_key, result)]))
+        payload[field] = value
+        client = _client(json.dumps(payload).encode(), {result_key: result})
 
-        Driving the encoding through ``ManifestEntry.to_csv_row`` rather than
-        writing the encoded form by hand means the test fails if either side
-        of the pair changes independently.
-        """
-        manifest_row = ManifestEntry(
-            source_bucket="my-bucket", object_key=object_key, version_id="v1"
-        ).to_csv_row()
-        _bucket, encoded_key, _version = manifest_row.split(",")
+        with pytest.raises(CompletionReportMalformed):
+            read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 1)
 
-        entry = self._read_one(
-            f"my-bucket,{encoded_key},v1,SUCCEEDED,,200,"
+    def test_row_count_mismatch_is_malformed(self):
+        result_key = f"{_PREFIX}/job-{_JOB_ID}/results/part.csv"
+        result = _row()
+        client = _client(_manifest([_result(result_key, result)]), {result_key: result})
+
+        with pytest.raises(CompletionReportMalformed, match="expected 2"):
+            read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 2)
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            b"source-bucket,object.txt,version-1,succeeded,200",
+            b",object.txt,version-1,succeeded,200,,success",
+            b"source-bucket,,version-1,succeeded,200,,success",
+        ],
+    )
+    def test_malformed_result_row_is_rejected(self, contents):
+        result_key = f"{_PREFIX}/job-{_JOB_ID}/results/part.csv"
+        client = _client(_manifest([_result(result_key, contents)]), {result_key: contents})
+
+        with pytest.raises(CompletionReportMalformed, match="malformed row"):
+            read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 1)
+
+    def test_duplicate_identity_across_declared_results_is_rejected(self):
+        first = _row()
+        second = _row(status="failed", http_status="500", error_code="AccessDenied")
+        first_key = f"{_PREFIX}/job-{_JOB_ID}/results/first.csv"
+        second_key = f"{_PREFIX}/job-{_JOB_ID}/results/second.csv"
+        client = _client(
+            _manifest([_result(first_key, first), _result(second_key, second)]),
+            {first_key: first, second_key: second},
         )
 
-        assert entry.object_key == object_key
-
-    def test_a_literal_percent_sequence_is_the_discriminating_case(self):
-        """The one key shape that proves the report echoes the manifest key.
-
-        For a key with no literal percent, the encoded and original forms
-        decode to the same string, so decoding is correct either way and the
-        test proves nothing about which form the report carries. A key holding
-        the text ``%20`` separates them: the manifest double-encodes it to
-        ``%2520``, so decoding once yields the real key only if the report
-        carried the manifest form. Verified against a real job — see the class
-        docstring.
-        """
-        real_key = "retag-verify/pct%20literal.txt"
-        manifest_row = ManifestEntry(
-            source_bucket="my-bucket", object_key=real_key, version_id="v1"
-        ).to_csv_row()
-        assert manifest_row == "my-bucket,retag-verify/pct%2520literal.txt,v1"
-
-        # The report's Key column, as observed from a real completion report.
-        entry = self._read_one(
-            "my-bucket,retag-verify/pct%2520literal.txt,v1,SUCCEEDED,,200,"
-        )
-        assert entry.object_key == real_key
-
-    def test_prefix_slashes_are_not_encoded_so_decoding_leaves_them(self):
-        """``to_csv_row`` uses ``safe="/"``, so a prefix survives untouched."""
-        entry = self._read_one("my-bucket,a/b/c.txt,v1,SUCCEEDED,,200,")
-        assert entry.object_key == "a/b/c.txt"
-
-    def test_plus_is_not_treated_as_a_space(self):
-        """``unquote``, not ``unquote_plus``: ``+`` is a literal in an S3 key.
-
-        ``to_csv_row`` emits ``+`` unencoded, so decoding it to a space would
-        corrupt every key containing a plus sign.
-        """
-        entry = self._read_one("my-bucket,a+b.txt,v1,SUCCEEDED,,200,")
-        assert entry.object_key == "a+b.txt"
-
-    def test_encoded_comma_keeps_the_column_count_intact(self):
-        """A comma in a key is encoded, so it cannot be read as a delimiter."""
-        manifest_row = ManifestEntry(
-            source_bucket="my-bucket", object_key="a,b.txt", version_id="v1"
-        ).to_csv_row()
-        assert manifest_row == "my-bucket,a%2Cb.txt,v1"
-
-        entry = self._read_one(f"{manifest_row},SUCCEEDED,,200,")
-        assert entry.object_key == "a,b.txt"
-
-
-class TestReadBopsCompletionReportMultipleObjects:
-    def test_several_report_csv_objects_all_read(self):
-        """A job may write more than one report CSV object under the prefix."""
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [
-                {"Key": f"{_PREFIX}job-abc/results/hash1.csv"},
-                {"Key": f"{_PREFIX}job-abc/results/hash2.csv"},
-            ],
-            "IsTruncated": False,
-        }
-        client.get_object.side_effect = [
-            {"Body": _mock_body(_csv_row("my-bucket", "key-a", "v1"))},
-            {"Body": _mock_body(_csv_row("my-bucket", "key-b", "v2"))},
-        ]
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        keys = {e.object_key for e in entries}
-        assert keys == {"key-a", "key-b"}
-        assert client.get_object.call_count == 2
-
-    def test_paginated_listing_all_pages_read(self):
-        """list_objects_v2 pagination (IsTruncated) is followed to completion."""
-        client = MagicMock()
-        client.list_objects_v2.side_effect = [
-            {
-                "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-                "IsTruncated": True,
-                "NextContinuationToken": "token-1",
-            },
-            {
-                "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash2.csv"}],
-                "IsTruncated": False,
-            },
-        ]
-        client.get_object.side_effect = [
-            {"Body": _mock_body(_csv_row("my-bucket", "key-a", "v1"))},
-            {"Body": _mock_body(_csv_row("my-bucket", "key-b", "v2"))},
-        ]
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        keys = {e.object_key for e in entries}
-        assert keys == {"key-a", "key-b"}
-        assert client.list_objects_v2.call_count == 2
-        second_call_kwargs = client.list_objects_v2.call_args_list[1][1]
-        assert second_call_kwargs.get("ContinuationToken") == "token-1"
-
-
-class TestReadBopsCompletionReportSkipsNonResultsSidecars:
-    """S3 Batch Operations writes manifest.json and manifest.json.md5
-    sidecar objects under the same Report.Prefix as the results/ CSVs.
-    Only the results/*.csv objects contain per-object completion rows;
-    the sidecars must be skipped rather than misparsed as CSV data.
-    """
-
-    def test_manifest_json_sidecar_is_not_parsed_as_csv_row(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [
-                {"Key": f"{_PREFIX}job-abc/manifest.json"},
-                {"Key": f"{_PREFIX}job-abc/manifest.json.md5"},
-                {"Key": f"{_PREFIX}job-abc/results/hash1.csv"},
-            ],
-            "IsTruncated": False,
-        }
-        client.get_object.return_value = {
-            "Body": _mock_body(_csv_row("my-bucket", "key-a", "v1"))
-        }
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert entries == [
-            ManifestEntry(source_bucket="my-bucket", object_key="key-a", version_id="v1")
-        ]
-        # Only the results/ CSV is ever fetched — sidecars are skipped
-        # before any get_object call.
-        assert client.get_object.call_count == 1
-        client.get_object.assert_called_once_with(
-            Bucket=_STATE_BUCKET, Key=f"{_PREFIX}job-abc/results/hash1.csv"
-        )
-
-    def test_only_sidecars_present_returns_empty_list(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [
-                {"Key": f"{_PREFIX}job-abc/manifest.json"},
-                {"Key": f"{_PREFIX}job-abc/manifest.json.md5"},
-            ],
-            "IsTruncated": False,
-        }
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert entries == []
-        client.get_object.assert_not_called()
-
-
-class TestReadBopsCompletionReportEmptyPrefix:
-    def test_empty_prefix_returns_empty_list(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {"Contents": [], "IsTruncated": False}
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert entries == []
-        client.get_object.assert_not_called()
-
-    def test_no_contents_key_returns_empty_list(self):
-        """Contents key entirely absent (rather than an empty list) is tolerated."""
-        client = MagicMock()
-        client.list_objects_v2.return_value = {"IsTruncated": False}
-        entries = read_bops_completion_report(client, _STATE_BUCKET, _PREFIX)
-        assert entries == []
-
-
-# ---------------------------------------------------------------------------
-# report_object_exists — task 23.4 (Requirements 8.1)
-# ---------------------------------------------------------------------------
-
-
-class TestReportObjectExists:
-    def test_returns_true_when_object_present_under_prefix(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-        }
-        assert report_object_exists(client, _STATE_BUCKET, _PREFIX) is True
-
-    def test_returns_false_when_prefix_empty(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {}
-        assert report_object_exists(client, _STATE_BUCKET, _PREFIX) is False
-
-    def test_returns_false_when_contents_key_absent(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {"IsTruncated": False}
-        assert report_object_exists(client, _STATE_BUCKET, _PREFIX) is False
-
-    def test_returns_false_when_contents_is_empty_list(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {"Contents": []}
-        assert report_object_exists(client, _STATE_BUCKET, _PREFIX) is False
-
-    def test_does_not_call_get_object(self):
-        """Existence-only — never reads or parses any CSV content."""
-        client = MagicMock()
-        client.list_objects_v2.return_value = {
-            "Contents": [{"Key": f"{_PREFIX}job-abc/results/hash1.csv"}],
-        }
-        report_object_exists(client, _STATE_BUCKET, _PREFIX)
-        client.get_object.assert_not_called()
-
-    def test_calls_list_objects_v2_with_max_keys_one(self):
-        client = MagicMock()
-        client.list_objects_v2.return_value = {"Contents": []}
-        report_object_exists(client, _STATE_BUCKET, _PREFIX)
-        kwargs = client.list_objects_v2.call_args[1]
-        assert kwargs.get("Bucket") == _STATE_BUCKET
-        assert kwargs.get("Prefix") == _PREFIX
-        assert kwargs.get("MaxKeys") == 1
+        with pytest.raises(CompletionReportMalformed, match="duplicate"):
+            read_bops_completion_report(client, _STATE_BUCKET, _PREFIX, _JOB_ID, 2)

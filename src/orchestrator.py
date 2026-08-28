@@ -41,21 +41,20 @@ Requirements: 4.3, 6.1, 7.3, 8.1, 8.2, 8.3, 9.1, 9.3, 9.4, 11.1
 """
 from __future__ import annotations
 
-import concurrent.futures
 import contextlib
 import logging
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
+from math import floor
 from typing import Any
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 
 from src.adapters import athena_journal_adapter
 from src.adapters import batch_operations_adapter
 from src.adapters import bops_report_reader
 from src.adapters import replication_config_adapter
-from src.adapters import source_status_adapter
 from src.adapters import state_store as state_store_module
 from src.adapters.client_factory import ClientFactory
 from src.adapters.inventory_manifest_writer import (
@@ -67,7 +66,6 @@ from src.adapters.metrics_publisher import MetricsPublisher
 from src.adapters.permanent_delete_reader import read_permanent_deletes
 from src.adapters.preflight_counter import preflight_count
 from src.adapters import sns_report_adapter
-from src.core import completion_serializer
 from src.core import completion_tracker
 from src.core import config_loader
 from src.core import journal_dedup
@@ -81,6 +79,8 @@ from src.core.delete_filter import filter_deleted_versions
 from src.core.manifest_generator import ManifestGenerator, serialize
 from src.core.manifest_strategy import (
     JOURNAL_READ_ROW_CAP_DEFAULT,
+    MIN_JOURNAL_READ_ROW_CAP,
+    TAIL_ROW_BUDGET_FRACTION,
     ManifestFormat,
 )
 from src.core.models import (
@@ -101,8 +101,10 @@ from src.core.job_recovery import (
     JobOutcome,
     RecoveryPlan,
     is_effective_failure,
+    is_terminal_status,
     plan_recovery,
 )
+from src.core.row_cap_validation import split_row_budget
 from src.core.watermark import subtract as watermark_subtract
 
 logger = logging.getLogger(__name__)
@@ -136,29 +138,19 @@ DEFAULT_JOURNAL_LOOKBACK = timedelta(hours=2)
 # unmet prerequisite in view without burying it.
 JOURNAL_UNAVAILABLE_REALERT_INTERVAL = timedelta(hours=24)
 
-# ---------------------------------------------------------------------------
-# Completion-tracking interval defaults (design.md Decisions 3, 5)
-# ---------------------------------------------------------------------------
-
-# Default cap on the total number of Source_Status_Check HeadObject calls
-# issued per _run_completion_tracking_interval invocation.
-COMPLETION_CHECK_BATCH_SIZE_DEFAULT = 2000
-
-# How long a Tracked_Object may stay PENDING before it is abandoned. This is a
-# backstop, not a replication deadline: it must comfortably exceed both the
-# time real replication takes and several Processing_Intervals (which may
-# themselves be up to 24 hours), so it never abandons work that is genuinely
-# still in flight. Seven days satisfies both while still bounding the state
-# object's growth.
-COMPLETION_ITEM_TTL_DEFAULT = timedelta(days=7)
-
-# Maximum wall-clock seconds to wait for a single completion-tracking
-# HeadObject check (mirrors batch_operations_adapter.py's _TIMEOUT_SECONDS).
-_COMPLETION_CHECK_TIMEOUT_SECONDS: float = 60.0
-
-# Default number of concurrent worker threads for _check_batch (design.md
-# Decision 3's check_batch pseudocode).
-_COMPLETION_CHECK_MAX_WORKERS = 20
+# Default ceiling on Batch Operations jobs outstanding at once for one bucket.
+#
+# Three is enough that a job outlasting an interval or two does not stall the
+# bucket, and small enough that a pathologically slow destination cannot run up
+# per-job charges unnoticed. A value of 1 reproduces strict serialization, which
+# is why the parameter's floor is 1 rather than 2.
+#
+# Must stay in sync with the MaxConcurrentJobsPerBucket default in
+# deploy/template.yaml; tests/test_template.py asserts the two agree. This value
+# applies only when MAX_CONCURRENT_JOBS_PER_BUCKET is unset, which a
+# CloudFormation deploy never leaves unset, so it governs direct invocation and
+# tests.
+MAX_CONCURRENT_JOBS_DEFAULT = 3
 
 # KMS key ARN format: arn:<partition>:kms:<region>:<account-id>:key/<key-id>
 # or arn:<partition>:kms:<region>:<account-id>:alias/<alias-name>
@@ -186,10 +178,10 @@ def _completion_report_prefix(replication_config_id: str, manifest_key: str) -> 
     the report back for a given ``job_id``, so the submission-time and
     read-time prefixes always agree.
 
-    S3 Batch Operations writes the actual report object under a
-    service-generated subpath of this prefix (e.g.
-    ``job-<job_id>/results/<manifest-hash>.csv``) — ``bops_report_reader``
-    lists everything under this prefix rather than reading one specific key.
+    S3 Batch Operations writes the top-level report manifest at
+    ``job-<job_id>/manifest.json`` under this prefix. The manifest names the
+    result CSV objects and their checksums; ``bops_report_reader`` reads that
+    manifest and validates every declared result object.
     """
     sanitized_manifest_key = manifest_key.replace("/", "_")
     return f"completion-reports/{replication_config_id}/{sanitized_manifest_key}/"
@@ -373,37 +365,54 @@ class _CompletionHooks:
         job_status: str,
         job_response,
         *,
-        entries: Callable[[], list[ManifestEntry]],
+        report: Callable[[], bops_report_reader.BopsCompletionReport],
     ) -> None:
-        """Completion-merge hook — merge configs and clear alerted.
+        """Atomically resolve a ready report and clear any stale alert.
 
-        Accepts a lazy *entries* accessor (a callable returning the parsed
-        report rows) rather than reading the report itself.  The read is
-        owned by the unconditional diagnosis block in _describe_prior_jobs;
-        this hook only needs the data for the merge.
-
-        Diagnosis (``_log_report_task_errors``) is no longer performed
-        here — it runs unconditionally in ``_describe_prior_jobs``, gated on
-        ``rec.report_diagnosed``, independent of completion tracking.
+        Accepts a lazy *report* accessor so the hook shares the one validated
+        typed report read by the diagnosis block in ``_describe_prior_jobs``.
+        Unknown task statuses are reported only after the state write succeeds.
         """
-        if job_status not in ("Complete", "Failed", "Cancelled"):
+        if not is_terminal_status(job_status):
             return
         try:
             if not store.completion_job_exists(
                 s3_client, self._state_bucket, bucket_name, rec.job_id
             ):
-                writer.merge_completion_configs(
-                    entries=entries(),
+                completion_report = report()
+                writer.merge_completion_report(
+                    report=completion_report,
                     replication_config_id=bucket_name,
                     job_id=rec.job_id,
-                    manifest_generated_at=job_response["Job"]["CreationTime"],
+                    job_created_at=job_response["Job"]["CreationTime"],
                 )
+                unknown_count = sum(
+                    completion_tracker.outcome_from_report_row(entry) == "UNKNOWN"
+                    for entry in completion_report.entries
+                )
+                if unknown_count:
+                    observability.emit(observability.log_error(
+                        component="Completion_Tracker",
+                        bucket=bucket_name,
+                        cause=(
+                            "BOPS completion report for job "
+                            f"{rec.job_id!r} (config {config_id!r}) mapped "
+                            f"{unknown_count} row(s) to UNKNOWN due to an "
+                            "unrecognised task status."
+                        ),
+                    ))
+                # Suppression is keyed by job_id, matching what
+                # check_report_handler writes, so clearing one job's alert
+                # cannot un-suppress another's. A bucket-name entry left by an
+                # earlier build is inert: nothing reads it and nothing clears
+                # it, and the list holds arbitrary strings so it needs no
+                # schema change.
                 alerted = store.get_alerted_configs(
                     s3_client, self._state_bucket, bucket_name
                 )
-                if bucket_name in alerted:
+                if rec.job_id in alerted:
                     writer.clear_alerted_config(
-                        replication_config_id=bucket_name,
+                        replication_config_id=rec.job_id,
                     )
         except Exception as exc:  # noqa: BLE001 — Requirement 6.1 isolation
             observability.emit(observability.log_error(
@@ -514,6 +523,13 @@ class _BucketContext:
     lookback: timedelta
     journal_read_row_cap: int
     max_batch_job_failures: int
+    # The most Batch Operations jobs that may be outstanding for this bucket at
+    # once. Submission is deferred at the limit rather than serialized, because
+    # a job's duration is set by replication throughput rather than task count:
+    # a bandwidth-bound bucket of large objects has jobs lasting hours, so
+    # serializing would extend head-of-line blocking across batches without
+    # bound. 1 reproduces strict serialization for an operator who wants it.
+    max_concurrent_jobs: int
     on_bucket_disabled: Callable | None
     on_submission_failure: Callable | None
     # Invoked on the first interval in which the bucket's S3 Metadata journal
@@ -577,10 +593,26 @@ class StateWriter:
             candidate_max_watermark=candidate_max_watermark,
         )
 
-    def record_submission(self, record: SubmissionRecord) -> None:
-        """Persist a submission record, updating the held ETag."""
+    def record_submission(
+        self,
+        record: SubmissionRecord,
+        *,
+        terminal_job_ids: Collection[str] = (),
+        completion_tracking_enabled: bool = True,
+        max_concurrent_jobs: int | None = None,
+    ) -> None:
+        """Persist a submission record, updating the held ETag.
+
+        The pruning arguments ride along on this one write rather than getting
+        their own: the record for the new job and the removal of settled ones are
+        the same edit to the same key, so splitting them would cost a second ETag
+        hop and could leave the two out of step.
+        """
         self._etag = self._store.record_submission(
             self._s3_client, self._state_bucket, record, self._etag,
+            terminal_job_ids=terminal_job_ids,
+            completion_tracking_enabled=completion_tracking_enabled,
+            max_concurrent_jobs=max_concurrent_jobs,
         )
 
     def record_scan_result(
@@ -595,18 +627,21 @@ class StateWriter:
             current_etag=self._etag,
         )
 
-    def merge_completion_configs(
-        self, entries, replication_config_id: str, job_id: str,
-        manifest_generated_at: datetime,
+    def merge_completion_report(
+        self,
+        report: bops_report_reader.BopsCompletionReport,
+        replication_config_id: str,
+        job_id: str,
+        job_created_at: datetime,
         timestamps: dict | None = None,
     ) -> None:
-        """Merge completion configs, updating the held ETag."""
-        self._etag = self._store.merge_completion_configs(
+        """Resolve a ready report and record its job ID, updating the ETag."""
+        self._etag = self._store.merge_completion_report(
             self._s3_client, self._state_bucket, self._source_bucket,
-            entries=entries,
+            report=report,
             replication_config_id=replication_config_id,
             job_id=job_id,
-            manifest_generated_at=manifest_generated_at,
+            job_created_at=job_created_at,
             current_etag=self._etag,
             timestamps=timestamps,
         )
@@ -687,27 +722,46 @@ class StateWriter:
         self._etag = new_etag
         return should_alert
 
-    def mark_report_diagnosed(self, config_id: str) -> None:
-        """Best-effort: set ``report_diagnosed = True`` on the submission record.
+    def mark_report_diagnosed(
+        self,
+        job_id: str,
+        *,
+        report_diagnosed: bool = True,
+        recovery_scored: bool = False,
+    ) -> None:
+        """Best-effort: set the named per-job flags on the job's record.
 
-        A failure is logged and swallowed. The only cost is one duplicate
-        diagnostic log on the next run — not a correctness problem.
+        A failure is logged and swallowed. It costs one duplicate diagnostic log
+        and, where ``recovery_scored`` was the flag that did not land, one
+        duplicate watermark rollback and resubmission on the next run. Both stop
+        as soon as a write lands, and neither is worth failing a run that has
+        already submitted a job over.
 
         Requirement 3.1.
         """
+        flags = [
+            name for name, on in (
+                ("report_diagnosed", report_diagnosed),
+                ("recovery_scored", recovery_scored),
+            ) if on
+        ]
+        if not flags:
+            return
         try:
             self._etag = self._store.mark_report_diagnosed(
                 self._s3_client, self._state_bucket, self._source_bucket,
-                config_id, current_etag=self._etag,
+                job_id, current_etag=self._etag,
+                report_diagnosed=report_diagnosed,
+                recovery_scored=recovery_scored,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort, Req 3.1
             observability.emit(observability.log_error(
                 component="Completion_Tracker",
                 bucket=self._source_bucket,
                 cause=(
-                    f"Failed to persist report_diagnosed flag for config "
-                    f"{config_id!r}: {exc}. The report diagnostic may repeat "
-                    f"on the next run."
+                    f"Failed to persist {', '.join(flags)} for job "
+                    f"{job_id!r}: {exc}. The work those flags record as done may "
+                    f"repeat on the next run."
                 ),
             ))
 
@@ -729,6 +783,51 @@ class _BucketResult:
     errored: bool = False   # True when the bucket was skipped due to a processing error
     capped: bool = False    # True when this run was a Capped_Run (journal_until is not None)
     progressed: bool = False  # True when a job was submitted AND the checkpoint advanced
+    # True when the lookback tail was truncated from below to fit the row budget,
+    # so part of the configured lookback window was not re-scanned this run. Not
+    # an error in itself, but a reduction in late-arrival tolerance forced by a
+    # backlog, so it is surfaced rather than absorbed.
+    tail_shortened: bool = False
+    # True when this bucket was skipped because its outstanding Batch Operations
+    # job count had reached MaxConcurrentJobsPerBucket. Not an error: the work is
+    # deferred, not lost.
+    submission_deferred: bool = False
+    # Batch Operations jobs outstanding for this bucket, including any this run
+    # submitted. Reported to completion-report subscribers as `outstanding_jobs`.
+    #
+    # None until the DescribeJob loop has actually run, and it stays None on every
+    # path that returns before then: a client-creation failure, a rule-resolution
+    # failure, or a checkpoint read failure. Zero would be a claim, and the claim
+    # would be wrong — a report saying nothing remains in tracking for a bucket
+    # whose jobs were never checked is the false all-clear this design removes.
+    outstanding_jobs: int | None = None
+
+
+@dataclass(frozen=True)
+class _BucketRunState:
+    """What the publish phase needs to know about this run's per-bucket outcome.
+
+    The publish phase reads only completion items and scan state from the state
+    object, deliberately: it is isolated so a per-bucket processing failure
+    cannot affect it. These two values are the exception — they are produced
+    during processing and cannot be re-derived at publish time without another
+    round trip — so they are threaded across that boundary rather than the two
+    phases being merged.
+
+    ``outstanding_jobs`` of ``None`` means the count is not known, which is the
+    right answer for a bucket that never got as far as checking its jobs and for
+    one skipped as disabled. The default therefore has to be ``None`` rather than
+    zero: a bucket is skipped as disabled precisely because its jobs kept failing,
+    and its report claiming nothing remains in tracking would be the worst place
+    to be wrong.
+
+    ``submission_deferred`` needs no unknown case. It answers "did the most recent
+    run skip this bucket at the concurrency limit", and for a bucket that never ran
+    the answer is a plain no.
+    """
+
+    outstanding_jobs: int | None = None
+    submission_deferred: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -876,6 +975,89 @@ def _resolve_rules(
 # ---------------------------------------------------------------------------
 
 
+# The status recorded for a job whose DescribeJob call failed. Such a job counts
+# toward the concurrency limit: its status is unknown, and assuming it finished
+# is the unsafe assumption — it would let the bucket look under its limit and
+# admit a job it should not.
+_UNKNOWN_JOB_STATUS = "Unknown"
+
+# How long a record whose DescribeJob keeps failing goes on counting toward the
+# concurrency limit before it stops.
+#
+# Without a bound the bucket stalls permanently. A record only leaves the count by
+# being described at a terminal status, and the two paths that delete a record —
+# pruning and ceiling eviction — both run inside the write that persists a
+# submission, which the deferral itself prevents. The circuit breaker cannot break
+# the tie either: with every describe failing, `outcomes` is empty, so plan_recovery
+# holds the counter and never disables the bucket. Reachable without anything
+# exotic: a lost `s3:DescribeJob` permission, a hand-edited job id, or a job whose
+# record has aged out of Batch Operations retention. At MaxConcurrentJobsPerBucket
+# of 1 a single such record stops the bucket for good.
+#
+# Ageing it out of the *count* loses nothing, because the record itself is kept:
+# check_report_handler still alerts on it and eviction still reaches it eventually.
+# And the bound only governs cost, not correctness — the data loss this release
+# fixes is fixed by keying records per job, so admitting one extra job costs one
+# per-job charge rather than risking an abandoned object.
+#
+# 14 days is far beyond any plausible job. The probe behind this design measured
+# 50 GiB in five minutes cross-Region, which puts even a petabyte inside a week,
+# and it sits well within the 90 days S3 Batch Operations retains a job record.
+_UNDESCRIBABLE_JOB_MAX_AGE = timedelta(days=14)
+
+
+def _record_age(record: SubmissionRecord, now: datetime) -> timedelta | None:
+    """How long ago *record* was submitted, or ``None`` if that cannot be told.
+
+    A hand-edited state object can carry a naive ``submitted_at``; UTC is assumed
+    rather than raising, because the alternative is an exception on the path that
+    decides whether a bucket may submit.
+    """
+    submitted_at = record.submitted_at
+    if submitted_at is None:
+        return None
+    if submitted_at.tzinfo is None:
+        submitted_at = submitted_at.replace(tzinfo=UTC)
+    return now - submitted_at
+
+
+@dataclass(frozen=True)
+class _InFlightJob:
+    """A prior job for this bucket that has not been shown to have finished."""
+
+    job_id: str
+    status: str
+    created_at: datetime | None
+    # From the bucket's SubmissionRecord rather than from DescribeJob, so a job
+    # whose describe call failed still orders against one that succeeded. The
+    # oldest outstanding job by this field is the one an operator investigates.
+    submitted_at: datetime | None = None
+
+    def elapsed_seconds(self, now: datetime) -> float | None:
+        """Seconds since the job was created, or ``None`` if unknown."""
+        if self.created_at is None:
+            return None
+        return (now - self.created_at).total_seconds()
+
+
+def _oldest_outstanding(jobs: list[_InFlightJob]) -> _InFlightJob | None:
+    """The longest-outstanding job in *jobs* by ``submitted_at``.
+
+    A job with no ``submitted_at`` sorts last rather than raising, so an
+    unparseable timestamp cannot break the deferral audit entry. Returns
+    ``None`` for an empty list.
+    """
+    if not jobs:
+        return None
+    return min(
+        jobs,
+        key=lambda job: (
+            job.submitted_at is None,
+            job.submitted_at.timestamp() if job.submitted_at is not None else 0.0,
+        ),
+    )
+
+
 @dataclass
 class _JobCheckResult:
     """Outcome of the DescribeJob loop for one bucket's prior submissions."""
@@ -884,6 +1066,15 @@ class _JobCheckResult:
     any_check_ran: bool
     any_check_failed: bool
     outcomes: list[JobOutcome]
+    # Every prior job for this bucket not shown to have finished: those at a
+    # non-terminal status, and those whose DescribeJob call failed. Submission is
+    # deferred once this reaches MaxConcurrentJobsPerBucket — see _process_bucket.
+    outstanding: list[_InFlightJob] = field(default_factory=list)
+    # Job IDs observed at a terminal status this run. The state store needs them
+    # to decide which submission records have settled and may be pruned; the
+    # record's own `status` field is written as SUBMITTED and never updated, so it
+    # cannot answer that.
+    terminal_job_ids: list[str] = field(default_factory=list)
 
 
 def _describe_prior_jobs(
@@ -893,7 +1084,7 @@ def _describe_prior_jobs(
     prev_submissions: dict[str, SubmissionRecord],
     tracking: _CompletionTracking,
 ) -> _JobCheckResult:
-    """Wrap the DescribeJob loop: check each prior submission's job status.
+    """Wrap the DescribeJob loop: check every prior submission's job status.
 
     For each prior submission record with a job_id, calls DescribeJob to get
     the terminal status.  Runs the completion-merge hook (positioned before
@@ -901,11 +1092,19 @@ def _describe_prior_jobs(
     reach it).  Collects watermark_lows of failed jobs and emits readmission
     audit logs.
 
+    ``prev_submissions`` is keyed by ``job_id`` and holds one entry per
+    outstanding or unsettled job, so this loop visits every job the bucket has
+    in flight rather than a single record. Each terminal job's report is merged
+    and diagnosed exactly once, under the existing
+    ``completion_processed_job_ids`` idempotency gate.
+
     The consolidation arithmetic is performed by ``plan_recovery`` in
     ``src.core.job_recovery`` — this function collects the raw outcomes and
     the caller passes them to that pure decision function.
 
     Returns a _JobCheckResult with the loop's collected state.
+
+    Requirements: 1.3, 2.1
     """
     bucket_name = ctx.bucket_name
     s3_client = ctx.s3_client
@@ -916,10 +1115,18 @@ def _describe_prior_jobs(
     any_check_ran = False
     any_check_failed = False
     outcomes: list[JobOutcome] = []
+    outstanding: list[_InFlightJob] = []
+    terminal_job_ids: list[str] = []
 
-    for config_id, rec in prev_submissions.items():
+    for rec in prev_submissions.values():
         if not rec.job_id:
             continue
+        # The completion report's State_Bucket prefix is written at submission
+        # time from the bucket name (see _leased_manifest_and_submit), so the
+        # read side must derive it the same way. Deliberately not the record's
+        # dict key, which is the job_id, nor rec.replication_config_id, which a
+        # hand-edited or legacy record could carry something else in.
+        config_id = bucket_name
         try:
             resp = s3control_client.describe_job(
                 AccountId=account_id, JobId=rec.job_id
@@ -934,9 +1141,62 @@ def _describe_prior_jobs(
                 bucket=bucket_name,
                 cause=f"DescribeJob {rec.job_id!r} failed (best-effort): {exc}",
             ))
+            # Counted as outstanding. A transport error says nothing about
+            # whether the job finished, and treating it as finished would let the
+            # bucket look under its concurrency limit and submit alongside a job
+            # that is still running. One record's describe failing does not
+            # disturb the others.
+            #
+            # But only up to _UNDESCRIBABLE_JOB_MAX_AGE, or the bucket stalls for
+            # good — see that constant for why nothing else can free the slot. The
+            # record is kept either way; it just stops blocking.
+            age = _record_age(rec, datetime.now(tz=UTC))
+            if age is not None and age > _UNDESCRIBABLE_JOB_MAX_AGE:
+                observability.emit(observability.log_error(
+                    component=_COMPONENT,
+                    bucket=bucket_name,
+                    cause=(
+                        f"Job {rec.job_id!r} was submitted {age.days} days ago and "
+                        f"still cannot be described, so it no longer counts toward "
+                        f"MaxConcurrentJobsPerBucket and this bucket can submit "
+                        f"again. Its outcome is unknown: no completion report will "
+                        f"be read for it and it cannot be rolled back. Check that "
+                        f"the execution role still holds s3:DescribeJob and that "
+                        f"the job id in the state object is one this account owns."
+                    ),
+                ))
+                continue
+            outstanding.append(_InFlightJob(
+                job_id=rec.job_id,
+                status=_UNKNOWN_JOB_STATUS,
+                created_at=None,
+                submitted_at=rec.submitted_at,
+            ))
             continue
 
-        any_check_ran = True
+        # A job that has not finished is reported, not scored. Everything below
+        # this point either self-gates on a terminal status (the completion merge
+        # and the report diagnosis) or would draw a wrong conclusion from a
+        # running job, so the record is carried out as outstanding and skipped.
+        #
+        # Deliberately NOT appended to `outcomes`. plan_recovery reads a
+        # non-empty `outcomes` with no failures as "a check ran and passed" and
+        # resets the bucket's consecutive-failure counter, so counting a running
+        # job there would let a bucket whose jobs keep failing reset its own
+        # counter whenever a fresh job happened to be in flight, and the circuit
+        # breaker would never trip. An empty `outcomes` takes plan_recovery's
+        # rule 4 and holds the counter, which is the correct reading: nothing has
+        # been learned yet.
+        if not is_terminal_status(job_status):
+            outstanding.append(_InFlightJob(
+                job_id=rec.job_id,
+                status=job_status,
+                created_at=resp["Job"].get("CreationTime"),
+                submitted_at=rec.submitted_at,
+            ))
+            continue
+
+        terminal_job_ids.append(rec.job_id)
 
         outcome = JobOutcome(
             config_id=config_id,
@@ -948,23 +1208,92 @@ def _describe_prior_jobs(
             tasks_succeeded=tasks_succeeded,
             tasks_failed=tasks_failed,
         )
-        outcomes.append(outcome)
 
-        # Lazy accessor — the report is read at most once per job per run,
-        # shared between the diagnosis block below and (in future) the
-        # tracking merge.  Each gate stays independent: diagnosis is gated
-        # on rec.report_diagnosed, the merge on completion_job_exists.
-        _entries: list[ManifestEntry] | None = None
+        # Score a terminal job's outcome exactly once, ever.
+        #
+        # A record now outlives the run in which its job finished: Requirement 3.2
+        # keeps a terminal record whose completion report has not been read, so
+        # check_report_handler can alert on it. Re-scoring such a record every run
+        # would roll the watermark back to the same watermark_low each time,
+        # resubmit the same journal range at a fresh per-job charge each time, and
+        # climb consecutive_failures until the breaker disabled the bucket with a
+        # reason claiming N consecutive failures for one job that failed once.
+        #
+        # `any_check_ran` is set here too rather than for every terminal job. An
+        # already-scored job is not evidence about this interval: counting it would
+        # take plan_recovery's rule 3 and reset the bucket's failure counter on a
+        # run that learned nothing, which is the same defect a non-terminal job
+        # already avoids by staying out of `outcomes`.
+        newly_scored = not rec.recovery_scored
+        if newly_scored:
+            any_check_ran = True
+            outcomes.append(outcome)
+
+        # Cache one validated typed report per terminal job. Both the merge
+        # and diagnosis consume its entries, so a missing or malformed report
+        # cannot be mistaken for a valid empty report. Zero invoked tasks are
+        # the sole exception: S3 does not emit a report, so recovery uses a
+        # synthetic empty report anchored at the terminal time.
+        _report: bops_report_reader.BopsCompletionReport | None = None
+        _report_error: Exception | None = None
+        _report_attempted = False
+
+        def _completion_report() -> bops_report_reader.BopsCompletionReport:
+            nonlocal _report, _report_attempted, _report_error
+            if _report is not None:
+                return _report
+            if _report_error is not None:
+                raise _report_error
+            if _report_attempted:
+                raise RuntimeError("completion report read did not produce a result")
+
+            _report_attempted = True
+            # An absent ProgressSummary means the invoked-task count is
+            # unknown, not zero. Treating it as zero would take the
+            # synthetic-empty-report branch below and mark the job processed
+            # with no outcomes, silently dropping every object in it. Leave the
+            # job retryable instead, matching how job_recovery and
+            # check_report_handler already refuse to read absence as zero.
+            if tasks_succeeded is None or tasks_failed is None:
+                _report_error = bops_report_reader.CompletionReportNotReady(
+                    f"DescribeJob for job {rec.job_id!r} carried no ProgressSummary; "
+                    "invoked task count is unknown"
+                )
+                raise _report_error
+
+            expected_row_count = tasks_succeeded + tasks_failed
+            try:
+                if expected_row_count == 0:
+                    # A terminal job should carry TerminationDate, but fall
+                    # back rather than raising KeyError into _report_error,
+                    # which would make the job retry every interval forever.
+                    # check_report_handler already uses the same fallback.
+                    job = resp["Job"]
+                    terminal_at = job.get("TerminationDate") or job.get("CreationTime")
+                    if terminal_at is None:
+                        raise bops_report_reader.CompletionReportNotReady(
+                            f"DescribeJob for job {rec.job_id!r} carried neither "
+                            "TerminationDate nor CreationTime"
+                        )
+                    _report = bops_report_reader.BopsCompletionReport(
+                        created_at=terminal_at,
+                        entries=(),
+                    )
+                else:
+                    _report = bops_report_reader.read_bops_completion_report(
+                        s3_client,
+                        ctx.state_bucket,
+                        _completion_report_prefix(config_id, rec.manifest_key),
+                        rec.job_id,
+                        expected_row_count,
+                    )
+            except Exception as exc:
+                _report_error = exc
+                raise
+            return _report
 
         def _report_entries() -> list[ManifestEntry]:
-            nonlocal _entries
-            if _entries is None:
-                _entries = bops_report_reader.read_bops_completion_report(
-                    s3_client,
-                    ctx.state_bucket,
-                    _completion_report_prefix(config_id, rec.manifest_key),
-                )
-            return _entries
+            return list(_completion_report().entries)
 
         # Completion-tracking merge hook — positioned before the
         # Failed/Cancelled circuit-breaker logic so an exception here cannot
@@ -978,7 +1307,7 @@ def _describe_prior_jobs(
             rec=rec,
             job_status=job_status,
             job_response=resp,
-            entries=_report_entries,
+            report=_completion_report,
         )
 
         # Report-based diagnosis — isolated so a read or parse failure
@@ -986,15 +1315,16 @@ def _describe_prior_jobs(
         # terminal job whose report has not yet been diagnosed, including
         # partial failures that is_effective_failure deliberately does not
         # flag (Requirement 2.2).
+        diagnosed_now = False
         try:
-            if job_status in ("Complete", "Failed", "Cancelled") and not rec.report_diagnosed:
+            if is_terminal_status(job_status) and not rec.report_diagnosed:
                 _log_report_task_errors(
                     entries=_report_entries(),
                     bucket_name=bucket_name,
                     job_id=rec.job_id,
                     config_id=config_id,
                 )
-                writer.mark_report_diagnosed(config_id)
+                diagnosed_now = True
         except Exception as exc:  # noqa: BLE001 — Requirement 2.5 isolation
             observability.emit(observability.log_error(
                 component="Completion_Tracker",
@@ -1004,6 +1334,23 @@ def _describe_prior_jobs(
                     f"job {rec.job_id!r} (config {config_id!r}): {exc}"
                 ),
             ))
+
+        # One write for both flags. They are set on different conditions — a job
+        # whose report is unreadable is scored but not diagnosed, which is the
+        # case that makes re-scoring reachable at all — so both are passed and
+        # the store sets only the ones that are true.
+        if diagnosed_now or newly_scored:
+            writer.mark_report_diagnosed(
+                rec.job_id,
+                report_diagnosed=diagnosed_now,
+                recovery_scored=newly_scored,
+            )
+
+        if not newly_scored:
+            # Already scored on an earlier run. Everything below is a
+            # once-per-job effect, so re-running it would repeat a rollback, a
+            # resubmission, and a failure count for an outcome already acted on.
+            continue
 
         # A job that reaches Complete with every task failed replicated
         # nothing, even though Job.Status alone reads as success.  The
@@ -1043,6 +1390,8 @@ def _describe_prior_jobs(
         any_check_ran=any_check_ran,
         any_check_failed=any_check_failed,
         outcomes=outcomes,
+        outstanding=outstanding,
+        terminal_job_ids=terminal_job_ids,
     )
 
 
@@ -1165,21 +1514,216 @@ def _apply_recovery_plan(
 # ---------------------------------------------------------------------------
 
 
+def _count_lookback_tail(
+    ctx: _BucketContext,
+    checkpoint_watermark: str,
+    window_start: str,
+    journal_read_row_cap: int,
+) -> tuple[int, bool]:
+    """Return ``(tail_rows, assumed)`` for the lookback tail.
+
+    ``assumed`` is ``True`` when the count is a fallback rather than a measured
+    figure, which obliges the caller to bound the tail anyway. See below.
+
+    Two cases skip the query rather than issuing it and discarding the answer
+    (Requirement 5.3):
+
+    * The watermark is the epoch, which is every bucket's first run. There is
+      nothing below it, so the tail is empty.
+    * ``JournalLookbackSeconds`` is zero, so the tail range is empty by
+      definition and ``window_start`` equals the watermark.
+
+    On an Athena failure the tail is assumed to be at its allowance, which
+    reserves the new-row budget so the run still progresses. That much is
+    conservative on the progress axis. It is *not* conservative on the memory
+    axis, which is why ``assumed`` is returned alongside it: an assumed count
+    equal to the allowance would make the caller's ``tail_rows > tail_allowance``
+    test false, so no floor would be raised and the read would span the tail's
+    real size — the very quantity this failed query was asked for, and therefore
+    unbounded — on top of the reserved new-row budget. The caller raises the
+    floor regardless when ``assumed`` is set, so the read stays inside
+    ``Journal_Read_Row_Cap`` at the cost of shortening a tail that might have
+    fitted. Truncating a tail unnecessarily for one run is recoverable; reading
+    an unbounded number of rows into memory is what the cap exists to prevent.
+    """
+    if not checkpoint_watermark or window_start == checkpoint_watermark:
+        return 0, False
+
+    try:
+        return athena_journal_adapter.find_tail_row_count(
+            athena_client=ctx.athena_client,
+            bucket_name=ctx.bucket_name,
+            window_start=window_start,
+            watermark=checkpoint_watermark,
+            athena_workgroup=ctx.athena_workgroup,
+            output_location=ctx.athena_output_location,
+        ), False
+    except Exception as exc:  # noqa: BLE001 — best-effort, see docstring
+        assumed = floor(journal_read_row_cap * TAIL_ROW_BUDGET_FRACTION)
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=ctx.bucket_name,
+            cause=(
+                f"Lookback-tail row count failed: {exc}. Falling back to "
+                f"assuming the tail is at its allowance of {assumed} rows, which "
+                f"reserves the new-row budget so this run still makes progress. "
+                f"The tail is bounded to that allowance rather than read in full, "
+                f"because its real size is exactly what this query failed to "
+                f"establish."
+            ),
+        ))
+        return assumed, True
+
+
+def _raise_tail_floor(
+    ctx: _BucketContext,
+    checkpoint_watermark: str,
+    window_start: str,
+    tail_rows: int,
+    tail_allowance: int,
+    result: _BucketResult,
+) -> str | None:
+    """Return the read's lower bound when the tail exceeds its allowance.
+
+    Truncates the tail from below, so the rows dropped are the oldest in the
+    lookback window and the rows nearest the watermark — the likeliest genuine
+    late arrivals — are kept.
+
+    Sets ``result.tail_shortened`` and emits an error entry when the bound
+    actually moves. An error rather than an audit entry, on the same reasoning
+    the record-eviction path in ``state_store`` uses: an audit entry records a
+    decision the Solution is entitled to make, and reducing late-arrival
+    tolerance because a backlog forced it is a loss, not a policy.
+
+    Returns the lower bound to use, or ``None`` when the run cannot establish a
+    safe one and the caller must skip the bucket for this interval.
+
+    ``None`` is returned on an Athena failure looking up the floor. Two directions
+    were tried before this one and both were wrong:
+
+    * Keep the nominal ``window_start``. This reads the tail's true size, which is
+      unbounded at this point by construction — the caller only reaches here
+      because the tail is known or assumed to exceed its allowance. It defeats the
+      cap the ceilings in ``row_cap_validation`` are enforced against, and the
+      out-of-memory failure it produces is self-sustaining: the run dies before
+      the checkpoint advances, so the next run reads the same window.
+    * Bound at the watermark, dropping the tail. Memory-safe, but it skips the
+      **whole** lookback window rather than the surplus, so every genuine late
+      arrival in it misses its only chance. ``is_eligible`` permanently rejects an
+      operation at or below ``watermark - lookback``, and this run advances the
+      watermark, so a record in the oldest part of the window — where truncation
+      already concentrates — is gone for good. That is silent data loss traded for
+      liveness, and one Athena error is not worth it.
+
+    Skipping the bucket has neither cost. Nothing is read, so memory is bounded.
+    The checkpoint does not advance, so nothing ages out of the lookback window
+    and the next run re-scans it whole with a correct floor. The backlog is
+    untouched and picked up entire on the next interval, so the only price is one
+    interval's drain on a run that had already hit an Athena failure.
+
+    It is also the posture this module already takes for a journal read it cannot
+    trust: a fatal ``JournalReadError`` returns ``None`` from
+    :func:`_read_journal_window` and leaves the checkpoint unchanged so the records
+    are retried. A floor lookup that fails is the same class of event — the read
+    window cannot be established — so it gets the same answer rather than a third
+    posture invented for it.
+
+    A persistently failing floor query therefore stalls the bucket. That is
+    intended: it is an infrastructure fault, it raises ``BucketErrors`` every run,
+    and papering over it by discarding late arrivals would hide it.
+    """
+    bucket_name = ctx.bucket_name
+
+    if tail_allowance <= 0:
+        # Unreachable: it needs a row cap whose tail share floors to zero, which
+        # is only a cap of 1, and both the template's MinValue and the runtime
+        # coercion enforce MIN_JOURNAL_READ_ROW_CAP. Kept because the alternative
+        # ways out of this state all lose data or read unbounded — bounding at the
+        # watermark drops the whole re-scan window, which is the very thing the
+        # floor-failure path above refuses to do — so if a future change makes it
+        # reachable, it must fail loudly rather than quietly pick one of them.
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=bucket_name,
+            cause=(
+                f"Lookback tail has no allowance: tail_allowance={tail_allowance} "
+                f"for a tail of {tail_rows} rows. No read window for this bucket "
+                f"is both bounded and lossless, so it is skipped this interval "
+                f"with its checkpoint unchanged. This is a regression: "
+                f"Journal_Read_Row_Cap is floored at "
+                f"{MIN_JOURNAL_READ_ROW_CAP} precisely so this cannot happen."
+            ),
+        ))
+        return None
+    else:
+        try:
+            floor_bound = athena_journal_adapter.find_tail_floor(
+                athena_client=ctx.athena_client,
+                bucket_name=bucket_name,
+                window_start=window_start,
+                watermark=checkpoint_watermark,
+                tail_allowance=tail_allowance,
+                athena_workgroup=ctx.athena_workgroup,
+                output_location=ctx.athena_output_location,
+            )
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            observability.emit(observability.log_error(
+                component=_COMPONENT,
+                bucket=bucket_name,
+                cause=(
+                    f"Lookback-tail floor lookup failed: {exc}. Skipping this "
+                    f"bucket for this interval. The lookback tail holds "
+                    f"{tail_rows} rows against an allowance of {tail_allowance}, "
+                    f"so reading it without a floor would be unbounded, and "
+                    f"dropping it would skip the whole lookback window and lose "
+                    f"any genuine late arrival in it. The checkpoint is left "
+                    f"unchanged, so nothing ages out and the next interval "
+                    f"re-scans the window whole."
+                ),
+            ))
+            return None
+
+    if floor_bound is None:
+        # The tail turned out smaller than its allowance after all, so nothing
+        # needs truncating.
+        return window_start
+
+    result.tail_shortened = True
+    observability.emit(observability.log_error(
+        component=_COMPONENT,
+        bucket=bucket_name,
+        cause=(
+            f"Lookback tail shortened to fit the row budget: tail_rows="
+            f"{tail_rows}, tail_allowance={tail_allowance}, "
+            f"effective_since={floor_bound!r}, "
+            f"journal_lookback_seconds={int(ctx.lookback.total_seconds())}. "
+            f"Journal rows between the configured lookback window start and "
+            f"the effective lower bound are not re-scanned this run, reducing "
+            f"late-arrival tolerance for as long as the backlog lasts."
+        ),
+    ))
+    return floor_bound
+
+
 def _read_journal_window(
     ctx: _BucketContext,
     checkpoint_watermark: str,
     result: _BucketResult,
     writer: StateWriter,
 ) -> tuple[list, str | None, str | None] | None:
-    """Steps d and d0: apply the row-count cap and read the journal window.
+    """Steps d and d0: split the row budget and read the journal window.
 
-    Performs find_row_count_boundary (best-effort), emits the journal_read_capped
-    audit when capped, calls read_journal, reports journal errors, and returns
-    early on fatal errors.
+    Sizes the lookback tail, divides ``Journal_Read_Row_Cap`` between it and the
+    rows above the watermark, finds the row-cap boundary over the new rows
+    (best-effort), raises the read's lower bound when the tail will not fit its
+    allowance, emits the journal_read_capped audit when capped, calls
+    read_journal, reports journal errors, and returns early on fatal errors.
 
     Returns (ops, since_timestamp, journal_until) on success, or None when a
-    fatal journal error means this bucket should be skipped.  Sets result.capped
-    as a side-effect when the row-count boundary fires.
+    fatal journal error means this bucket should be skipped. The returned
+    ``since_timestamp`` is the lower bound actually used, which is what the
+    preflight count and the delete scan need so they cover the same range this
+    read did. Sets result.capped and result.tail_shortened as side-effects.
 
     *writer* is used only for the journal-unavailable streak counter, which
     keeps the operator alert for an absent journal to one notification per
@@ -1192,17 +1736,32 @@ def _read_journal_window(
     athena_workgroup = ctx.athena_workgroup
     athena_output_location = ctx.athena_output_location
 
-    since_timestamp = watermark_subtract(checkpoint_watermark, lookback)
+    window_start = watermark_subtract(checkpoint_watermark, lookback)
 
-    # Row-count cap boundary (Step d0): find the record_timestamp that would
-    # cap this run to at most journal_read_row_cap rows.
+    # Row-budget split (Step d0). The read spans the lookback tail,
+    # (window_start, checkpoint_watermark], and the rows above the watermark,
+    # which are the only rows that can advance the checkpoint. The cap governs
+    # both together, so the tail's true row count has to be known before the
+    # boundary over the new rows can be found.
+    tail_rows, tail_rows_assumed = _count_lookback_tail(
+        ctx, checkpoint_watermark, window_start, journal_read_row_cap,
+    )
+    tail_allowance, new_row_budget = split_row_budget(
+        journal_read_row_cap, tail_rows,
+    )
+
+    # Boundary anchored at the watermark, not at window_start. This is what
+    # makes forward progress structural: _build_boundary_query emits
+    # `record_timestamp > timestamp '<since>'`, so a boundary derived from the
+    # watermark is strictly above it by construction and the read window always
+    # contains rows that can advance the checkpoint.
     journal_until: str | None = None
     try:
         journal_until = athena_journal_adapter.find_row_count_boundary(
             athena_client=athena_client,
             bucket_name=bucket_name,
-            since_timestamp=since_timestamp if since_timestamp else None,
-            row_cap=journal_read_row_cap,
+            since_timestamp=checkpoint_watermark if checkpoint_watermark else None,
+            row_cap=new_row_budget,
             athena_workgroup=athena_workgroup,
             output_location=athena_output_location,
         )
@@ -1216,6 +1775,47 @@ def _read_journal_window(
             cause=f"Row-count boundary check failed (proceeding uncapped): {exc}",
         ))
 
+    # Requirement 4 tripwire. Unreachable: a boundary anchored at the watermark
+    # is strictly above it, which is the whole point of the anchor above. It
+    # exists so a change that reintroduces a non-advancing window fails loudly
+    # here instead of silently producing runs that read only already-processed
+    # rows and never move the checkpoint.
+    if journal_until is not None and journal_until <= checkpoint_watermark:
+        observability.emit(observability.log_error(
+            component=_COMPONENT,
+            bucket=bucket_name,
+            cause=(
+                f"Row-cap boundary did not advance: journal_until={journal_until!r} "
+                f"is not above checkpoint_watermark={checkpoint_watermark!r} "
+                f"(tail_rows={tail_rows}). A run reading this window can only "
+                f"re-read already-processed rows, so the bucket is skipped this "
+                f"interval rather than making no progress silently. This is a "
+                f"regression: the boundary is anchored at the watermark and is "
+                f"strictly above it by construction."
+            ),
+        ))
+        result.errored = True
+        return None
+
+    # Raise the lower bound when the tail will not fit its allowance, so the
+    # whole read stays within the row budget (Requirement 2.4).
+    # An assumed count bounds the tail too, even though the assumed value equals
+    # the allowance and so does not exceed it on its own: the real tail size is
+    # unknown, and leaving the bound at window_start would read all of it.
+    since_timestamp: str | None = window_start
+    if tail_rows > tail_allowance or tail_rows_assumed:
+        since_timestamp = _raise_tail_floor(
+            ctx, checkpoint_watermark, window_start, tail_rows, tail_allowance,
+            result,
+        )
+        if since_timestamp is None:
+            # The floor could not be established, so there is no lower bound this
+            # run can use that is both memory-safe and lossless. Skip the bucket
+            # with the checkpoint untouched — see _raise_tail_floor. The error
+            # naming the cause has already been emitted.
+            result.errored = True
+            return None
+
     if journal_until is not None:
         result.capped = True
         observability.emit(observability.log_audit(
@@ -1225,6 +1825,9 @@ def _read_journal_window(
                 "row_cap": journal_read_row_cap,
                 "until_timestamp": journal_until,
                 "since_timestamp": since_timestamp,
+                "tail_rows": tail_rows,
+                "new_row_budget": new_row_budget,
+                "tail_shortened": result.tail_shortened,
             },
         ))
 
@@ -1837,18 +2440,34 @@ def _persist_submission(
     ctx: _BucketContext,
     writer: StateWriter,
     last_submission: SubmissionRecord | None,
+    *,
+    terminal_job_ids: Collection[str] = (),
+    completion_tracking_enabled: bool = True,
 ) -> None:
     """Persist the submission record into the per-bucket state object.
 
+    The write adds this job's record without disturbing another job's, prunes
+    the records of jobs that have settled, and enforces the record ceiling — all
+    in one conditional write. *terminal_job_ids* and
+    *completion_tracking_enabled* are what the store needs to tell a settled
+    record from a terminal one whose report has not been read; see
+    ``StateStore.record_submission``.
+
     Best-effort: the job is already submitted and the checkpoint already
-    advanced, so a persistence failure here is non-fatal and only loses the
-    audit convenience of the in-state record (the job id is also captured in
-    the submission and audit log entries).
+    advanced, so a persistence failure here is non-fatal. It costs the audit
+    convenience of the in-state record (the job id is also captured in the
+    submission and audit log entries) and defers pruning to the next successful
+    submission.
     """
     if last_submission is None:
         return
     try:
-        writer.record_submission(last_submission)
+        writer.record_submission(
+            last_submission,
+            terminal_job_ids=terminal_job_ids,
+            completion_tracking_enabled=completion_tracking_enabled,
+            max_concurrent_jobs=ctx.max_concurrent_jobs,
+        )
     except Exception as exc:  # noqa: BLE001
         entry = observability.log_error(
             component=_COMPONENT,
@@ -1958,16 +2577,12 @@ def run_interval(
         _validate_kms_key_arn(kms_key_arn)
 
     # Completion-tracking feature gate (Requirement 4.8): the SNS topic ARN
-    # a Completion_Report would be published to. Absent/empty means the
-    # per-object tracking and email features are a no-op for this deployment —
-    # no Completion_Record is created, no Destination_Presence_Check or
-    # Source_Status_Check is issued — mirroring the existing
-    # MetricsNamespace no-op-when-unset pattern. The BOPS completion report
-    # itself is always requested and diagnosed regardless of this setting.
-    # Task 22.1 wires this to a
-    # stack-provisioned SNS topic ARN via the COMPLETION_REPORT_TOPIC_ARN
-    # env var; for now this key is simply read from runtime_config like any
-    # other optional setting.
+    # a Completion_Report would be published to. Absent/empty disables
+    # report-derived per-object tracking and email for this deployment,
+    # mirroring the existing MetricsNamespace no-op-when-unset pattern. The
+    # BOPS completion report itself is always requested and diagnosed
+    # regardless of this setting. The stack wires this to a provisioned SNS
+    # topic ARN through the COMPLETION_REPORT_TOPIC_ARN environment variable.
     completion_report_topic_arn: str = (
         runtime_config.get("completion_report_topic_arn", "") or ""
     ).strip()
@@ -1996,10 +2611,22 @@ def run_interval(
     # Default 4 matches the CloudFormation parameter default.
     max_batch_job_failures: int = max(1, int(runtime_config.get("max_batch_job_failures", 4)))
 
+    # Ceiling on Batch Operations jobs outstanding at once per bucket. Clamped at
+    # 1 rather than 0: 0 would defer every bucket forever, which is a way to stop
+    # the Solution entirely and not something a tuning knob should be able to do
+    # by accident. The CloudFormation parameter enforces the same floor.
+    max_concurrent_jobs: int = max(1, int(
+        runtime_config.get("max_concurrent_jobs_per_bucket", MAX_CONCURRENT_JOBS_DEFAULT)
+    ))
+
     # -----------------------------------------------------------------------
     # Journal_Read_Row_Cap — the single scale knob (Requirement 2.1)
     # -----------------------------------------------------------------------
-    journal_read_row_cap: int = max(1, int(
+    # Floored at MIN_JOURNAL_READ_ROW_CAP rather than 1: a cap of 1 leaves the
+    # lookback tail an allowance of floor(1 * 0.8) = 0, which is the one budget
+    # split with no safe read window — see _raise_tail_floor. The template
+    # enforces the same minimum, so this only catches a hand-edited config object.
+    journal_read_row_cap: int = max(MIN_JOURNAL_READ_ROW_CAP, int(
         runtime_config.get(
             "journal_read_row_cap", JOURNAL_READ_ROW_CAP_DEFAULT
         )
@@ -2024,6 +2651,10 @@ def run_interval(
     total_matched = 0
     total_submitted = 0
     bucket_results: list[BucketMetrics] = []  # per-bucket metrics for CloudWatch
+    # What the publish phase needs from this run, per bucket. A bucket skipped as
+    # disabled gets no entry, so the publish phase falls back to zero and False
+    # for it rather than reporting a stale count.
+    bucket_run_state: dict[str, _BucketRunState] = {}
     disabled_buckets = 0  # run-level count for CloudWatch (auto-disable visibility)
     any_capped_and_progressed = False  # RunOutcome signal for Self_Reinvocation
 
@@ -2059,6 +2690,11 @@ def run_interval(
             max_batch_job_failures=max_batch_job_failures,
             completion_report_topic_arn=completion_report_topic_arn,
             journal_read_row_cap=journal_read_row_cap,
+            max_concurrent_jobs=max_concurrent_jobs,
+        )
+        bucket_run_state[bucket.name] = _BucketRunState(
+            outstanding_jobs=result.outstanding_jobs,
+            submission_deferred=result.submission_deferred,
         )
         total_ops_read += result.ops_read
         total_raw_records += result.raw_records
@@ -2072,6 +2708,8 @@ def run_interval(
                 submitted=result.submitted,
                 errored=result.errored,
                 archived_excluded=result.archived_excluded,
+                submission_deferred=result.submission_deferred,
+                tail_shortened=result.tail_shortened,
             )
         )
         if result.capped and result.progressed:
@@ -2137,21 +2775,8 @@ def run_interval(
                 factory=factory,
                 store=store,
                 state_bucket=state_bucket,
-                check_batch_size=int(
-                    runtime_config.get(
-                        "completion_check_batch_size",
-                        COMPLETION_CHECK_BATCH_SIZE_DEFAULT,
-                    )
-                ),
                 completion_report_topic_arn=completion_report_topic_arn,
-                completion_item_ttl=timedelta(
-                    hours=float(
-                        runtime_config.get(
-                            "completion_item_ttl_hours",
-                            COMPLETION_ITEM_TTL_DEFAULT.total_seconds() / 3600,
-                        )
-                    )
-                ),
+                run_state=bucket_run_state,
             )
         except Exception as exc:  # noqa: BLE001
             entry = observability.log_error(
@@ -2367,11 +2992,16 @@ def _prepare_state_and_recovery(
     tracking_arn: str,
     account_id: str,
     result: _BucketResult,
-) -> tuple[StateWriter, str, _CompletionTracking, int, Any] | None:
+) -> tuple[
+    StateWriter, str, _CompletionTracking, int, Any, _JobCheckResult
+] | None:
     """Read checkpoint, set up writer/tracking, run job-check and recovery.
 
-    Returns (writer, checkpoint_watermark, tracking, consecutive_failures, state)
-    or None if the checkpoint read fails.
+    Returns (writer, checkpoint_watermark, tracking, consecutive_failures, state,
+    job_check) or None if the checkpoint read fails. The caller reads
+    ``job_check.outstanding`` to decide whether to defer submission, and
+    ``job_check.terminal_job_ids`` to tell the state store which records have
+    settled.
     """
     try:
         state, _initial_etag = store.get_checkpoint(
@@ -2424,7 +3054,14 @@ def _prepare_state_and_recovery(
             return None
         checkpoint_watermark = new_watermark
 
-    return state_writer, checkpoint_watermark, tracking, recovery.consecutive_failures, state
+    return (
+        state_writer,
+        checkpoint_watermark,
+        tracking,
+        recovery.consecutive_failures,
+        state,
+        job_check,
+    )
 
 
 def _process_bucket(
@@ -2444,11 +3081,16 @@ def _process_bucket(
     max_batch_job_failures: int = 4,
     completion_report_topic_arn: str = "",
     journal_read_row_cap: int = JOURNAL_READ_ROW_CAP_DEFAULT,
+    max_concurrent_jobs: int = MAX_CONCURRENT_JOBS_DEFAULT,
 ) -> _BucketResult:
     """Process one Monitored_Bucket for a single interval.
 
     Performs per-bucket fault isolation: any skip or error is logged and the
     function returns with partial counters, without raising.
+
+    At most one job is submitted per bucket per run, before and after the
+    concurrency bound: the limit caps how many jobs may be *outstanding*, not the
+    submission rate, so ``BatchJobsSubmitted`` stays 0 or 1.
     """
     result = _BucketResult()
     bucket_name = bucket.name
@@ -2473,6 +3115,7 @@ def _process_bucket(
         lookback=lookback,
         journal_read_row_cap=journal_read_row_cap,
         max_batch_job_failures=max_batch_job_failures,
+        max_concurrent_jobs=max_concurrent_jobs,
         on_bucket_disabled=on_bucket_disabled,
         on_submission_failure=on_submission_failure,
         on_journal_unavailable=on_journal_unavailable,
@@ -2489,7 +3132,82 @@ def _process_bucket(
     )
     if prep is None:
         return result
-    writer, checkpoint_watermark, tracking, bucket_consecutive_failures, state = prep
+    (
+        writer,
+        checkpoint_watermark,
+        tracking,
+        bucket_consecutive_failures,
+        state,
+        job_check,
+    ) = prep
+
+    outstanding_jobs = job_check.outstanding
+    result.outstanding_jobs = len(outstanding_jobs)
+
+    # Defer this bucket's work once its outstanding job count reaches the limit.
+    #
+    # The bound exists because not bounding replaces one unbounded behavior with
+    # another. A bandwidth-bound bucket submitting every 15 minutes accumulates
+    # jobs at roughly four an hour, against an account-level Batch Operations job
+    # quota this Solution does not model, and each job carries a per-job charge.
+    #
+    # Bounded rather than serialized: one job already spans every one of the
+    # bucket's tag-scoped rules and reaches terminal only when all its tasks do,
+    # so a rule targeting small objects already waits on one targeting large
+    # objects inside a single job. Serializing extends that head-of-line blocking
+    # across batches without limit, and holds the watermark meanwhile, so the
+    # journal read window grows until a resumed run hits JournalReadRowCap and
+    # drains one capped job at a time. A job's duration is set by replication
+    # throughput, not task count: 50 GiB across 5,400 objects took just over 5
+    # minutes cross-Region, which puts a multi-terabyte job into hours and a
+    # multi-hundred-terabyte one into days, against a CheckFrequencyMinutes that
+    # defaults to 15.
+    #
+    # Deferring costs nothing but time. The return happens before the journal is
+    # read, so no Athena query is billed, and because nothing is submitted the
+    # watermark does not advance and no operation enters `processed_window`:
+    # every pending tagging event stays eligible and is picked up whole once a
+    # job finishes. This is the same state path an ordinary submission failure
+    # already takes, and it is per bucket — other buckets in this run are
+    # unaffected.
+    if len(outstanding_jobs) >= max_concurrent_jobs:
+        result.submission_deferred = True
+        # The oldest outstanding job, not an arbitrary one: it is the one an
+        # operator would investigate.
+        oldest = _oldest_outstanding(outstanding_jobs)
+        observability.emit(observability.log_audit(
+            action="submission_deferred_job_in_flight",
+            source_bucket=bucket_name,
+            details={
+                "outstanding_count": len(outstanding_jobs),
+                "limit": max_concurrent_jobs,
+                "job_id": oldest.job_id if oldest else "",
+                "job_status": oldest.status if oldest else "",
+                "job_age_seconds": (
+                    oldest.elapsed_seconds(datetime.now(tz=UTC)) if oldest else None
+                ),
+            },
+        ))
+        # A deferral held up entirely by jobs whose status could not be read is
+        # not the ordinary "a job outlasted an interval" case, and an audit entry
+        # is the wrong weight for it: nothing here is working as intended. It
+        # resolves on its own once the describes succeed, or at
+        # _UNDESCRIBABLE_JOB_MAX_AGE if they never do, but an operator should not
+        # have to notice a stretch of SubmissionDeferred datapoints to find out.
+        if all(job.status == _UNKNOWN_JOB_STATUS for job in outstanding_jobs):
+            observability.emit(observability.log_error(
+                component=_COMPONENT,
+                bucket=bucket_name,
+                cause=(
+                    f"Submission deferred, and the status of all "
+                    f"{len(outstanding_jobs)} outstanding job(s) is unknown because "
+                    f"every DescribeJob call failed. This bucket submits nothing "
+                    f"while that holds. Check that the execution role still holds "
+                    f"s3:DescribeJob."
+                ),
+            ))
+        return result
+
     journal_result = _read_journal_window(
         ctx, checkpoint_watermark, result, writer)
     if journal_result is None:
@@ -2545,100 +3263,28 @@ def _process_bucket(
     if holder.release_ok:
         if holder.submitted_refs is not None:
             result.progressed = True
-        _persist_submission(ctx, writer, sub_outcome.last_submission)
+        _persist_submission(
+            ctx, writer, sub_outcome.last_submission,
+            terminal_job_ids=job_check.terminal_job_ids,
+            completion_tracking_enabled=bool(completion_report_topic_arn),
+        )
+
+    # A job submitted by this run is outstanding too, and the completion report is
+    # built after this returns, so the count a subscriber sees has to include it.
+    # Reporting the pre-submission count could let a report say nothing remains in
+    # tracking while the job this very run started was still replicating.
+    #
+    # Reaching here means the DescribeJob loop ran, so the count is an int; the
+    # guard keeps that an assertion rather than an assumption.
+    if result.outstanding_jobs is not None:
+        result.outstanding_jobs += result.submitted
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Isolated completion-tracking interval (design.md Decisions 3, 6, 7, 8) —
-# source-only. There is no destination-account or destination-region client,
-# no CheckKind, and no age gate anywhere in this section (design.md's
-# "Removes destination access entirely" note).
+# Isolated completion-tracking publish phase.
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _TrackingCandidate:
-    """One check-eligible ``TrackedObject`` selected for a Source_Status_Check
-    in a single ``_run_completion_tracking_interval`` invocation, tagged with
-    which bucket it belongs to.
-
-    Thin orchestrator-level wrapper around
-    ``completion_tracker.CheckCandidate`` (``item_key`` + ``obj``): that
-    dataclass has no notion of *which bucket* the item belongs to —
-    ``select_check_candidates`` operates on one bucket's ``items`` dict at a
-    time. This wrapper adds ``source_bucket`` so that, after collecting
-    candidates across ALL buckets into one global list for the cross-bucket
-    sort/cap step, the caller can still tell which bucket's ``s3_client``/
-    ``store`` calls to use when issuing the check and persisting the
-    resolution.
-    """
-
-    source_bucket: str
-    item_key: str
-    obj: TrackedObject
-
-    @property
-    def oldest_manifest_generated_at(self) -> datetime:
-        """The oldest ``ConfigContext.manifest_generated_at`` among this
-        candidate's routing configs — the deterministic cross-bucket
-        ordering key (design.md Decision 1)."""
-        return min(ctx.manifest_generated_at for ctx in self.obj.configs.values())
-
-
-def _check_batch(
-    checks: list[tuple[_TrackingCandidate, Callable[[], Any]]],
-    max_workers: int = _COMPLETION_CHECK_MAX_WORKERS,
-) -> list[tuple[_TrackingCandidate, Any]]:
-    """Run up to ``CompletionCheckBatchSize`` Source_Status_Checks concurrently.
-
-    Mirrors ``batch_operations_adapter.py::_call_with_timeout``'s
-    thread-backed timeout pattern, generalized to a bounded pool of
-    ``max_workers`` concurrent workers rather than a single in-line call.
-    Each check is a zero-argument callable returning a
-    ``source_status_adapter.SourceStatusResult`` (which itself never raises
-    — every failure mode is represented as a ``CHECK_FAILED`` result); a
-    check that unexpectedly raises, or that does not complete within
-    ``_COMPLETION_CHECK_TIMEOUT_SECONDS``, is treated as ``None`` rather than
-    propagating — a single failing check must never abort the rest of the
-    batch (Requirement 6.2, Property 13).
-
-    Parameters
-    ----------
-    checks:
-        A list of ``(candidate, check_fn)`` pairs. ``check_fn`` is a
-        zero-argument closure over the already-constructed source-side S3
-        client and the specific object/version to check.
-    max_workers:
-        Maximum number of concurrent worker threads.
-
-    Returns
-    -------
-    list[tuple[_TrackingCandidate, Any]]
-        One ``(candidate, result)`` pair per input, in the same order as
-        ``checks``. Never raises for an individual check failure.
-    """
-    if not checks:
-        return []
-
-    results: list[Any] = [None] * len(checks)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_to_index = {
-            pool.submit(check_fn): index for index, (_, check_fn) in enumerate(checks)
-        }
-        for future in concurrent.futures.as_completed(future_to_index):
-            index = future_to_index[future]
-            try:
-                results[index] = future.result(timeout=_COMPLETION_CHECK_TIMEOUT_SECONDS)
-            except Exception:  # noqa: BLE001 — a single failing check must not
-                # abort the batch (Requirement 3.6, 6.2, Property 13); treat
-                # any exception (including a concurrent.futures.TimeoutError)
-                # as an unexpected check failure.
-                results[index] = None
-
-    return [(checks[i][0], results[i]) for i in range(len(checks))]
 
 
 def _run_completion_tracking_interval(
@@ -2646,329 +3292,27 @@ def _run_completion_tracking_interval(
     factory: ClientFactory,
     store: state_store_module.StateStore,
     state_bucket: str,
-    check_batch_size: int = COMPLETION_CHECK_BATCH_SIZE_DEFAULT,
     completion_report_topic_arn: str = "",
-    completion_item_ttl: timedelta = COMPLETION_ITEM_TTL_DEFAULT,
+    run_state: dict[str, _BucketRunState] | None = None,
 ) -> None:
-    """Check-and-reconcile, then publish, phases of the isolated
-    completion-tracking interval — source-only (design.md Decisions 3, 6, 7).
+    """Publish quiescent completion items per bucket.
 
-    **Check-and-reconcile phase.** For each bucket's check-eligible
-    ``TrackedObject``s (``store.get_check_eligible_items`` — already
-    filtered to ``state == PENDING`` AND every ``ConfigContext``
-    ``bops_confirmed``), selects candidates via
-    ``completion_tracker.select_check_candidates(items)``. Across ALL
-    buckets, orders candidates by the oldest routing job's
-    ``manifest_generated_at``, then ``item_key`` as a deterministic
-    tie-break, caps the combined total at ``check_batch_size``, issues one
-    ``source_status_adapter.check_source_replication_status`` per candidate
-    concurrently via ``_check_batch``, reconciles each result via
-    ``completion_tracker.reconcile_source_status_check``, and persists all
-    resolutions per bucket via ``store.apply_completion_resolutions``. There
-    is no destination-presence client, no ``CheckKind``, and no age gate —
-    every gated candidate goes straight to a Source_Status_Check.
+    The report-resolution path runs during bucket processing. This isolated
+    phase remains after checkpoint and metrics work so newly resolved items may
+    publish in the same invocation. Per-bucket failures are isolated and leave
+    other buckets unaffected.
 
-    Per-candidate and per-bucket failures are isolated (Requirement 6.2,
-    Property 13): an exception raised while checking or reconciling one
-    candidate, or while persisting one bucket's resolutions, is logged via
-    ``observability.log_error`` (identifying only ``job_id``/
-    ``replication_config_id`` — never the object key, Requirement 7.3) and
-    does not prevent other candidates or other buckets from being
-    processed. A Source_Status_Check that reports a header-absent result
-    resolves the Tracked_Object to ``UNKNOWN`` and also emits an error
-    entry (Requirement 3.5); a successful resolution to ``COMPLETE``,
-    ``PENDING``, or ``FAILED`` emits no log entry at all (Requirement 7.1).
+    *run_state* carries the two values this phase cannot derive from the state
+    object — the bucket's outstanding job count and whether its submission was
+    deferred — so the report can state whether replication work is still in
+    progress. A bucket with no entry reports zero and False, which is what a
+    bucket skipped before processing should report.
 
-    **Publish phase**, run after the check-and-reconcile phase above
-    completes for every bucket: for each bucket in ``buckets``, reads that
-    bucket's full, UNFILTERED set of ``TrackedObject``s via
-    ``store.get_all_completion_items`` (deliberately NOT the check-eligible
-    set from the phase above — an item that already resolved in a prior
-    interval is no longer check-eligible, yet still needs its
-    ``should_publish``/quiescence re-evaluated every interval), collects
-    every item for which ``completion_tracker.should_publish`` is true
-    (using that bucket's ``store.get_scan_state``), and — if that collected
-    set is non-empty — builds ONE ``completion_tracker.build_completion_report``
-    for the whole batch and publishes it once via
-    ``sns_report_adapter.publish_completion_report``. On a successful
-    publish, deletes every covered item via ``store.delete_completion_items``
-    (guarded by a freshly-read ETag for that bucket's state object) and
-    emits ``observability.log_audit(action="completion_report_published", ...)``.
-    On a failed publish, emits ``observability.log_error`` identifying the
-    bucket and leaves every item in the batch untouched for retry at the
-    next interval (Requirement 4.5, 4.6). The whole publish phase — no
-    ``get_scan_state`` call, no ``should_publish`` evaluation, no SNS client
-    construction, no publish call, for any bucket — is skipped entirely
-    when ``completion_report_topic_arn`` is unset (Requirement 4.8),
-    mirroring the check-and-reconcile phase's own gating precedent at the
-    ``run_interval`` call site. Per-item and per-bucket failures in this
-    phase are isolated the same way as the check-and-reconcile phase
-    (Requirement 6.2): a failure reading one bucket's items, reading its
-    scan state, or evaluating one item's ``should_publish``, is logged and
-    that bucket/item is skipped rather than aborting the whole pass.
-
-    Parameters
-    ----------
-    buckets:
-        The list of ``MonitoredBucket``s to poll (mirrors ``app_config.buckets``
-        from ``run_interval``).
-    factory:
-        The shared ``ClientFactory`` used to construct each bucket's
-        source-side S3 client (for ``source_status_adapter`` and for
-        ``store.get_check_eligible_items``/``apply_completion_resolutions``),
-        and, when ``completion_report_topic_arn`` is set, one SNS client
-        per source region (via ``factory.create_sns_client``) for the
-        publish phase. No destination-account or destination-region client
-        is ever constructed anywhere in this function.
-    store:
-        The shared ``StateStore``.
-    state_bucket:
-        The scratch/state bucket name.
-    check_batch_size:
-        The maximum number of Source_Status_Check ``HeadObject`` calls
-        issued in this invocation (default 2000).
-    completion_report_topic_arn:
-        ARN of the stack-provisioned ``CompletionReportTopic``. Empty/unset
-        (the default) disables the entire publish phase (Requirement 4.8) —
-        mirrors the existing ``MetricsNamespace``/``completion_report_topic_arn``
-        no-op-when-unset pattern used elsewhere in this module.
-
-    Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 4.1, 4.4, 4.5, 4.6, 5.4, 6.2,
-    7.1, 7.2, 7.3
+    Items written by 1.0.1 that 1.1.0 cannot resolve are normalized to
+    ``UNKNOWN`` in memory here and drain through the ordinary publish-then-delete
+    path. There is no separate migration write; see
+    ``completion_tracker.resolve_legacy_item`` and design.md Decision 5.
     """
-    now = datetime.now(tz=UTC)
-
-    # Cache one source-side s3_client per source_bucket — reuses the same
-    # ClientFactory cache _process_bucket already relies on.
-    source_client_by_bucket: dict[str, Any] = {}
-
-    def _source_client(source_bucket: str):
-        client = source_client_by_bucket.get(source_bucket)
-        if client is None:
-            region = next(
-                (b.region for b in buckets if b.name == source_bucket), ""
-            )
-            client = factory.create_s3_client(region=region)
-            source_client_by_bucket[source_bucket] = client
-        return client
-
-    # ------------------------------------------------------------------
-    # 1. Collect check-eligible TrackedObjects (and their check candidates)
-    #    across all buckets.
-    # ------------------------------------------------------------------
-    all_candidates: list[_TrackingCandidate] = []
-
-    for bucket in buckets:
-        try:
-            eligible_items = store.get_check_eligible_items(
-                _source_client(bucket.name), state_bucket, bucket.name
-            )
-        except Exception as exc:  # noqa: BLE001 — Requirement 6.2 isolation
-            observability.emit(observability.log_error(
-                component="Completion_Tracker",
-                bucket=bucket.name,
-                cause=f"Failed to read check-eligible items: {exc}",
-            ))
-            continue
-
-        if not eligible_items:
-            continue
-
-        try:
-            candidates = completion_tracker.select_check_candidates(
-                eligible_items
-            )
-        except Exception as exc:  # noqa: BLE001 — Requirement 6.2 isolation
-            observability.emit(observability.log_error(
-                component="Completion_Tracker",
-                bucket=bucket.name,
-                cause=f"select_check_candidates failed: {exc}",
-            ))
-            continue
-
-        for candidate in candidates:
-            all_candidates.append(
-                _TrackingCandidate(
-                    source_bucket=bucket.name,
-                    item_key=candidate.item_key,
-                    obj=candidate.obj,
-                )
-            )
-
-    # ------------------------------------------------------------------
-    # 2. Order oldest-routing-job-first across ALL buckets, then
-    #    lexicographic item_key as a deterministic tie-break; cap at
-    #    check_batch_size.
-    #
-    # No early return when all_candidates is empty — the publish phase
-    # (step 5) must still run even when the check-and-reconcile phase has
-    # nothing to check this pass.
-    # ------------------------------------------------------------------
-    def _sort_key(candidate: _TrackingCandidate) -> tuple[datetime, str]:
-        return (candidate.oldest_manifest_generated_at, candidate.item_key)
-
-    all_candidates.sort(key=_sort_key)
-    selected = all_candidates[:check_batch_size]
-
-    # ------------------------------------------------------------------
-    # 3. Build the (candidate, check_fn) pairs and run them concurrently.
-    # ------------------------------------------------------------------
-    checks: list[tuple[_TrackingCandidate, Callable[[], Any]]] = []
-    expired: list[_TrackingCandidate] = []
-
-    for candidate in selected:
-        # Expire before spending a HeadObject on it: an object past the TTL is
-        # abandoned regardless of what the check would return, so the call
-        # would be wasted (Requirement 3.8).
-        if completion_tracker.is_expired(candidate.obj, now, completion_item_ttl):
-            expired.append(candidate)
-            continue
-
-        source_bucket = candidate.source_bucket
-        object_key = candidate.obj.object_key
-        version_id = candidate.obj.version_id
-
-        def _source_check_fn(
-            object_key=object_key,
-            version_id=version_id,
-            source_bucket=source_bucket,
-        ):
-            s3_client = _source_client(source_bucket)
-            return source_status_adapter.check_source_replication_status(
-                s3_client, source_bucket, object_key, version_id
-            )
-
-        checks.append((candidate, _source_check_fn))
-
-    check_results = _check_batch(checks)
-
-    # ------------------------------------------------------------------
-    # 4. Reconcile each result, grouping resolutions by source_bucket.
-    #    Logging: a header-absent or check-failed result emits exactly one
-    #    error entry naming only job_id/replication_config_id (never the
-    #    object key or item_key, Requirement 7.3); a clean COMPLETE/PENDING/
-    #    FAILED resolution emits nothing (Requirement 7.1).
-    # ------------------------------------------------------------------
-    resolutions_by_bucket: dict[str, dict[str, TrackedObject]] = {}
-
-    for candidate in expired:
-        resolutions_by_bucket.setdefault(candidate.source_bucket, {})[
-            candidate.item_key
-        ] = completion_tracker.expire_tracked_object(candidate.obj, now)
-        observability.emit(observability.log_audit(
-            action="completion_item_expired",
-            source_bucket=candidate.source_bucket,
-            details={
-                "job_ids": [ctx.job_id for ctx in candidate.obj.configs.values()],
-                "age_seconds": int(
-                    completion_tracker.tracked_object_age(candidate.obj, now)
-                    .total_seconds()
-                ),
-                "ttl_seconds": int(completion_item_ttl.total_seconds()),
-            },
-        ))
-
-    for candidate, raw_result in check_results:
-        source_bucket = candidate.source_bucket
-        item_key = candidate.item_key
-        job_ids = [ctx.job_id for ctx in candidate.obj.configs.values()]
-        config_ids = list(candidate.obj.configs.keys())
-
-        if raw_result is None:
-            # The check itself raised unexpectedly or timed out — leave the
-            # item untouched (still PENDING) for retry next interval.
-            observability.emit(observability.log_error(
-                component="Completion_Tracker",
-                bucket=source_bucket,
-                cause=(
-                    "Source_Status_Check raised an unexpected error "
-                    f"(job_ids={job_ids!r}, replication_config_ids={config_ids!r})"
-                ),
-            ))
-            continue
-
-        try:
-            reconciled = completion_tracker.reconcile_source_status_check(
-                candidate.obj, raw_result, now
-            )
-        except Exception as exc:  # noqa: BLE001 — Requirement 6.2, Property 13
-            observability.emit(observability.log_error(
-                component="Completion_Tracker",
-                bucket=source_bucket,
-                cause=(
-                    "Reconciliation failed "
-                    f"(job_ids={job_ids!r}, replication_config_ids={config_ids!r}): {exc}"
-                ),
-            ))
-            continue
-
-        if raw_result.kind is source_status_adapter.SourceStatusCheckKind.CHECK_FAILED:
-            observability.emit(observability.log_error(
-                component="Completion_Tracker",
-                bucket=source_bucket,
-                cause=(
-                    "Source_Status_Check failed "
-                    f"(job_ids={job_ids!r}, replication_config_ids={config_ids!r}): "
-                    f"{raw_result.error_reason}"
-                ),
-            ))
-        elif raw_result.kind is source_status_adapter.SourceStatusCheckKind.HEADER_ABSENT:
-            # Requirement 3.5 — resolved to UNKNOWN; record an error
-            # indication naming job_id/replication_config_id, never the key.
-            observability.emit(observability.log_error(
-                component="Completion_Tracker",
-                bucket=source_bucket,
-                cause=(
-                    "Source_Status_Check header absent "
-                    f"(job_ids={job_ids!r}, replication_config_ids={config_ids!r})"
-                ),
-            ))
-
-        resolutions_by_bucket.setdefault(source_bucket, {})[item_key] = reconciled
-
-    # ------------------------------------------------------------------
-    # 5. Persist all resolutions per bucket via apply_completion_resolutions.
-    #    Grouped by source_bucket (one state object per bucket) so a single
-    #    conditional write covers every item's resolution for that bucket.
-    # ------------------------------------------------------------------
-    for source_bucket, bucket_resolutions in resolutions_by_bucket.items():
-
-        def _mutate_fn(
-            payload: dict[str, Any], bucket_resolutions=bucket_resolutions
-        ) -> dict[str, Any]:
-            existing_items = completion_serializer.deserialize_completion_items(payload)
-            for item_key, reconciled_obj in bucket_resolutions.items():
-                if item_key not in existing_items:
-                    # Item was deleted (e.g. already published) between
-                    # selection and persistence — nothing to update.
-                    continue
-                existing_items[item_key] = reconciled_obj
-            payload["completion_items"] = completion_serializer.serialize_completion_items(
-                existing_items
-            )
-            return payload
-
-        try:
-            s3_client = _source_client(source_bucket)
-            store.apply_completion_resolutions(
-                s3_client, state_bucket, source_bucket, _mutate_fn
-            )
-        except Exception as exc:  # noqa: BLE001 — Requirement 6.2, Property 13
-            observability.emit(observability.log_error(
-                component="Completion_Tracker",
-                bucket=source_bucket,
-                cause=f"Failed to persist completion resolutions: {exc}",
-            ))
-            continue
-
-    # ------------------------------------------------------------------
-    # 6. Publish phase — one Completion_Report per source_bucket, covering
-    #    every TrackedObject whose should_publish holds.
-    #
-    #    Entirely a no-op when completion_report_topic_arn is unset
-    #    (Requirement 4.8): no TrackedObject is read for should_publish, no
-    #    ScanState is read, and no SNS client is ever constructed.
-    # ------------------------------------------------------------------
     if not completion_report_topic_arn:
         return
 
@@ -2983,10 +3327,10 @@ def _run_completion_tracking_interval(
 
     for bucket in buckets:
         source_bucket = bucket.name
-
         try:
+            s3_client = factory.create_s3_client(region=bucket.region)
             all_items = store.get_all_completion_items(
-                _source_client(source_bucket), state_bucket, source_bucket
+                s3_client, state_bucket, source_bucket
             )
         except Exception as exc:  # noqa: BLE001 — Requirement 6.2 isolation
             observability.emit(observability.log_error(
@@ -3001,7 +3345,7 @@ def _run_completion_tracking_interval(
 
         try:
             scan_state_by_config = store.get_scan_state(
-                _source_client(source_bucket), state_bucket, source_bucket
+                s3_client, state_bucket, source_bucket
             )
         except Exception as exc:  # noqa: BLE001 — Requirement 6.2 isolation
             # Conservative fallback: treat as if no scan has ever run for
@@ -3016,15 +3360,35 @@ def _run_completion_tracking_interval(
             scan_state_by_config = {}
 
         publishable: list[tuple[str, TrackedObject]] = []
-        for item_key, item in all_items.items():
+        for item_key, stored_item in all_items.items():
             try:
+                # A state object written by 1.0.1 can hold items 1.1.0 has no
+                # way to resolve: lifecycle PENDING, or a RESOLVED outcome of
+                # PENDING/GONE/EXPIRED. Left alone they would sit here forever,
+                # never publishable and never pruned, so the bucket's
+                # completion_items map would only ever grow and the objects they
+                # describe would never be reported at all.
+                #
+                # Normalizing in memory lets the existing publish-then-delete
+                # path drain them: they report as UNKNOWN and are deleted with
+                # everything else in the batch (design.md Decision 5).
+                item = completion_tracker.resolve_legacy_item(stored_item)
                 if completion_tracker.should_publish(item, scan_state_by_config):
                     publishable.append((item_key, item))
             except Exception as exc:  # noqa: BLE001 — Requirement 6.2, Property 13
+                # This entry is the only signal that an item is stuck. It is not
+                # publishable, so it is never deleted, and the report carries no
+                # count of items left behind for it to show up in. The object key
+                # is deliberately absent — keys are never logged — so the count of
+                # these entries is what an operator has to go on.
                 observability.emit(observability.log_error(
                     component="Completion_Tracker",
                     bucket=source_bucket,
-                    cause=f"should_publish evaluation failed for an item: {exc}",
+                    cause=(
+                        f"should_publish evaluation failed for an item: {exc}. "
+                        f"The item stays in this bucket's completion items and is "
+                        f"not reported; it will be retried on the next run."
+                    ),
                 ))
                 continue
 
@@ -3040,30 +3404,33 @@ def _run_completion_tracking_interval(
             [item for _, item in publishable]
         )
 
-        # How many Tracked_Objects for this bucket are NOT covered by this
-        # run's report(s) — i.e. still awaiting a terminal replication answer.
-        # A report covers only what resolved since the previous one
-        # (Requirement 4.2), so this count is what tells an operator whether a
-        # wave of tagged objects has fully landed: zero means nothing is left
-        # in tracking for the bucket.
+        # The report deliberately carries no count of items left behind. Such a
+        # count is always zero in any report that gets sent: quiescence is keyed
+        # per bucket, so every item here is tested against the same ScanState, and
+        # the `if not publishable` above means a report exists only when at least
+        # one item passed. A run that matched anything records a non-zero match
+        # count and so publishes nothing; a run that matched nothing records a
+        # zero-match scan later than every job creation time, so everything passes.
+        # There is no ordering that leaves some items quiescent and others not.
         #
-        # all_items is the bucket's entire completion_items map, not a window:
-        # get_all_completion_items applies no filter and no bound, and every
-        # item covered by a previous report was deleted after that publish. So
-        # the difference is the full remaining population, not a per-run slice.
+        # The one exception is an item whose should_publish raised above, which is
+        # reported by that error rather than by a number here.
         #
-        # The same value is carried by every chunk of one run's report rather
-        # than being decremented across chunks: the chunks are one logical
-        # report split only to fit SNS's message limit, and they carry no
-        # ordering, so a per-chunk countdown would imply a sequence that does
-        # not exist.
-        outstanding = len(all_items) - len(publishable)
+        # The job-level values below are duplicated across chunks rather than
+        # apportioned: the chunks are one logical report split only to fit SNS's
+        # message limit and carry no ordering, so a per-chunk countdown would imply
+        # a sequence that does not exist.
+        bucket_state = (run_state or {}).get(source_bucket, _BucketRunState())
 
         region = next((b.region for b in buckets if b.name == source_bucket), "")
         item_keys: list[str] = []
         for batch in batches:
             report = completion_tracker.build_completion_report(
-                source_bucket, batch, outstanding=outstanding
+                source_bucket,
+                batch,
+
+                outstanding_jobs=bucket_state.outstanding_jobs,
+                submission_deferred=bucket_state.submission_deferred,
             )
             result = sns_report_adapter.publish_completion_report(
                 _sns_client(region),
@@ -3087,10 +3454,10 @@ def _run_completion_tracking_interval(
             continue
         try:
             _, delete_etag = store.get_checkpoint(
-                _source_client(source_bucket), state_bucket, source_bucket
+                s3_client, state_bucket, source_bucket
             )
             store.delete_completion_items(
-                _source_client(source_bucket),
+                s3_client,
                 state_bucket,
                 source_bucket,
                 item_keys,

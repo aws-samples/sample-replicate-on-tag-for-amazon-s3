@@ -111,8 +111,26 @@ These have no default. You must provide a value.
 | `LambdaMemoryMB` | `2048` | Memory in MiB for the main ReplicationLambda function. One of 1024, 2048, 3072, 4096, 6144, 8192, 10240; each carries its own `JournalReadRowCap` ceiling, tabulated below |
 | `CompletionCheckMemoryMB` | `256` | Memory in MiB for CompletionReportCheckLambda (report-missing detection, only created when `CompletionNotificationEmail` is set). One of 128, 256, 512, 1024, 2048. Sized independently, since this function does not read the journal or generate manifests |
 | `LambdaTimeoutSeconds` | `900` | Lambda function timeout in seconds (max 900), for ReplicationLambda |
-| `JournalReadRowCap` | `500000` | Max journal rows read in one interval, and the single scale knob bounding in-memory manifest size; a larger single-interval tagging burst is processed in bounded partial reads across multiple intervals |
+| `JournalReadRowCap` | `500000` | Max journal rows read in one interval, and the single scale knob bounding in-memory manifest size. Governs the whole read: the `JournalLookbackSeconds` re-scan window and the new rows above it together. At least 20% is reserved for new rows, so a larger single-interval tagging burst drains in bounded partial reads across a bounded number of intervals |
 | `ReinvocationChainLimit` | `20` | Max consecutive self-reinvocations draining a capped run's backlog before deferring to the next scheduled trigger |
+
+The cap is divided between two ranges each run. Up to 80% may go to the
+`JournalLookbackSeconds` window below the Solution's journal position, which is
+re-scanned for late-arriving journal records; the remainder is reserved for new
+rows above it, which are the only rows that can advance the Solution's position.
+A re-scan window that fits its share is read whole, which is the ordinary case.
+One that does not is truncated from its oldest end, so the read stays within the
+cap and the most recent part of the window is still re-scanned. Each truncation
+emits an error log entry and publishes the `JournalTailShortened` metric. A
+sustained run of that metric means a record delivered late into the skipped part
+of the window can be missed rather than delayed, so treat it as a reason to raise
+this parameter — see
+[CloudWatch metrics](../docs/monitoring.md#cloudwatch-metrics).
+
+The minimum accepted value is 2, not 1. At 1 the re-scan window's share rounds
+down to zero, which leaves no read window that is both bounded and lossless, so the
+value is rejected at deploy time rather than handled. 2 is a correctness floor and
+not a usable setting; the smallest sensible value is orders of magnitude higher.
 
 Raising `JournalReadRowCap` lets each run clear more before capping, at the cost
 of Lambda timeout and memory headroom. The Solution enforces a safe maximum for
@@ -174,30 +192,28 @@ When either KMS parameter is set, the key policy must grant the `ExecutionRole` 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `AlarmEmail` | _(empty)_ | Email address for run-failure and S3 Batch Operations job-failure notifications. When set, creates an SNS topic and an email subscription; a failed or cancelled batch job sends one readable email with the job ID, status, and a console link. A CloudWatch alarm on the same event exists for console/dashboard visibility but does not itself send email. The separate `ReplicationLambdaErrorAlarm` does email this address when a scheduled run fails outright, and again when runs recover. Requires an active CloudTrail trail in the stack Region for the batch job events only (see [Verifying the CloudTrail trail](#verifying-the-cloudtrail-trail)) |
-| `MaxBatchJobFailures` | `4` | Consecutive S3 Batch Operations job failures (`Failed` or `Cancelled`) for a bucket's job before the Solution disables that bucket in its state object. Prevents runaway per-job costs from a bucket whose job keeps failing; the failure counter resets on the first successful (`Complete`) job |
+| `MaxBatchJobFailures` | `4` | Consecutive S3 Batch Operations job failures (`Failed` or `Cancelled`) for a bucket's job before the Solution disables that bucket in its state object. Prevents runaway per-job costs from a bucket whose job keeps failing; the failure counter resets on the first successful (`Complete`) job. Counts failing intervals, not failing jobs: a run in which several jobs fail increments it once |
+| `MaxConcurrentJobsPerBucket` | `3` | How many S3 Batch Operations jobs may be outstanding at once for one source bucket, between 1 and 10. At the limit the bucket is skipped for that run: no journal query, no checkpoint advance, and the pending tagging stays pending. At most one job is still submitted per bucket per run, whatever this is set to. `1` serializes the bucket. Raising it raises the ceiling on concurrent per-job charges for that bucket (see [Bounded Concurrent Jobs per Bucket](../README.md#bounded-concurrent-jobs-per-bucket)) |
 
 **Completion tracking**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `CompletionNotificationEmail` | _(empty)_ | Email address for per-object replication tracking and completion email reports. The S3 Batch Operations completion report CSV is always written to the State Bucket; this parameter gates the per-object `x-amz-replication-status` tracking, the SNS email, and the report-missing alert only |
-| `CompletionCheckBatchSize` | `2000` | Maximum number of replication-status checks issued per run when completion tracking is enabled |
-| `CompletionItemTtlHours` | `168` | Hours a tracked object may await replication confirmation before it is abandoned with outcome `EXPIRED` and removed from tracking. A backstop bounding state-object growth for objects that can never resolve; minimum 24, since it must exceed both real replication time and several run intervals |
+| `CompletionNotificationEmail` | _(empty)_ | Email address for completion email reports and report-missing alerts. The S3 Batch Operations completion report CSV is always written to the State Bucket; when this parameter is set, the Solution resolves tracked objects from its task rows and sends the SNS email report |
 
 Every S3 Batch Operations job writes a completion report CSV to the State Bucket
 under `completion-reports/`, regardless of whether `CompletionNotificationEmail`
-is set. The Solution reads it to diagnose permission-shaped error codes. Setting
-`CompletionNotificationEmail` additionally enables per-object
-`x-amz-replication-status` tracking, the SNS email report, and the
-report-missing alert.
+is set. The Solution reads it to diagnose permission-shaped error codes and,
+when completion reporting is enabled, resolve tracked-object outcomes from the
+report. Setting `CompletionNotificationEmail` enables the SNS email report and
+the report-missing alert.
 
 The report is written by the job itself, using the `s3:PutObject` grant on
 `completion-reports/*` that the stack's
 [Batch Operations job role](../docs/permissions.md#batch-operations-job-role)
 carries. The stack's `ExecutionRole` reads the report back through its existing
 `ScratchBucketReadWrite` grant, so no additional statement is needed on either
-role. Completion tracking never accesses the destination account or Region: it
-reads only the source object's own replication-status header.
+role. Completion tracking never accesses the destination account or Region.
 
 **Lake Formation**
 
@@ -221,8 +237,7 @@ stack.
 | `JournalLookbackSeconds` | `JOURNAL_LOOKBACK_SECONDS` |
 | `ReinvocationChainLimit` | `REINVOCATION_CHAIN_LIMIT` |
 | `MaxBatchJobFailures` | `MAX_BATCH_JOB_FAILURES` |
-| `CompletionCheckBatchSize` | `COMPLETION_CHECK_BATCH_SIZE` |
-| `CompletionItemTtlHours` | `COMPLETION_ITEM_TTL_HOURS` |
+| `MaxConcurrentJobsPerBucket` | `MAX_CONCURRENT_JOBS_PER_BUCKET` |
 | `MetricsNamespace` | `METRICS_NAMESPACE` |
 | `MetricsDeploymentId` | `METRICS_DEPLOYMENT_ID` |
 
@@ -377,6 +392,11 @@ update.
   picked up. A bounded processed-operation window suppresses re-submission of
   already-processed records, so a larger lookback never replicates an object
   twice.
+  On a new stack this reaches back before the stack existed: the checkpoint is
+  seeded at the deployment timestamp and the first run reads from
+  `deployment_timestamp - JournalLookbackSeconds`, so tagging done in the two
+  hours before you deployed is replicated by the first run. See
+  [Journal Start Point](../README.md#journal-start-point).
 
   The window is a bound, not a retry. A record whose `record_timestamp` falls
   at or below `watermark - JournalLookbackSeconds` by the time it reaches the

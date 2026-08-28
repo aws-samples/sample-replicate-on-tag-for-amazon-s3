@@ -286,9 +286,9 @@ class TestIsEffectiveFailure:
 
     def test_complete_with_partial_success_is_not_a_failure(self):
         """A nonzero tasks_succeeded is never flagged, however large
-        tasks_failed is — NumberOfTasksFailed alone is not a reliable
-        signal at scale (see docstring in job_recovery.py), so only the
-        all-zero-succeeded case counts."""
+        tasks_failed is: a job with any succeeded task is not a job where
+        every task failed. It is a partially failed job, handled through the
+        completion report rather than by flagging the whole job."""
         outcome = _make_outcome(status="Complete", tasks_succeeded=1, tasks_failed=100001)
         assert is_effective_failure(outcome) is False
 

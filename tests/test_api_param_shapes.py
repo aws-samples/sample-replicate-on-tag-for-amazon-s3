@@ -31,7 +31,6 @@ from botocore.exceptions import ClientError
 from src.adapters import (
     bops_report_reader,
     replication_config_adapter,
-    source_status_adapter,
 )
 from src.adapters.athena_journal_adapter import read_journal
 from src.adapters.inventory_manifest_writer import write_in_memory_inventory_manifest
@@ -46,6 +45,7 @@ from src.core.models import (
     RunResult,
 )
 from src.lambda_handler import (
+    _build_runtime_config,
     _publish_report_missing_alert,
     _publish_submission_failure_alert,
     handler,
@@ -157,36 +157,10 @@ class TestInventoryManifestWriterPutObject:
 
 
 class TestOtherS3CallSites:
-    def test_report_existence_check_is_valid(self):
+    def test_report_manifest_existence_check_is_valid(self):
         client = MagicMock()
-        client.list_objects_v2.return_value = {"Contents": []}
-        bops_report_reader.report_object_exists(
-            client, _STATE_BUCKET, "completion-reports/src/manifest/"
-        )
-        assert_calls_match_api(client, "s3", expected=1)
-
-    def test_report_listing_pagination_is_valid(self):
-        """The ContinuationToken branch, which only a truncated listing takes."""
-        client = MagicMock()
-        client.list_objects_v2.side_effect = [
-            {
-                "Contents": [{"Key": "completion-reports/a/results/x.csv"}],
-                "IsTruncated": True,
-                "NextContinuationToken": "token-1",
-            },
-            {"Contents": [{"Key": "completion-reports/a/results/y.csv"}]},
-        ]
-        bops_report_reader._list_report_object_keys(
-            client, _STATE_BUCKET, "completion-reports/a/"
-        )
-        assert_calls_match_api(client, "s3", expected=2)
-
-    @pytest.mark.parametrize("version_id", [None, "v1"], ids=["no-version", "version"])
-    def test_source_status_head_object_is_valid(self, version_id):
-        client = MagicMock()
-        client.head_object.return_value = {"ReplicationStatus": "COMPLETED"}
-        source_status_adapter.check_source_replication_status(
-            client, _SRC_BUCKET, "path/obj.txt", version_id
+        bops_report_reader.report_manifest_written_at(
+            client, _STATE_BUCKET, "completion-reports/src/manifest/", "job-1"
         )
         assert_calls_match_api(client, "s3", expected=1)
 
@@ -506,3 +480,34 @@ class TestDisableWriteAndRemainingReaders:
         client = MagicMock()
         client.describe_job(AccountId=_ACCOUNT, JobId="job-1")
         assert_calls_match_api(client, "s3control", expected=1)
+
+
+# ---------------------------------------------------------------------------
+# Runtime configuration guard — removed completion HEAD tuning must remain inert.
+# ---------------------------------------------------------------------------
+
+
+class TestRemovedCompletionTrackingRuntimeConfig:
+    _REQUIRED_ENV = {
+        "STATE_BUCKET": _STATE_BUCKET,
+        "ATHENA_WORKGROUP": "wg",
+        "ATHENA_OUTPUT_LOCATION": f"s3://{_STATE_BUCKET}/athena-results/",
+        "ACCOUNT_ID": _ACCOUNT,
+        "BATCH_OPERATIONS_ROLE_ARN": _BATCHOPS_ROLE_ARN,
+    }
+
+    @pytest.mark.parametrize(
+        ("env_var", "runtime_key"),
+        [
+            ("COMPLETION_CHECK_BATCH_SIZE", "completion_check_batch_size"),
+            ("COMPLETION_ITEM_TTL_HOURS", "completion_item_ttl_hours"),
+        ],
+    )
+    def test_removed_completion_env_var_never_reaches_runtime_config(
+        self, env_var, runtime_key
+    ):
+        """Removed tuning variables stay ignored even if an old deployment sets them."""
+        runtime_config = _build_runtime_config(
+            {**self._REQUIRED_ENV, env_var: "123"}
+        )
+        assert runtime_key not in runtime_config

@@ -46,6 +46,7 @@ from botocore.exceptions import ClientError
 from src.adapters import bops_report_reader
 from src.adapters import state_store as state_store_module
 from src.core import completion_tracker
+from src.core import job_recovery
 from src.core import observability
 from src.core.manifest_strategy import JOURNAL_READ_ROW_CAP_DEFAULT
 from src.core.reinvocation import should_reinvoke
@@ -53,7 +54,7 @@ from src.core.row_cap_validation import validate_row_cap
 from src.orchestrator import _completion_report_prefix, run_interval
 
 _DEFAULT_CONFIG_KEY = "config/solution-config.json"
-_TERMINAL_JOB_STATUSES = ("Complete", "Failed", "Cancelled")
+_TERMINAL_JOB_STATUSES = job_recovery.TERMINAL_JOB_STATUSES
 
 # Reinvocation_Chain_Limit default (tasks.md "Resolved decisions": at ~6 min
 # per capped run this is ~2 hours of continuous draining before deferring to
@@ -351,6 +352,15 @@ def _build_runtime_config(env: dict) -> dict:
         except ValueError:
             pass
 
+    max_concurrent_jobs = env.get("MAX_CONCURRENT_JOBS_PER_BUCKET", "")
+    if max_concurrent_jobs.strip():
+        try:
+            runtime_config["max_concurrent_jobs_per_bucket"] = int(
+                max_concurrent_jobs.strip()
+            )
+        except ValueError:
+            pass  # orchestrator falls back to MAX_CONCURRENT_JOBS_DEFAULT
+
     # Reinvocation_Chain_Limit (Requirement 5.1) — the `ReinvocationChainLimit`
     # CFN parameter/env var wiring lands in a later task; read the env var
     # now so the handler is ready for it, falling back to
@@ -370,24 +380,6 @@ def _build_runtime_config(env: dict) -> dict:
         runtime_config["completion_report_topic_arn"] = (
             completion_report_topic_arn.strip()
         )
-
-    completion_check_batch_size = env.get("COMPLETION_CHECK_BATCH_SIZE", "")
-    if completion_check_batch_size.strip():
-        try:
-            runtime_config["completion_check_batch_size"] = int(
-                completion_check_batch_size.strip()
-            )
-        except ValueError:
-            pass
-
-    completion_item_ttl_hours = env.get("COMPLETION_ITEM_TTL_HOURS", "")
-    if completion_item_ttl_hours.strip():
-        try:
-            runtime_config["completion_item_ttl_hours"] = float(
-                completion_item_ttl_hours.strip()
-            )
-        except ValueError:
-            pass  # orchestrator falls back to COMPLETION_ITEM_TTL_DEFAULT
 
     return runtime_config
 
@@ -670,8 +662,9 @@ def _publish_report_missing_alert(
     replication_config_id: str,
     job_id: str,
     now: datetime,
+    reason: str = "missing",
 ) -> None:
-    """Deliver one report-missing escalation: always log, publish to SNS iff
+    """Deliver one completion-report escalation: always log, publish to SNS iff
     ``topic_arn`` is present (design.md Decision 9, Requirements 8.3, 8.4).
 
     The log write always happens and never depends on the SNS outcome; the
@@ -679,12 +672,37 @@ def _publish_report_missing_alert(
     call is wrapped in its own try/except here — the caller
     (``check_report_handler``'s per-config loop) isolates any failure from
     this delivery step per Requirement 8.8.
+
+    *reason* selects between the two conditions that leave a terminal job's
+    outcomes unconfirmed. Both produce the same event type and the same
+    operator action, so they share one alert rather than two:
+
+    ``missing``                 No report manifest exists an hour after the job
+                                terminated. The likely cause is the Batch
+                                Operations job role lacking ``s3:PutObject`` on
+                                the report location.
+    ``present but unconsumed``  A report manifest exists but the Solution has
+                                not consumed it after several of its own
+                                intervals, so it cannot read it. Likely causes
+                                are a checksum or row-count mismatch, a
+                                malformed row, or the report objects having been
+                                removed by the State Bucket's
+                                ``LifecycleExpirationDays`` rule (Requirement 1.7).
     """
-    cause = (
-        "BOPS_Completion_Report has not appeared within 1 hour of "
-        "job termination. The stack-created Batch Operations job role "
-        "likely lacks s3:PutObject on the report location."
-    )
+    unconsumed = reason == "present but unconsumed"
+    if unconsumed:
+        cause = (
+            "BOPS_Completion_Report has existed for 48 hours without being "
+            "consumed, so the Solution cannot read it. Likely a checksum or "
+            "row-count mismatch, a malformed row, or report objects expired by "
+            "the State Bucket lifecycle rule."
+        )
+    else:
+        cause = (
+            "BOPS_Completion_Report has not appeared within 1 hour of "
+            "job termination. The stack-created Batch Operations job role "
+            "likely lacks s3:PutObject on the report location."
+        )
     # Structured for the log group, prose for the inbox — see
     # _publish_bucket_disabled_alert for the same split.
     message = json.dumps(
@@ -693,6 +711,7 @@ def _publish_report_missing_alert(
             "source_bucket": source_bucket,
             "replication_config_id": replication_config_id,
             "job_id": job_id,
+            "reason": reason,
             "cause": cause,
         }
     )
@@ -707,21 +726,46 @@ def _publish_report_missing_alert(
                 f"S3 replication cannot confirm completion for {source_bucket}"
             ),
             Message=(
-                f"An S3 Batch Operations job for source bucket "
-                f"{source_bucket} finished more than an hour ago, but its "
-                f"completion report has never appeared, so this Solution "
-                f"cannot confirm whether those objects replicated.\n\n"
-                f"Job ID: {job_id}\n\n"
-                f"Most likely cause: the Batch Operations job role this stack "
-                f"created is missing s3:PutObject on the report location "
-                f"under the State Bucket's completion-reports/ prefix. The "
-                f"stack grants that itself, so this is a defect in the "
-                f"deployment rather than something to fix on a role you own: "
-                f"check the policy on the role named by the "
-                f"BatchOperationsRoleArn stack output against the Batch "
-                f"Operations job role table in docs/permissions.md.\n\n"
-                f"Replication itself may well have succeeded — this is a "
-                f"reporting gap, not a confirmed replication failure.\n"
+                (
+                    f"An S3 Batch Operations job for source bucket "
+                    f"{source_bucket} wrote a completion report more than 48 "
+                    f"hours ago, but this Solution has not been able to read "
+                    f"that report, so it cannot confirm whether those objects "
+                    f"replicated.\n\n"
+                    f"Job ID: {job_id}\n\n"
+                    f"Most likely causes: the report failed an integrity "
+                    f"check (a result object's MD5 checksum or the total row "
+                    f"count did not match what DescribeJob reported, or a row "
+                    f"was malformed), or the report objects were deleted by "
+                    f"the State Bucket's lifecycle rule on the "
+                    f"completion-reports/ prefix before they could be read. "
+                    f"That rule uses the LifecycleExpirationDays parameter, "
+                    f"which defaults to 30 days.\n\n"
+                    f"The report itself is still the record of what happened, "
+                    f"if it has not expired: read it under the "
+                    f"completion-reports/ prefix of the State Bucket.\n\n"
+                    f"Replication itself may well have succeeded — this is a "
+                    f"reporting gap, not a confirmed replication failure.\n"
+                )
+                if unconsumed
+                else (
+                    f"An S3 Batch Operations job for source bucket "
+                    f"{source_bucket} finished more than an hour ago, but its "
+                    f"completion report has never appeared, so this Solution "
+                    f"cannot confirm whether those objects replicated.\n\n"
+                    f"Job ID: {job_id}\n\n"
+                    f"Most likely cause: the Batch Operations job role this "
+                    f"stack created is missing s3:PutObject on the report "
+                    f"location under the State Bucket's completion-reports/ "
+                    f"prefix. The stack grants that itself, so this is a "
+                    f"defect in the deployment rather than something to fix "
+                    f"on a role you own: check the policy on the role named "
+                    f"by the BatchOperationsRoleArn stack output against the "
+                    f"Batch Operations job role table in "
+                    f"docs/permissions.md.\n\n"
+                    f"Replication itself may well have succeeded — this is a "
+                    f"reporting gap, not a confirmed replication failure.\n"
+                )
             ),
         )
 
@@ -730,19 +774,36 @@ def check_report_handler(event, context):  # noqa: ARG001 — event/context impo
     """Lambda entry point — report-missing detection (design.md Decision 9).
 
     Runs on its own 5-minute schedule, independent of ``handler``'s
-    Processing_Interval. For each Monitored_Bucket, for each
-    ``replication_config_id`` with a terminal, unconfirmed
-    ``SubmissionRecord`` (``not store.completion_job_exists(job_id)``) not
-    currently under alert suppression: checks whether the
-    BOPS_Completion_Report object now exists via
-    ``bops_report_reader.report_object_exists``. If found, this check-only
-    path does nothing further — the next ``handler`` invocation's own
-    creation hook reads and merges the report normally. If absent and
-    ``completion_tracker.is_report_overdue`` holds, publishes the escalation
-    (SNS + log) and marks the config as alerted.
+    Processing_Interval. For each Monitored_Bucket, for **every**
+    ``SubmissionRecord`` that is terminal, unconfirmed
+    (``not store.completion_job_exists(job_id)``), and not currently under alert
+    suppression: checks whether the exact top-level BOPS_Completion_Report
+    manifest now exists via ``bops_report_reader.report_manifest_written_at``,
+    which returns the manifest's ``LastModified`` or ``None``.
 
-    Each ``replication_config_id``'s processing is wrapped in its own
-    try/except so a single failure never blocks the rest of the invocation's
+    Every record, because a bucket may have several jobs outstanding at once. The
+    previous single-record lookup meant the one mechanism built to detect an
+    unread report was blind to the case that produced one. Suppression is keyed
+    by ``job_id`` for the same reason (Requirements 1.4, 1.5).
+
+    If the manifest was written recently, this check-only path does nothing
+    further — the next ``handler`` invocation's own creation hook reads and
+    merges the report normally. If it has existed longer than
+    ``completion_tracker.is_report_unconsumed_overdue`` allows, the Solution
+    cannot read it and the same escalation fires with a different reason
+    (Requirement 1.7).
+
+    That second condition is measured from when the report was written, not from
+    a job timestamp, because a job's duration is unbounded: measuring from
+    ``CreationTime`` would give a job that ran for days no grace at all.
+
+    Terminal jobs with zero invoked tasks are skipped because S3 does not create
+    their reports. If the manifest is absent and
+    ``completion_tracker.is_report_overdue`` holds, the handler publishes the
+    escalation (SNS + log) and marks the config as alerted.
+
+    Each record's processing is wrapped in its own try/except so a single
+    failure never blocks the rest of the invocation's
     batch (Requirement 8.8). This handler is entirely independent of
     ``run_interval`` — it never touches the checkpoint, lease, or
     Batch_Replication_Job submission path.
@@ -809,64 +870,118 @@ def check_report_handler(event, context):  # noqa: ARG001 — event/context impo
             continue
 
         # ---------------------------------------------------------------
-        # design.md D6 (task 6.1): the ``submission_records`` dict holds
-        # exactly ONE entry, keyed by the per-bucket sentinel
-        # (``bucket_name``). Look up that single record directly.
+        # Every submission record for the bucket, not one. A bucket may have
+        # several jobs outstanding at once (MaxConcurrentJobsPerBucket), and
+        # indexing a single record was the reason a missing report could go
+        # undetected for exactly the job that produced one. Requirement 1.4.
         # ---------------------------------------------------------------
-        rec = prior_submissions.get(bucket_name)
-        if rec is None:
-            continue
+        for rec in list(prior_submissions.values()):
+            # The report prefix is derived from the bucket name at submission
+            # time, so the read side must derive it the same way. Unlike the
+            # suppression identity below, this is not per job.
+            config_id = bucket_name
+            # Suppression is per job (Requirement 1.5): keying it on the bucket
+            # would let one job's alert hide every other job's. The stored list
+            # holds arbitrary strings, so this needs no schema change, and a
+            # bucket-name entry left by an earlier build is inert — nothing
+            # reads or writes it any more.
+            alert_identity = rec.job_id
 
-        config_id = bucket_name
-        alert_identity = bucket_name
+            try:
+                if not rec.job_id:
+                    continue
+                if alert_identity in alerted:
+                    continue  # suppressed (Requirement 8.5)
+                if store.completion_job_exists(
+                    regional_s3, state_bucket, bucket_name, rec.job_id
+                ):
+                    continue  # already confirmed — nothing to detect as missing
 
-        try:
-            if not rec.job_id:
-                continue
-            if alert_identity in alerted:
-                continue  # suppressed (Requirement 8.5)
-            if store.completion_job_exists(
-                regional_s3, state_bucket, bucket_name, rec.job_id
-            ):
-                continue  # already confirmed — nothing to detect as missing
-
-            resp = s3control_client.describe_job(
-                AccountId=account_id, JobId=rec.job_id
-            )
-            job = resp["Job"]
-            status = job.get("Status")
-            if status not in _TERMINAL_JOB_STATUSES:
-                continue  # not yet terminal — nothing to check
-
-            terminal_at = job.get("TerminationDate") or job.get("CreationTime")
-            if terminal_at is None:
-                continue
-
-            report_prefix = _completion_report_prefix(config_id, rec.manifest_key)
-            if bops_report_reader.report_object_exists(
-                regional_s3, state_bucket, report_prefix
-            ):
-                # Found — leave it for the next handler() invocation's
-                # creation hook to read and merge normally (Decision 9).
-                continue
-
-            if completion_tracker.is_report_overdue(terminal_at, now):
-                _publish_report_missing_alert(
-                    sns_client,
-                    logs_client,
-                    batch_job_failure_topic_arn,
-                    batch_job_failure_log_group,
-                    source_bucket=bucket_name,
-                    replication_config_id=alert_identity,
-                    job_id=rec.job_id,
-                    now=now,
+                resp = s3control_client.describe_job(
+                    AccountId=account_id, JobId=rec.job_id
                 )
-                store.add_alerted_config(
-                    regional_s3, state_bucket, bucket_name, alert_identity
+                job = resp["Job"]
+                status = job.get("Status")
+                if status not in _TERMINAL_JOB_STATUSES:
+                    continue  # not yet terminal — nothing to check
+
+                progress_summary = job.get("ProgressSummary", {})
+                tasks_succeeded = progress_summary.get("NumberOfTasksSucceeded")
+                tasks_failed = progress_summary.get("NumberOfTasksFailed")
+                if tasks_succeeded == 0 and tasks_failed == 0:
+                    # S3 does not generate a completion report until at least
+                    # one task is invoked, so a report-missing alert would be
+                    # false.
+                    continue
+
+                terminal_at = job.get("TerminationDate") or job.get("CreationTime")
+                if terminal_at is None:
+                    continue
+
+                report_prefix = _completion_report_prefix(
+                    config_id, rec.manifest_key
                 )
-        except Exception as exc:  # noqa: BLE001 — Requirement 8.8 isolation
-            _logger.error(
-                "Report-missing check failed for bucket %r (job %r): %s",
-                bucket_name, rec.job_id, exc,
-            )
-            continue
+                report_written_at = bops_report_reader.report_manifest_written_at(
+                    regional_s3, state_bucket, report_prefix, rec.job_id
+                )
+
+                # Reaching this point means the job is terminal, invoked at least
+                # one task, and is NOT recorded as processed in state. Both
+                # branches below escalate from that, on different clocks:
+                #
+                #   report absent      S3 writes a report within minutes of
+                #                      terminal, so an hour is enough to
+                #                      conclude it is not coming.
+                #   report present     The Solution has had several of its own
+                #                      intervals to consume a report that exists
+                #                      and has not, which means it cannot read
+                #                      it. No extra read is needed to establish
+                #                      that, so this branch does not download
+                #                      the report.
+                #
+                # A present report inside the shorter window is left alone for
+                # the next handler() invocation to read and merge normally
+                # (Decision 9).
+                #
+                # The two branches measure from different points on purpose. A
+                # missing report is measured from the job terminating, since S3
+                # writes it within minutes of that. An unconsumed report is
+                # measured from when the report itself was written, because a
+                # job's duration is unbounded and measuring from a job timestamp
+                # would give a long-running job no grace at all.
+                if report_written_at is not None:
+                    overdue = completion_tracker.is_report_unconsumed_overdue(
+                        report_written_at, now
+                    )
+                    reason = "present but unconsumed"
+                else:
+                    overdue = completion_tracker.is_report_overdue(terminal_at, now)
+                    reason = "missing"
+
+                if overdue:
+                    _publish_report_missing_alert(
+                        sns_client,
+                        logs_client,
+                        batch_job_failure_topic_arn,
+                        batch_job_failure_log_group,
+                        source_bucket=bucket_name,
+                        replication_config_id=alert_identity,
+                        job_id=rec.job_id,
+                        now=now,
+                        reason=reason,
+                    )
+                    store.add_alerted_config(
+                        regional_s3, state_bucket, bucket_name, alert_identity
+                    )
+                    # Keep the in-memory set in step with the write, so two
+                    # records that somehow share an identity cannot both alert
+                    # within one invocation.
+                    alerted.add(alert_identity)
+            except Exception as exc:  # noqa: BLE001 — Requirement 8.8 isolation
+                # Per record, so one job's failure does not stop the next job's
+                # check for the same bucket.
+                _logger.error(
+                    "Report-missing check failed for bucket %r (job %r): %s",
+                    bucket_name, rec.job_id, exc,
+                )
+                continue

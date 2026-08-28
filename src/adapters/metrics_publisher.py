@@ -136,6 +136,43 @@ def _build_metric_data(
                 "Unit": "Count",
             })
 
+        # Emitted only when the bucket's previous Batch Operations job had not
+        # finished, so submission was deferred. Follows the same
+        # publish-only-when-non-zero reasoning as the group above: it is an
+        # occasional condition, not a liveness signal, and an alarm on it should
+        # treat missing data as not breaching.
+        #
+        # Worth alarming on when sustained. One or two consecutive runs means a
+        # job simply outlasted an interval, which is normal for large objects
+        # whose replication is bandwidth-bound. A long unbroken stretch means the
+        # bucket's replication throughput, not this Solution, is what limits how
+        # fast tagging is acted on.
+        if bm.submission_deferred:
+            datums.append({
+                "MetricName": "SubmissionDeferred",
+                "Dimensions": dims,
+                "Value": 1.0,
+                "Unit": "Count",
+            })
+
+        # Emitted only when the run raised its journal-read lower bound above
+        # the configured lookback window start, so part of that window was not
+        # re-scanned. Same publish-only-when-non-zero reasoning as the two above,
+        # and an alarm on it should treat missing data as not breaching.
+        #
+        # Worth alarming on when sustained. An occasional datapoint means one
+        # burst briefly exceeded the row budget. A long unbroken stretch means
+        # either the bucket is in a backlog an operator should know about, or the
+        # tail's share of JournalReadRowCap is mistuned for the workload — those
+        # are the two readings, and both warrant looking.
+        if bm.tail_shortened:
+            datums.append({
+                "MetricName": "JournalTailShortened",
+                "Dimensions": dims,
+                "Value": 1.0,
+                "Unit": "Count",
+            })
+
         # Always emitted, including zero — per-bucket liveness signal
         # (Req 2.4, 2.6, 7.3).
         datums.append({

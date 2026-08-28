@@ -37,8 +37,7 @@ Metadata:
           default: Resilience
         Parameters:
           - MaxBatchJobFailures
-          - CompletionCheckBatchSize
-          - CompletionItemTtlHours
+          - MaxConcurrentJobsPerBucket
       - Label:
           default: Encryption
         Parameters:
@@ -171,12 +170,17 @@ Parameters:
   JournalReadRowCap:
     Type: Number
     Default: 500000
-    MinValue: 1
+    # Minimum 2, not 1: at 1 the JournalLookbackSeconds re-scan window gets a
+    # share of zero, leaving no read window that is both memory-bounded and
+    # lossless. See MIN_JOURNAL_READ_ROW_CAP in src/core/manifest_strategy.py.
+    MinValue: 2
     Description: >-
-      (Optional) Max journal rows read in one interval. A single-interval
-      tagging burst above this is processed in bounded partial reads across
-      multiple intervals instead of risking the Lambda timeout
-      (see deploy/README.md).
+      (Optional) Max journal rows read in one interval, covering the
+      JournalLookbackSeconds re-scan window and the new rows above it
+      together. At least 20 percent is reserved for new rows, so a
+      single-interval tagging burst above this drains in bounded partial
+      reads across a bounded number of intervals instead of risking the
+      Lambda timeout (see deploy/README.md).
 
   MaxBatchJobFailures:
     Type: Number
@@ -185,6 +189,16 @@ Parameters:
     Description: >-
       Consecutive job failures before disabling a bucket
       (see deploy/README.md).
+
+  MaxConcurrentJobsPerBucket:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: >-
+      (Optional) Max Batch Operations jobs outstanding at once per source
+      bucket. At the limit the bucket is skipped until a job finishes. 1
+      serializes the bucket (see deploy/README.md).
 
   ReinvocationChainLimit:
     Type: Number
@@ -211,24 +225,10 @@ Parameters:
     Type: String
     Default: ""
     Description: >-
-      (Optional) Email for per-object replication tracking and completion
-      email reports. The completion report CSV is always written; this
-      parameter gates the per-object status checks and SNS email only
-      (see deploy/README.md Completion Tracking).
-
-  CompletionCheckBatchSize:
-    Type: Number
-    Default: 2000
-    Description: (Optional) Max Source_Status_Check calls issued per invocation.
-
-  CompletionItemTtlHours:
-    Type: Number
-    Default: 168
-    MinValue: 24
-    Description: >-
-      (Optional) Hours a tracked object may await replication confirmation
-      before it is abandoned as EXPIRED. A backstop that bounds state growth;
-      must exceed real replication time and several run intervals.
+      (Optional) Email for report-derived per-object replication outcomes.
+      The completion report CSV is always written; this parameter gates SNS
+      email reports and report-missing alerts (see deploy/README.md Completion
+      Tracking).
 
 # Conditions
 Conditions:
@@ -321,46 +321,11 @@ Resources:
                 Effect: Allow
                 Action:
                   - s3:GetReplicationConfiguration
-                  # ListBucket is required so that the completion-tracking
-                  # Source_Status_Check's HeadObject on a deleted object
-                  # version returns 404 rather than 403 — S3 masks object
-                  # existence from a caller without ListBucket. A 403 is
-                  # indistinguishable from a transient access failure, so such
-                  # an object would be re-checked every run forever and its
-                  # Tracked_Object would never leave the state object. Same
-                  # reasoning as the ScratchBucketReadWrite grant in
-                  # deploy/iam-policy.json.
-                  - s3:ListBucket
                 Resource: !Split
                   - ","
                   - !Sub
                     - "arn:aws:s3:::${B}"
                     - B: !Join [",arn:aws:s3:::", !Ref SourceBucketNames]
-
-              # Sid retained for continuity; this statement no longer grants
-              # tagging actions. It covers exactly one call: the
-              # completion-tracking Source_Status_Check's HeadObject on a source
-              # object version (both actions are needed, because S3 evaluates a
-              # version-qualified HeadObject against GetObjectVersion and an
-              # unqualified one against GetObject).
-              #
-              # s3:GetObjectTagging and s3:InitiateReplication were removed as
-              # unreachable. Nothing in src/ calls GetObjectTagging -- object
-              # tags reach this Solution through the S3 Metadata journal via
-              # Athena, never by reading tags off the object. InitiateReplication
-              # belongs to the S3 Batch Replication job role -- BatchOperationsRole
-              # below, passed as create_job's RoleArn -- not to this role, which
-              # only submits the job (s3-batch-replication-policies.html).
-              - Sid: ReadSourceObjectTags
-                Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:GetObjectVersion
-                Resource: !Split
-                  - ","
-                  - !Sub
-                    - "arn:aws:s3:::${B}/*"
-                    - B: !Join ["/*,arn:aws:s3:::", !Ref SourceBucketNames]
 
               - Sid: AthenaJournalQuery
                 Effect: Allow
@@ -681,13 +646,13 @@ Resources:
             Resource:
               - !Ref CompletionReportTopic
 
-  # Grants sns:Publish on BatchJobFailureTopic, for the report-missing alert
-  # (design.md Decision 9, source-status-completion-tracking) and the
-  # bucket-disabled alert (recovery-instructions email on circuit-breaker /
-  # InlineHashCeiling disable). Scoped to HasAlarmEmail alone (not also
-  # HasCompletionNotificationEmail) since ReplicationLambda's disable path
-  # needs this regardless of whether completion tracking is configured, and
-  # BatchJobFailureTopic itself only exists under HasAlarmEmail.
+  # Grants sns:Publish on BatchJobFailureTopic for the report-missing alert
+  # and the bucket-disabled alert (recovery-instructions email on
+  # circuit-breaker / InlineHashCeiling disable). Scoped to HasAlarmEmail
+  # alone (not also HasCompletionNotificationEmail) since ReplicationLambda's
+  # disable path needs this regardless of whether completion tracking is
+  # configured, and BatchJobFailureTopic itself only exists under
+  # HasAlarmEmail.
   BatchJobFailureAlertPolicy:
     Type: AWS::IAM::Policy
     Condition: HasAlarmEmail
@@ -1542,9 +1507,8 @@ Resources:
           JOURNAL_READ_ROW_CAP: !Ref JournalReadRowCap
           REINVOCATION_CHAIN_LIMIT: !Ref ReinvocationChainLimit
           MAX_BATCH_JOB_FAILURES: !Ref MaxBatchJobFailures
+          MAX_CONCURRENT_JOBS_PER_BUCKET: !Ref MaxConcurrentJobsPerBucket
           COMPLETION_REPORT_TOPIC_ARN: !If [HasCompletionNotificationEmail, !Ref CompletionReportTopic, !Ref "AWS::NoValue"]
-          COMPLETION_CHECK_BATCH_SIZE: !Ref CompletionCheckBatchSize
-          COMPLETION_ITEM_TTL_HOURS: !Ref CompletionItemTtlHours
           BATCH_JOB_FAILURE_TOPIC_ARN: !If [HasAlarmEmail, !Ref BatchJobFailureTopic, !Ref "AWS::NoValue"]
           BATCH_JOB_FAILURE_LOG_GROUP: !Ref BatchJobFailureLogGroup
 
@@ -1641,9 +1605,8 @@ Resources:
         RoleArn: !GetAtt ScheduleRole.Arn
 
   # Completion Report Check Lambda / Schedule (conditional)
-  # Report-missing detection, on its own 5-minute schedule, only when
-  # CompletionNotificationEmail is set. See design.md Decision 9 under
-  # .kiro/specs/.complete/source-status-completion-tracking/.
+  # Report-missing detection runs on its own 5-minute schedule when
+  # CompletionNotificationEmail is set.
   CompletionReportCheckLambda:
     Type: AWS::Lambda::Function
     Condition: HasCompletionNotificationEmail

@@ -22,8 +22,12 @@ from src.adapters.athena_journal_adapter import (
     JournalReadError,
     _build_boundary_query,
     _build_query,
+    _build_tail_count_query,
+    _build_tail_floor_query,
     _parse_row,
     find_row_count_boundary,
+    find_tail_floor,
+    find_tail_row_count,
     read_journal,
 )
 from src.core.models import TaggingOperation
@@ -324,6 +328,219 @@ class TestFindRowCountBoundary:
         with pytest.raises(ValueError):
             find_row_count_boundary(
                 client, _BUCKET, since_timestamp=None, row_cap=500_000,
+                athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Lookback-tail queries (row-cap-forward-progress).
+#
+# find_tail_row_count sizes the tail so the row budget can be split between it
+# and the rows above the watermark; find_tail_floor raises the read's lower
+# bound when the tail will not fit its allowance.
+#
+# Feature: row-cap-forward-progress
+# Requirements: 5.1, 5.2, 7.1
+# ---------------------------------------------------------------------------
+
+_WATERMARK_WM = "2024-01-01T02:00:50.000000Z"
+_WATERMARK_ATHENA = "2024-01-01 02:00:50.000000"
+
+
+class TestBuildTailCountQuery:
+    def test_is_a_single_row_aggregate(self):
+        query = _build_tail_count_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM
+        )
+        assert query.strip().startswith("SELECT count(*)")
+        assert "OFFSET" not in query
+        assert "ORDER BY" not in query
+
+    def test_bounds_the_tail_exclusively_below_and_inclusively_above(self):
+        query = _build_tail_count_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM
+        )
+        assert f"record_timestamp > timestamp '{_SINCE_ATHENA}'" in query
+        assert f"record_timestamp <= timestamp '{_WATERMARK_ATHENA}'" in query
+
+    def test_predicate_parity_with_build_query(self):
+        """The count must be over exactly the rows read_journal would
+        materialise for the same range, or the number cannot be budgeted
+        against the row cap."""
+        count_query = _build_tail_count_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM
+        )
+        read_query = _build_query(
+            _BUCKET_NAMESPACE,
+            _BUCKET,
+            since_timestamp=_SINCE_WM,
+            until_timestamp=_WATERMARK_WM,
+        )
+        for predicate in (
+            f"bucket = '{_BUCKET}'",
+            "record_type = 'UPDATE_METADATA'",
+            f"record_timestamp > timestamp '{_SINCE_ATHENA}'",
+            f"record_timestamp <= timestamp '{_WATERMARK_ATHENA}'",
+        ):
+            assert predicate in count_query
+            assert predicate in read_query
+
+    def test_uses_the_same_journal_table_path(self):
+        query = _build_tail_count_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM
+        )
+        assert f'"s3tablescatalog/aws-s3"."{_BUCKET_NAMESPACE}"."journal"' in query
+
+    def test_bucket_name_escaped(self):
+        query = _build_tail_count_query(
+            _BUCKET_NAMESPACE, "buck'et", _SINCE_WM, _WATERMARK_WM
+        )
+        assert "buck''et" in query
+
+
+class TestBuildTailFloorQuery:
+    def test_orders_descending_so_the_offset_counts_back_from_the_watermark(self):
+        query = _build_tail_floor_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=400_000
+        )
+        assert "ORDER BY record_timestamp DESC" in query
+        assert "ORDER BY record_timestamp ASC" not in query
+
+    def test_offset_equals_the_allowance_not_allowance_minus_one(self):
+        """The bound is used exclusively, so the row named must be the one *past*
+        the allowance. `OFFSET allowance - 1` would name the allowance-th row and
+        admit one fewer than budgeted, which differs from
+        `_build_boundary_query`'s `OFFSET row_cap - 1` only because that bound is
+        inclusive."""
+        query = _build_tail_floor_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=400_000
+        )
+        assert "OFFSET 400000 LIMIT 1" in query
+
+    def test_offset_one_for_an_allowance_of_one(self):
+        """`OFFSET 0` here would name the newest tail row, and an exclusive bound
+        on it admits no tail rows at all — discarding the whole tail while the run
+        advances past it."""
+        query = _build_tail_floor_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=1
+        )
+        assert "OFFSET 1 LIMIT 1" in query
+
+    def test_selects_only_record_timestamp_over_the_tail_range(self):
+        query = _build_tail_floor_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=10
+        )
+        assert query.strip().startswith("SELECT record_timestamp")
+        assert f"record_timestamp > timestamp '{_SINCE_ATHENA}'" in query
+        assert f"record_timestamp <= timestamp '{_WATERMARK_ATHENA}'" in query
+
+    def test_filters_to_update_metadata(self):
+        query = _build_tail_floor_query(
+            _BUCKET_NAMESPACE, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=10
+        )
+        assert "record_type = 'UPDATE_METADATA'" in query
+
+
+class TestFindTailRowCount:
+    def test_returns_the_count(self):
+        client = _make_athena_client(rows=[["620000"]])
+        result = find_tail_row_count(
+            client, _BUCKET, _SINCE_WM, _WATERMARK_WM,
+            athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+        )
+        assert result == 620_000
+
+    def test_returns_zero_for_an_empty_tail(self):
+        client = _make_athena_client(rows=[["0"]])
+        result = find_tail_row_count(
+            client, _BUCKET, _SINCE_WM, _WATERMARK_WM,
+            athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+        )
+        assert result == 0
+
+    def test_fetches_a_single_row_rather_than_paginating(self):
+        """One get_query_results call, no NextToken follow-up — the property
+        that keeps this query's cost independent of the tail's size."""
+        client = _make_athena_client(rows=[["12"]])
+        find_tail_row_count(
+            client, _BUCKET, _SINCE_WM, _WATERMARK_WM,
+            athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+        )
+        assert client.get_query_results.call_count == 1
+
+    def test_query_failure_raises(self):
+        client = _make_athena_client(state="FAILED", failure_reason="boom")
+        with pytest.raises(ValueError):
+            find_tail_row_count(
+                client, _BUCKET, _SINCE_WM, _WATERMARK_WM,
+                athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+            )
+
+    def test_unparseable_count_raises(self):
+        client = _make_athena_client(rows=[["not-a-number"]])
+        with pytest.raises(ValueError):
+            find_tail_row_count(
+                client, _BUCKET, _SINCE_WM, _WATERMARK_WM,
+                athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+            )
+
+    def test_empty_result_set_raises_rather_than_reporting_zero(self):
+        """COUNT(*) always returns a row. Reporting zero here would hand the
+        caller a tail-free budget split on a response it did not understand."""
+        client = _make_athena_client(rows=None)
+        with pytest.raises(ValueError):
+            find_tail_row_count(
+                client, _BUCKET, _SINCE_WM, _WATERMARK_WM,
+                athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+            )
+
+
+class TestFindTailFloor:
+    def test_returns_canonical_watermark_when_floor_found(self):
+        client = _make_athena_client(rows=[["2024-01-01 01:30:00.000000"]])
+        result = find_tail_floor(
+            client, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=4,
+            athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+        )
+        assert result == "2024-01-01T01:30:00.000000Z"
+
+    def test_returns_none_when_tail_smaller_than_allowance(self):
+        client = _make_athena_client(rows=None)
+        result = find_tail_floor(
+            client, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=400_000,
+            athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+        )
+        assert result is None
+
+    def test_fetches_a_single_row_rather_than_paginating(self):
+        client = _make_athena_client(rows=[["2024-01-01 01:30:00.000000"]])
+        find_tail_floor(
+            client, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=4,
+            athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+        )
+        assert client.get_query_results.call_count == 1
+
+    def test_rejects_non_positive_allowance(self):
+        client = _make_athena_client(rows=None)
+        with pytest.raises(ValueError):
+            find_tail_floor(
+                client, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=0,
+                athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+            )
+
+    def test_query_failure_raises(self):
+        client = _make_athena_client(state="FAILED", failure_reason="boom")
+        with pytest.raises(ValueError):
+            find_tail_floor(
+                client, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=4,
+                athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
+            )
+
+    def test_unparseable_timestamp_raises(self):
+        client = _make_athena_client(rows=[["not-a-timestamp"]])
+        with pytest.raises(ValueError):
+            find_tail_floor(
+                client, _BUCKET, _SINCE_WM, _WATERMARK_WM, tail_allowance=4,
                 athena_workgroup=_WORKGROUP, output_location=_OUTPUT,
             )
 

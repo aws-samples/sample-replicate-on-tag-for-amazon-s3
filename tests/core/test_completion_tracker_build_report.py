@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -24,7 +25,7 @@ from src.core.models import CompletionState, ConfigContext, TrackedObject
 _MANIFEST_AT = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 _NOW = datetime(2024, 1, 3, 0, 0, 0, tzinfo=timezone.utc)
 
-_ALL_REPLICATION_OUTCOMES = ("COMPLETE", "PENDING", "FAILED", "UNKNOWN")
+_ALL_REPLICATION_OUTCOMES = ("COMPLETE", "FAILED", "UNKNOWN")
 
 
 def make_config_context(
@@ -73,10 +74,13 @@ def make_obj(
 
 
 class TestBuildCompletionReport:
-    def test_format_version_is_2(self):
+    def test_format_version_is_3(self):
+        """Bumped from 2 by the removal of the `outstanding` field. Removing rather than
+        redefining, with an explicit bump, is cheaper for a subscriber than
+        silently changing the meaning of a field it already parses."""
         obj = make_obj()
         report = build_completion_report("my-bucket", [obj])
-        assert report["format_version"] == 2
+        assert report["format_version"] == 3
 
     def test_source_bucket_copied_verbatim_from_parameter(self):
         obj = make_obj(source_bucket="item-bucket")
@@ -350,10 +354,10 @@ class TestSummaryField:
         )["summary"]
         assert "Action needed: 1 of 1 did not replicate." in failed
 
-        gone = build_completion_report(
-            "my-bucket", [make_obj(replication_outcome="GONE")]
+        unknown = build_completion_report(
+            "my-bucket", [make_obj(replication_outcome="UNKNOWN")]
         )["summary"]
-        assert "No failures." in gone
+        assert "Action needed: 1 of 1 did not replicate." in unknown
 
         complete = build_completion_report(
             "my-bucket", [make_obj(replication_outcome="COMPLETE")]
@@ -373,7 +377,7 @@ class TestSummaryField:
 
     def test_large_counts_carry_thousands_separators(self):
         items = [
-            make_obj(object_key=f"{i}.txt", replication_outcome="GONE")
+            make_obj(object_key=f"{i}.txt", replication_outcome="UNKNOWN")
             for i in range(1057)
         ]
         summary = build_completion_report("my-bucket", items)["summary"]
@@ -382,44 +386,20 @@ class TestSummaryField:
 
     def test_singular_object_is_not_pluralised(self):
         summary = build_completion_report(
-            "my-bucket", [make_obj(replication_outcome="GONE")]
+            "my-bucket", [make_obj(replication_outcome="COMPLETE")]
         )["summary"]
         assert "1 object " in summary
-        assert "object(s)" not in summary
-
-    def test_verb_agrees_with_a_single_object(self):
-        """"1 were deleted" and "1 are still replicating" are the failure modes
-        here — the count precedes the phrase, so both forms are needed."""
-        gone = build_completion_report(
-            "my-bucket", [make_obj(replication_outcome="GONE")]
-        )["summary"]
-        assert "1 object was deleted" in gone
-        assert "were deleted" not in gone
-
-        pending = build_completion_report(
-            "my-bucket", [make_obj(replication_outcome="PENDING")]
-        )["summary"]
-        assert "is still replicating" in pending
-        assert "are still replicating" not in pending
-
-    def test_verb_agrees_with_many_objects(self):
-        items = [
-            make_obj(object_key=f"{i}.txt", replication_outcome="GONE")
-            for i in range(3)
-        ]
-        summary = build_completion_report("my-bucket", items)["summary"]
-        assert "3 objects were deleted" in summary
+        assert "1 objects" not in summary
 
     def test_single_outcome_absorbs_the_total_without_repeating_it(self):
-        """Avoids "1,057 objects — 1,057 were deleted ..."."""
+        """Avoids repeating the count in a single-outcome summary."""
         items = [
-            make_obj(object_key=f"{i}.txt", replication_outcome="GONE")
+            make_obj(object_key=f"{i}.txt", replication_outcome="COMPLETE")
             for i in range(1057)
         ]
         summary = build_completion_report("my-bucket", items)["summary"]
         assert summary == (
-            "my-bucket: 1,057 objects were deleted before replication could be "
-            "confirmed. No failures."
+            "my-bucket: 1,057 objects replicated successfully. No action needed."
         )
         assert summary.count("1,057") == 1
 
@@ -436,7 +416,7 @@ class TestSummaryField:
 
     def test_subject_object_noun_agrees_with_count(self):
         one = format_completion_report_subject(
-            build_completion_report("my-bucket", [make_obj(replication_outcome="GONE")])
+            build_completion_report("my-bucket", [make_obj(replication_outcome="COMPLETE")])
         )
         assert "1 object," in one
         assert "1 objects" not in one
@@ -448,7 +428,7 @@ class TestSummaryField:
     def test_none_outcome_rendered_in_words_not_python_none(self):
         obj = make_obj(replication_outcome=None)
         summary = build_completion_report("my-bucket", [obj])["summary"]
-        assert "reported no replication status" in summary
+        assert "reported an unrecognized task status" in summary
         assert "None" not in summary
         assert "Action needed" in summary
 
@@ -643,7 +623,7 @@ class TestProperty9ReportGroupingAndContentMatchBatch:
 
         assert report["source_bucket"] == source_bucket
         assert report["item_count"] == len(items)
-        assert report["format_version"] == 2
+        assert report["format_version"] == 3
 
         # Rebuild expected groups from items.
         GroupKey = tuple[str, tuple[str, ...], tuple[str, ...]]
@@ -801,12 +781,11 @@ class TestCompletionReportSubject:
         )
         assert "action needed" in format_completion_report_subject(report)
 
-    def test_gone_alone_is_not_action_needed(self):
-        """A deleted object is not a replication failure to chase."""
+    def test_unknown_outcome_is_action_needed(self):
         report = build_completion_report(
-            "my-bucket", [make_obj(replication_outcome="GONE")]
+            "my-bucket", [make_obj(replication_outcome="UNKNOWN")]
         )
-        assert "no failures" in format_completion_report_subject(report)
+        assert "action needed" in format_completion_report_subject(report)
 
     def test_within_sns_length_limit_for_a_long_bucket_name(self):
         """SNS rejects a subject of 100 characters or more."""
@@ -829,7 +808,7 @@ class TestCompletionReportSubject:
         """SNS rejects a non-ASCII subject or one containing a newline, which
         would lose the notification entirely."""
         report = build_completion_report(
-            "my-bucket", [make_obj(replication_outcome="GONE")]
+            "my-bucket", [make_obj(replication_outcome="UNKNOWN")]
         )
         subject = format_completion_report_subject(report)
         subject.encode("ascii")  # raises if non-ASCII
@@ -844,94 +823,277 @@ class TestCompletionReportSubject:
 
 
 # ---------------------------------------------------------------------------
-# report["outstanding"] — how many Tracked_Objects for the bucket are still
-# awaiting a terminal answer after this report. A report covers only what
-# resolved since the previous one, so this is the field that answers "has
-# everything I tagged arrived?".
+# No stored-item count in the payload. format_version 2's "outstanding" field is
+# removed and nothing replaces its name. An earlier draft of 1.1.0 carried an
+# "outstanding_items" count of resolved items awaiting quiescence; it was removed
+# before release because it is always zero in any report a subscriber receives.
+# Quiescence is keyed per bucket, so every item is tested against the same
+# ScanState, and a report is only built when at least one item is publishable — a
+# run that matched anything publishes nothing, and a run that matched nothing makes
+# everything publishable. See build_completion_report's docstring.
 # ---------------------------------------------------------------------------
 
 
-class TestOutstandingCount:
-    def test_omitted_entirely_when_not_supplied(self):
-        """A caller that does not know the count must not be made to assert a
-        zero, which would read as a false all-clear."""
+class TestNoStoredItemCount:
+    def test_the_old_field_name_is_gone(self):
+        """A subscriber parsing `outstanding` sees format_version 3 and knows to
+        look again, rather than reading a field whose meaning changed silently."""
         report = build_completion_report("my-bucket", [make_obj()])
         assert "outstanding" not in report
+
+    def test_no_stored_item_count_under_any_name(self):
+        """Nothing took `outstanding`'s place. A count of stored items cannot
+        answer the question it answered, because an object enters tracking only
+        after its job's report has been read."""
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=0
+        )
+        assert "outstanding_items" not in report
+        assert [k for k in report if k.startswith("outstanding")] == [
+            "outstanding_jobs"
+        ]
+
+    def test_the_summary_makes_no_claim_about_items_in_tracking(self):
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=0
+        )
         assert "in tracking" not in report["summary"]
+        assert "still tracking" not in format_completion_report_subject(report)
 
-    def test_zero_is_reported_and_is_not_confused_with_omitted(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=0)
-        assert report["outstanding"] == 0
-        assert report["summary"].endswith("No objects remain in tracking.")
+    def test_build_completion_report_rejects_the_removed_argument(self):
+        """Kept so a caller reintroducing the field fails loudly rather than
+        having the keyword silently absorbed."""
+        with pytest.raises(TypeError):
+            build_completion_report(
+                "my-bucket", [make_obj()], outstanding_items=5,
+            )
 
-    def test_non_zero_count_appears_in_field_and_summary(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=47)
-        assert report["outstanding"] == 47
-        assert report["summary"].endswith("47 objects remain in tracking.")
 
-    def test_count_is_thousands_separated_like_every_other_count(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=1057)
-        assert "1,057 objects remain in tracking" in report["summary"]
-        assert "1057" not in report["summary"]
+# ---------------------------------------------------------------------------
+# report["outstanding_jobs"] and report["submission_deferred"] — the fields
+# that answer "is replication still in progress". No count of stored items can:
+# an object enters tracking only after its job's report has been read, so by the
+# time it is counted the question is already settled for it.
+# ---------------------------------------------------------------------------
 
-    def test_singular_noun_for_one_outstanding_object(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=1)
-        assert report["summary"].endswith("1 object remains in tracking.")
-        assert "1 objects" not in report["summary"]
 
-    def test_clause_follows_the_verdict_rather_than_replacing_it(self):
+class TestOutstandingJobs:
+    def test_both_fields_are_always_present(self):
+        """The keys always exist, so a subscriber can read them without guarding.
+        outstanding_jobs uses null for unknown rather than being omitted, which is
+        what lets "unknown" be told apart from "zero"."""
+        report = build_completion_report("my-bucket", [make_obj()])
+        assert "outstanding_jobs" in report
+        assert report["outstanding_jobs"] is None
+        assert report["submission_deferred"] is False
+
+    def test_an_unknown_count_is_null_rather_than_zero(self):
+        """A bucket that failed before its jobs could be checked, or was skipped as
+        disabled, has no count. Zero would be a claim, and a bucket is disabled
+        because its jobs kept failing — the worst place for a false all-clear."""
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=None
+        )
+        assert report["outstanding_jobs"] is None
+        assert "remain outstanding" not in report["summary"]
+
+    def test_an_unknown_count_states_nothing_rather_than_guessing(self):
+        """The null in the payload carries the reason; the summary does not
+        over-explain an edge case to someone reading an email, and above all does
+        not describe the bucket as clear."""
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=None
+        )
+        assert report["summary"].endswith("No action needed.")
+        assert "outstanding" not in report["summary"]
+        assert "unknown" not in report["summary"]
+
+    def test_an_unknown_count_adds_no_subject_marker(self):
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=None
+        )
+        assert "running" not in format_completion_report_subject(report)
+
+    def test_the_count_is_reported(self):
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=2
+        )
+        assert report["outstanding_jobs"] == 2
+
+    def test_the_deferred_flag_is_reported(self):
+        report = build_completion_report(
+            "my-bucket", [make_obj()], submission_deferred=True
+        )
+        assert report["submission_deferred"] is True
+
+    def test_a_running_job_suppresses_the_all_clear_clause(self):
+        """The specific false reassurance this exists to remove: zero items in
+        tracking while a job is still replicating is not completeness."""
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=1
+        )
+        assert "remain outstanding" not in report["summary"]
+        assert report["summary"].endswith("1 replication job is still running.")
+
+    def test_a_known_zero_earns_the_all_clear(self):
+        """The only thing that does. Unknown and non-zero both withhold it."""
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=0
+        )
+        assert report["summary"].endswith(
+            "No replication jobs remain outstanding."
+        )
+
+    def test_plural_jobs_are_thousands_separated(self):
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=1234
+        )
+        assert report["summary"].endswith("1,234 replication jobs are still running.")
+
+    def test_the_jobs_clause_follows_the_verdict_rather_than_replacing_it(self):
         items = [
             make_obj(object_key="a.txt", replication_outcome="COMPLETE"),
             make_obj(object_key="b.txt", replication_outcome="FAILED"),
         ]
-        summary = build_completion_report("my-bucket", items, outstanding=3)["summary"]
+        report = build_completion_report("my-bucket", items, outstanding_jobs=2)
+        summary = report["summary"]
         assert "Action needed" in summary
-        assert summary.index("Action needed") < summary.index("remain in tracking")
+        assert "2 replication jobs are still running." in summary
+        assert summary.index("Action needed") < summary.index("still running")
+        assert "\n" not in summary
 
-    def test_empty_report_still_carries_the_count(self):
-        """An empty batch is not published, but the summary must still be
-        coherent if one is ever built."""
-        report = build_completion_report("my-bucket", [], outstanding=5)
+    def test_an_empty_report_still_reads_coherently(self):
+        """An empty batch is not published, but the summary must still make sense
+        if one is ever built."""
+        report = build_completion_report("my-bucket", [], outstanding_jobs=0)
         assert report["summary"] == (
-            "my-bucket: no objects to report. 5 objects remain in tracking."
+            "my-bucket: no objects to report."
+            " No replication jobs remain outstanding."
         )
-
-    def test_summary_stays_one_line_with_the_clause(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=2)
-        assert "\n" not in report["summary"]
-
-    def test_field_order_keeps_summary_first(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=1)
-        keys = list(report.keys())
-        assert keys[0] == "summary"
-        assert keys.index("outstanding") < keys.index("groups")
-
-    def test_round_trips_through_json(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=9)
-        restored = json.loads(json.dumps(report))
-        assert restored["outstanding"] == 9
-
 
 
 class TestOutstandingCountInSubject:
-    def test_non_zero_count_is_flagged_in_the_subject(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=47)
-        assert "47 still tracking" in format_completion_report_subject(report)
-
     def test_zero_adds_no_marker_so_a_bare_subject_means_the_wave_is_done(self):
-        report = build_completion_report("my-bucket", [make_obj()], outstanding=0)
-        assert "still tracking" not in format_completion_report_subject(report)
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=0
+        )
+        subject = format_completion_report_subject(report)
+        assert "running" not in subject
+        assert "still tracking" not in subject
 
     def test_omitted_count_adds_no_marker(self):
         report = build_completion_report("my-bucket", [make_obj()])
         assert "still tracking" not in format_completion_report_subject(report)
 
+    def test_a_running_job_is_flagged_so_a_bare_subject_cannot_mislead(self):
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=2
+        )
+        assert "2 jobs running" in format_completion_report_subject(report)
+
+    def test_one_running_job_uses_the_singular(self):
+        report = build_completion_report(
+            "my-bucket", [make_obj()], outstanding_jobs=1
+        )
+        assert "1 job running" in format_completion_report_subject(report)
+
     def test_subject_stays_within_the_sns_limit_with_a_long_bucket_and_marker(self):
         report = build_completion_report(
-            "a" * 200, [make_obj() for _ in range(1000)], outstanding=999_999
+            "a" * 200, [make_obj() for _ in range(1000)],
+            outstanding_jobs=10,
         )
         subject = format_completion_report_subject(report)
         assert len(subject) <= 100
-        assert "999,999 still tracking" in subject
+        assert "10 jobs running" in subject
         assert subject.isascii()
         assert "\n" not in subject
+
+
+# ---------------------------------------------------------------------------
+# Report chunking
+# ---------------------------------------------------------------------------
+
+
+class TestReportChunking:
+    """Preserve the SNS report-size guards independently of HEAD tracking."""
+
+    def _objs(self, count: int, key_length: int = 40) -> list[TrackedObject]:
+        return [
+            make_obj(object_key=f"{index:0{key_length}d}", version_id=f"v{index}")
+            for index in range(count)
+        ]
+
+    def _group_objs(self, group_count: int, per_group: int = 1, name_length: int = 20):
+        return [
+            make_obj(
+                object_key=f"{group}-{index}.txt",
+                version_id=f"v{index}",
+                matched_rules=frozenset({f"rule-{group:0{name_length}d}"}),
+                destinations=frozenset({f"dest-{group:0{name_length}d}"}),
+            )
+            for group in range(group_count)
+            for index in range(per_group)
+        ]
+
+    def test_empty_input_yields_no_batches(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        assert chunk_items_for_report([]) == []
+
+    def test_small_run_is_a_single_batch(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        assert len(chunk_items_for_report(self._objs(10))) == 1
+
+    def test_every_item_appears_exactly_once(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        objects = self._objs(5_000)
+        batched = [item for batch in chunk_items_for_report(objects) for item in batch]
+        assert len(batched) == len(objects)
+        assert [id(item) for item in batched] == [id(item) for item in objects]
+
+    def test_each_batch_fits_the_sns_message_limit(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        for batch in chunk_items_for_report(self._objs(5_000)):
+            body = json.dumps(build_completion_report("my-bucket", batch), indent=2)
+            assert len(body) < 262_144
+
+    def test_object_count_alone_never_splits_a_batch(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        assert len(chunk_items_for_report(self._objs(5_000, key_length=10))) == 1
+        assert len(chunk_items_for_report(self._objs(5_000, key_length=200))) == 1
+
+    def test_many_groups_split_into_multiple_batches_without_loss(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        objects = self._group_objs(group_count=1_200)
+        batches = chunk_items_for_report(objects)
+        assert len(batches) > 1
+        assert [id(item) for batch in batches for item in batch] == [id(item) for item in objects]
+
+    def test_many_groups_each_batch_fits_the_sns_message_limit(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        for batch in chunk_items_for_report(self._group_objs(group_count=1_200)):
+            body = json.dumps(build_completion_report("my-bucket", batch), indent=2)
+            assert len(body) < 262_144
+
+    def test_a_group_is_never_split_across_batches(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        batches = chunk_items_for_report(self._group_objs(group_count=1_200, per_group=3))
+        seen: set[tuple[str, ...]] = set()
+        for batch in batches:
+            group_keys = {tuple(sorted(item.matched_rules)) for item in batch}
+            assert seen.isdisjoint(group_keys)
+            seen |= group_keys
+
+    def test_single_oversized_group_is_emitted_alone(self):
+        from src.core.completion_tracker import chunk_items_for_report
+
+        batches = chunk_items_for_report(self._objs(1), max_group_bytes=1)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1

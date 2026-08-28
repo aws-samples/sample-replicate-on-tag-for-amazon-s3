@@ -202,8 +202,8 @@ def serialize_submission_record(rec: SubmissionRecord) -> dict[str, Any]:
     """Serialize a single ``SubmissionRecord`` to a JSON-serializable dict.
 
     Includes ``watermark_low``, ``watermark_high``, ``consecutive_failures``,
-    and ``report_diagnosed`` (may be empty strings / zero / False for
-    pre-existing records).
+    ``report_diagnosed``, and ``recovery_scored`` (may be empty strings / zero /
+    False for pre-existing records).
     """
     return {
         "replication_config_id": rec.replication_config_id,
@@ -216,15 +216,27 @@ def serialize_submission_record(rec: SubmissionRecord) -> dict[str, Any]:
         "watermark_high": rec.watermark_high,
         "consecutive_failures": rec.consecutive_failures,
         "report_diagnosed": rec.report_diagnosed,
+        "recovery_scored": rec.recovery_scored,
     }
 
 
-def _deserialize_submission_record(data: dict[str, Any]) -> SubmissionRecord:
+def deserialize_submission_record(data: dict[str, Any]) -> SubmissionRecord:
     """Reconstruct a ``SubmissionRecord`` from a parsed JSON dict.
 
+    Public so a caller holding several stored records can deserialize them one at
+    a time and isolate a malformed one, rather than losing the whole dict to a
+    single bad entry. :func:`deserialize_submission_records` deliberately does not
+    isolate — see :meth:`~src.adapters.state_store.StateStore.get_submission_records`
+    for the caller that does.
+
     Tolerates absent ``watermark_low``, ``watermark_high``,
-    ``consecutive_failures``, and ``report_diagnosed`` for backward
-    compatibility with records written before those fields existed.
+    ``consecutive_failures``, ``report_diagnosed``, and ``recovery_scored`` for
+    backward compatibility with records written before those fields existed.
+
+    An absent ``recovery_scored`` reads as ``False``, so a record written by
+    1.0.1 is scored once on the first 1.1.0 run that observes it and not again.
+    That is the right default: it is also the only reading that cannot lose a
+    failure the Solution has not yet acted on.
     """
     return SubmissionRecord(
         replication_config_id=data["replication_config_id"],
@@ -237,6 +249,7 @@ def _deserialize_submission_record(data: dict[str, Any]) -> SubmissionRecord:
         watermark_high=data.get("watermark_high", ""),
         consecutive_failures=int(data.get("consecutive_failures", 0)),
         report_diagnosed=bool(data.get("report_diagnosed", False)),
+        recovery_scored=bool(data.get("recovery_scored", False)),
     )
 
 
@@ -266,7 +279,7 @@ def deserialize_submission_records(
                 f"submission_records must be a JSON object, got {type(raw_dict).__name__}"
             )
         return {
-            config_id: _deserialize_submission_record(rec_data)
+            config_id: deserialize_submission_record(rec_data)
             for config_id, rec_data in raw_dict.items()
         }
 

@@ -16,8 +16,10 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from src.core.config_loader import ConfigError
+from src.core.manifest_strategy import MIN_NEW_ROW_BUDGET
 from src.core.row_cap_validation import (
     IN_MEMORY_MEMORY_CEILING,
+    split_row_budget,
     validate_row_cap,
 )
 
@@ -165,3 +167,78 @@ class TestValidateRowCapProperty:
                 validate_row_cap(row_cap, lambda_memory_mb)
         else:
             validate_row_cap(row_cap, lambda_memory_mb)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# split_row_budget — the row-budget division between the lookback tail and the
+# rows above the watermark.
+#
+# Feature: row-cap-forward-progress
+# Requirements: 1.2, 2.1, 2.3, 7.1, 7.3
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRowBudget:
+    def test_empty_tail_gives_the_whole_cap_to_new_rows(self):
+        """The steady state, and always a bucket's first run: no tail, so the
+        split is identical to the behavior before it existed."""
+        assert split_row_budget(500_000, 0) == (0, 500_000)
+
+    def test_tail_that_fits_is_read_whole_with_the_remainder_reserved(self):
+        """The ordinary case with a lookback tail present. The whole tail is
+        admitted and the sum is still exactly row_cap (Req 2.3)."""
+        tail_allowance, new_row_budget = split_row_budget(500_000, 100_000)
+        assert tail_allowance == 100_000
+        assert new_row_budget == 400_000
+        assert tail_allowance + new_row_budget == 500_000
+
+    def test_tail_exceeding_the_fraction_is_clamped_and_leaves_the_remainder(self):
+        tail_allowance, new_row_budget = split_row_budget(500_000, 620_000)
+        assert tail_allowance == 400_000          # 80% of the cap
+        assert new_row_budget == 100_000          # 20% reserved for new rows
+        assert tail_allowance + new_row_budget == 500_000
+
+    def test_tail_exactly_at_the_fraction_is_read_whole(self):
+        assert split_row_budget(500_000, 400_000) == (400_000, 100_000)
+
+    def test_tail_one_row_over_the_fraction_is_clamped(self):
+        assert split_row_budget(500_000, 400_001) == (400_000, 100_000)
+
+    def test_row_cap_of_one_still_yields_a_new_row_budget_of_one(self):
+        """The floor that matters: a cap small enough for the tail fraction to
+        round to zero must still leave a run able to make progress
+        (Req 1.2)."""
+        assert split_row_budget(1, 0) == (0, 1)
+        assert split_row_budget(1, 1) == (0, 1)
+        assert split_row_budget(1, 10_000) == (0, 1)
+
+    def test_tail_larger_than_row_cap(self):
+        """The livelock's own conditions. The tail cannot take the whole cap."""
+        tail_allowance, new_row_budget = split_row_budget(5, 12)
+        assert tail_allowance == 4
+        assert new_row_budget == 1
+
+    def test_rejects_non_positive_row_cap(self):
+        with pytest.raises(ValueError, match="row_cap"):
+            split_row_budget(0, 10)
+
+    def test_rejects_negative_tail_rows(self):
+        with pytest.raises(ValueError, match="tail_rows"):
+            split_row_budget(100, -1)
+
+    @given(
+        row_cap=st.integers(min_value=1, max_value=2_500_000),
+        tail_rows=st.integers(min_value=0, max_value=5_000_000),
+    )
+    @settings(max_examples=300)
+    def test_sum_never_exceeds_row_cap_and_new_row_budget_is_never_zero(
+        self, row_cap, tail_rows,
+    ):
+        """Requirement 2.1 and Requirement 1.2 together, over the whole input
+        range: the read stays bounded by the cap, and no tail size can reduce
+        the new-row budget to zero."""
+        tail_allowance, new_row_budget = split_row_budget(row_cap, tail_rows)
+        assert tail_allowance + new_row_budget <= row_cap
+        assert new_row_budget >= MIN_NEW_ROW_BUDGET
+        assert tail_allowance <= tail_rows
+        assert tail_allowance >= 0

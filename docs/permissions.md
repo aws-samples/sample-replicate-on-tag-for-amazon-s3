@@ -10,10 +10,14 @@ actions. Nothing in this Solution accesses the destination account or Region.
 |---|---|
 | `s3:GetReplicationConfiguration` on source buckets | Derive tag-scoped replication rules |
 | Athena query submission and result reads, Glue catalog reads, S3 Tables metadata reads, `lakeformation:GetDataAccess` | Query the S3 Metadata journal |
-| `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` on the State Bucket | Read and write checkpoints, manifests, and Athena results |
-| `s3:CreateJob`, `iam:PassRole` | Submit S3 Batch Operations replication jobs |
+| `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` on the State Bucket | Read and write checkpoints, manifests, Athena results, and completion reports |
+| `s3:CreateJob`, `s3:PutJobTagging`, `iam:PassRole` | Submit and tag S3 Batch Operations replication jobs |
+| `s3:DescribeJob` | Read a job's status, termination date, and invoked-task count, for resolving completion outcomes and for failed-job recovery |
+| `lambda:InvokeFunction` on the Solution's own function | Self-reinvoke when a run approaches its timeout |
+| `cloudwatch:PutMetricData` in `MetricsNamespace` when that parameter is set | Publish the Solution's custom metrics |
+| `sns:Publish` on the report topic when `CompletionNotificationEmail` is set | Send the completion report email |
 | `sns:Publish` on the failure topic when `AlarmEmail` is set | Send the batch-job-failure and bucket-disabled alerts |
-| `logs:PutLogEvents` on the failure log group, always | Write those same alerts to CloudWatch Logs regardless of `AlarmEmail` |
+| `logs:PutLogEvents`, `logs:CreateLogStream` on the failure log group, always | Write those same alerts to CloudWatch Logs regardless of `AlarmEmail` |
 
 `iam:PassRole` is scoped to the ARN of the one role the stack creates for its
 batch jobs, described next. It carries no `iam:PassedToService` condition,
@@ -195,6 +199,10 @@ Every S3 Batch Operations job writes a completion report to the State Bucket. Th
 [Batch Operations job role](#batch-operations-job-role), alongside its
 manifest-read grant.
 
-Setting `CompletionNotificationEmail` additionally enables per-object
-`x-amz-replication-status` tracking and the SNS email report; no extra IAM grant
-is needed beyond what the unconditional report write already provides.
+The Solution resolves each tracked object's outcome by reading that report back
+from the State Bucket, which the execution role's existing State Bucket grant
+already covers.
+
+Setting `CompletionNotificationEmail` creates the report topic and grants the
+execution role `sns:Publish` on it. That grant is the only permission the email
+report adds.

@@ -132,6 +132,18 @@ class TestSerializeCompletionItems:
         result = serialize_completion_items({"k": obj})
         assert set(result["k"]["configs"].keys()) == {"cfg-a"}
 
+    def test_default_config_context_serializes_compatibility_flag_as_true(self):
+        context = ConfigContext(
+            replication_config_id="cfg-a",
+            job_id="job-a",
+            manifest_generated_at=_T0,
+        )
+        obj = make_obj(configs={"cfg-a": context})
+
+        result = serialize_completion_items({"k": obj})
+
+        assert result["k"]["configs"]["cfg-a"]["bops_confirmed"] is True
+
     def test_multi_config_item_serializes_all_configs(self):
         obj = make_obj(
             configs={
@@ -215,6 +227,53 @@ class TestDeserializeCompletionItems:
         }
         restored = deserialize_completion_items(payload)
         assert restored["obj-1\x00v1"].configs == {}
+
+    @pytest.mark.parametrize(
+        ("name", "state", "outcome"),
+        [
+            ("lifecycle-pending", "PENDING", None),
+            ("outcome-pending", "RESOLVED", "PENDING"),
+            ("outcome-gone", "RESOLVED", "GONE"),
+            ("outcome-expired", "RESOLVED", "EXPIRED"),
+        ],
+    )
+    def test_legacy_wire_shapes_round_trip_without_lifecycle_mutation(
+        self, name: str, state: str, outcome: str | None
+    ) -> None:
+        """Generic deserialization preserves every 1.0.1 legacy shape.
+
+        Migration is deliberately an explicit StateStore mutation, not a
+        side effect of deserialize/serialize.
+
+        Validates: Requirements 4.1, 4.2, 4.4
+        """
+        key = item_key(name, "v1")
+        legacy_item = {
+            "source_bucket": "legacy-source",
+            "object_key": name,
+            "version_id": "v1",
+            "state": state,
+            "resolved_at": _T0.isoformat() if state == "RESOLVED" else None,
+            "resolution_method": "source_status_header" if state == "RESOLVED" else None,
+            "replication_outcome": outcome,
+            "tagged_at": _T0.isoformat(),
+            "last_modified": _T1.isoformat(),
+            "matched_rules": ["rule-a"],
+            "destinations": ["destination-a"],
+            "configs": {
+                "cfg-1": {
+                    "replication_config_id": "cfg-1",
+                    "job_id": "legacy-job",
+                    "manifest_generated_at": _T0.isoformat(),
+                    "bops_confirmed": True,
+                }
+            },
+        }
+
+        restored = deserialize_completion_items({"completion_items": {key: legacy_item}})
+
+        assert serialize_completion_items(restored) == {key: legacy_item}
+        assert restored[key].configs["cfg-1"].bops_confirmed is True
 
     def test_bad_configs_type_raises(self):
         payload = {
@@ -319,12 +378,12 @@ class TestScanStateRoundTrip:
 
 _object_keys = st.text(min_size=1, max_size=30).filter(lambda s: "\x00" not in s)
 _version_ids = st.one_of(st.none(), st.text(min_size=1, max_size=20))
-_states = st.sampled_from(list(CompletionState))
-_resolution_methods = st.one_of(st.none(), st.just("source_status_header"))
-_replication_outcomes = st.one_of(
-    st.none(),
-    st.sampled_from(["COMPLETE", "PENDING", "FAILED", "UNKNOWN"]),
-)
+# New 1.1.0 model fixtures represent only report-derived resolved outcomes.
+# Legacy PENDING, GONE, and EXPIRED wire shapes remain covered separately below
+# so generic deserialization retains its lossless compatibility guarantee.
+_states = st.just(CompletionState.RESOLVED)
+_resolution_methods = st.just("bops_completion_report")
+_replication_outcomes = st.sampled_from(["COMPLETE", "FAILED", "UNKNOWN"])
 
 _datetimes = st.datetimes(
     min_value=datetime(2000, 1, 1),
@@ -338,7 +397,7 @@ _config_context_strategy = st.builds(
     make_config_context,
     job_id=_job_ids,
     manifest_generated_at=_datetimes,
-    bops_confirmed=st.booleans(),
+    bops_confirmed=st.just(True),
 )
 
 
@@ -553,7 +612,10 @@ class TestProperty16SerializationRoundTrip:
                 object_key=object_key,
                 version_id=version_id,
                 configs=configs,
-                state=CompletionState.PENDING,
+                state=CompletionState.RESOLVED,
+                resolved_at=_T1,
+                resolution_method="bops_completion_report",
+                replication_outcome="COMPLETE",
             )
         }
 

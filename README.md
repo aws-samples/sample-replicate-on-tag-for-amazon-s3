@@ -78,7 +78,7 @@ The role that each S3 Batch Operations job runs as is not a parameter. The stack
 | CloudFormation parameter | Default | Description |
 |---|---|---|
 | `CheckFrequencyMinutes` | 15 | How often the Solution runs, in minutes (15–1440). Because S3 Batch Operations charges per job, smaller values can raise cost, most of all when tagging activity is spread over time rather than arriving in a single batch |
-| `CompletionNotificationEmail` | _(empty)_ | Email address for per-object replication tracking and completion email reports. The S3 Batch Operations completion report CSV is always written to the State Bucket; this parameter gates the per-object `x-amz-replication-status` tracking, the SNS email, and the report-missing alert only (see [Completion Reporting](#completion-reporting)) |
+| `CompletionNotificationEmail` | _(empty)_ | Email address for completion email reports and report-missing alerts. The S3 Batch Operations completion report CSV is always written to the State Bucket; this parameter enables the SNS email and report-missing alert (see [Completion Reporting](#completion-reporting)) |
 | `AlarmEmail` | _(empty)_ | Email address for run-failure, Batch Operations job-failure, and bucket-disabled alerts. Leave empty to disable alerting; no SNS topic is provisioned (see [Monitoring](#monitoring)) |
 | `MetricsNamespace` | _(empty)_ | CloudWatch namespace to publish metrics under, any name you choose, e.g. `S3ReplicateOnTag`. CloudWatch creates it on first publish; names starting with `AWS/` are reserved. Leave empty to disable metrics |
 | `KmsKeyArn` | _(empty)_ | Customer-managed KMS key ARN; leave empty for SSE-S3. See [Customer-Managed KMS Keys](docs/kms.md) |
@@ -94,27 +94,27 @@ The Solution is configured entirely through CloudFormation stack parameters. The
 
 **Replication rules.** Tag filters, key prefixes, and destinations are read from each bucket's existing replication configuration, not set on this Solution. The Solution acts only on **tag-scoped** rules; rules without a tag filter, whether prefix-only or unfiltered, are ignored. A bucket may have multiple tag-scoped rules. All of a bucket's tag-scoped rules are evaluated together, and every matched object across every rule goes into one Batch Operations job per bucket per interval.
 
-**Journal read cap.** `JournalReadRowCap` (default 500,000) caps how many tagging operations one run processes, and is the Solution's single scale knob. A run that finds more than the cap processes the oldest `JournalReadRowCap` operations and picks up the rest automatically, so no tagging operation is ever dropped, only delayed. A capped run reinvokes itself immediately rather than waiting for the next scheduled interval, so a temporary burst clears faster than the schedule alone allows.
+**Journal read cap.** `JournalReadRowCap` (default 500,000) caps how many journal rows one run reads, and is the Solution's single scale knob. The cap governs the whole read: both the new operations above the Solution's position in the journal and the `JournalLookbackSeconds` window below it that each run re-scans for late-arriving journal records. At least 20% of the cap is always reserved for new operations, so a run always makes progress and a burst larger than the cap drains across a bounded number of runs rather than stalling. No tagging operation is dropped, only delayed. A capped run reinvokes itself immediately rather than waiting for the next scheduled interval, so a temporary burst clears faster than the schedule alone allows.
+
+A backlog large enough that the re-scan window alone would exceed 80% of the cap shortens the window this run: the Solution raises the lower bound of its read so the most recent part of the window is still re-scanned and the oldest part is skipped. This reduces tolerance for late-arriving journal records for as long as the backlog lasts. It emits an error log entry naming the row counts involved and publishes the `JournalTailShortened` metric, so it is visible rather than silent. See [Monitoring](#monitoring).
 
 The default suits most workloads. Its ceiling for each `LambdaMemoryMB`, what happens when a value exceeds that ceiling, and the sustained tagging rate the cap supports are in the [deployment parameter reference](deploy/README.md#parameter-reference).
 
 ## Completion Reporting
 
-Answers the question "did the objects I tagged actually arrive?". S3 Batch Operations confirms only that it initiated replication for each object, not that the bytes landed at the destination: a job reaches `Complete` while replication may still be in flight, or may have failed.
+Answers the question "did the S3 Batch Replication tasks succeed?" The Solution resolves each tracked object from the S3 Batch Operations completion report. S3 documents that a Batch Replication task's status depends on the object's replication status and its annotation replication status ([S3 Batch Replication considerations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-batch-replication-batch.html#batch-replication-considerations)).
 
-Set `CompletionNotificationEmail` to turn it on. The Solution then polls each tagged object's `x-amz-replication-status`, which S3 sets to `COMPLETED` only once the object has reached every destination its rules target, and emails one report per source bucket covering everything that reached a terminal answer since the last one:
+Set `CompletionNotificationEmail` to receive one report per source bucket covering the outcomes resolved since the prior email:
 
-> my-bucket: 150 objects replicated successfully. No action needed. No objects remain in tracking.
+> my-bucket: 150 objects replicated successfully. No action needed. No replication jobs remain outstanding.
 
-That closing count is the batch-level answer. A report covers what confirmed by the time it was sent, which is not the same as a set of objects you tagged together: if some replicate quickly and others lag, one tagging batch is reported across several emails. `No objects remain in tracking` means none are left awaiting confirmation for that bucket, so the wave has landed. A non-zero count means more reports are coming, and it appears in the email subject too, so an inbox can be triaged without opening anything.
+The email groups counts, outcomes, and time ranges by rule and destination. Object keys and version IDs are not included. Read the Batch Operations completion report CSV in the State Bucket under `completion-reports/` for per-object results and failure details.
 
-The report states counts, outcomes and time ranges per rule and destination, not individual objects. Object keys and version IDs are not in it. To find out which specific object failed, read the Batch Operations completion report CSV on the State Bucket under `completion-reports/`.
+One completion-report row is the aggregate result for its task. For an object bound for multiple destinations, a failed row does not identify which destination failed. Use the S3 replication failure event or inspect the destination to diagnose a destination-specific failure. A successful row also does not show whether a replica remains present later: per [AWS's S3 Batch Replication considerations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-batch-replication-batch.html#batch-replication-considerations), a destination version deleted by specifying its version ID is not re-replicated.
 
-Two limits on what a successful outcome means. It is one aggregate across every destination, so for an object bound for two buckets it means both succeeded, and a failure means at least one did not, without saying which. And it confirms S3 reported `COMPLETED` at the time of the check, not that the replica is still there now: per [AWS's S3 Batch Replication considerations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-batch-replication-batch.html#batch-replication-considerations), a destination version deleted by specifying its version ID is not re-replicated, and no check detects that.
+Leave `CompletionNotificationEmail` empty to disable completion email reports and report-missing alerts. The Batch Operations completion report CSV is written to the State Bucket either way, and the Solution still reads it to diagnose permission-shaped failures (`InitiateReplicationNotPermitted`, `AccessDenied`) in CloudWatch Logs. Per-object outcomes are only tracked when the email is set, so with it empty the report CSV in the State Bucket is the record of what replicated.
 
-Leave `CompletionNotificationEmail` empty and none of the above runs. The Batch Operations completion report CSV is written to the State Bucket either way, and the Solution reads it either way to diagnose permission-shaped failures (`InitiateReplicationNotPermitted`, `AccessDenied`).
-
-[Completion Reporting](docs/completion-reporting.md) has the outcomes an object can reach, the fields each report group carries, and the tracking mechanics.
+[Completion Reporting](docs/completion-reporting.md) has the outcomes an object can reach and the fields each report group carries.
 
 ## Deleted-Version Filtering
 
@@ -162,13 +162,49 @@ Tagging an object again is a new tagging operation, whether or not the object ha
 | Two or more versions of the same key tagged inside one interval | One version per run, oldest tagging event first, until all are replicated. Each of those runs submits a job and is billed for its manifest entries. Versions still waiting must stay within `JournalLookbackSeconds` of the checkpoint, which they do unless newer tagging activity advances the watermark past them |
 | An object version permanently deleted at the destination | Not restored, by this or any other job (see [Completion Reporting](#completion-reporting)) |
 
+## Bounded Concurrent Jobs per Bucket
+
+`MaxConcurrentJobsPerBucket` (default 3, minimum 1, maximum 10) caps how many Batch Operations jobs may be outstanding at once for one source bucket. A job is outstanding until it reaches a terminal status: `Complete`, `Failed`, or `Cancelled`. At the limit, the bucket is skipped for that run.
+
+At most one job is submitted per bucket per run, whatever the limit is set to. The limit bounds how many jobs may be outstanding, not how fast they are submitted.
+
+Nothing is lost by a skip. The run returns before querying the journal, so no Athena charge is incurred, and because nothing is submitted the checkpoint does not advance and no operation enters the deduplication window. Every tagging event that was waiting stays waiting and is picked up whole once a job finishes.
+
+The limit exists because a job's duration is set by replication throughput, not by how many objects it covers. A bucket of large objects is bandwidth-bound, so its job can run for far longer than `CheckFrequencyMinutes`. For scale, 50 GiB across 5,400 objects took just over five minutes to replicate cross-Region, which puts a multi-terabyte job into hours and a multi-hundred-terabyte one into days. Without a cap, such a bucket would accumulate jobs against an account-level Batch Operations quota, each carrying its own per-job charge.
+
+| Condition | Behavior |
+|---|---|
+| Fewer outstanding jobs than the limit | Normal run: the journal is read and a job is submitted if anything matched, alongside any jobs still running |
+| Outstanding jobs at or above the limit | Bucket skipped. An audit entry `submission_deferred_job_in_flight` records the outstanding count, the limit, and the oldest outstanding job's ID, status, and age. The `SubmissionDeferred` metric is published for the bucket |
+| A job whose status cannot be read | Counted as outstanding, because assuming it finished could admit a job that should have waited |
+| A job whose status has been unreadable for 14 days | No longer counted, so the bucket can submit again. An error names the job and the likely causes. Its record is kept, so the report-missing check still covers it |
+| No outstanding jobs | Normal run |
+
+A skip is per bucket. Other buckets in the same run are unaffected.
+
+If a skip is held up entirely by jobs whose status could not be read, the run logs an error rather than only the audit entry. Nothing is working as intended in that case: the usual cause is the execution role losing `s3:DescribeJob`, or a job ID in the state object that this account does not own. It clears itself once the calls succeed, and at 14 days regardless, but you should not have to infer it from a run of `SubmissionDeferred` datapoints.
+
+Setting the limit to 1 serializes the bucket: one job at a time, each new job waiting for the previous one. That is a legitimate choice, and it is why the minimum is 1 rather than 2. It costs throughput, because one job already covers every matched object across all of the bucket's tag-scoped rules and finishes only when all its tasks do, so serializing extends that wait across batches.
+
+A few consecutive skips mean a job simply outlasted an interval. A long unbroken run of them means the bucket's replication throughput is what limits how quickly tagging is acted on, not this Solution. Alarm on `SubmissionDeferred` if you want to be told; treat missing data as not breaching, because the metric is published only when a skip happens.
+
+Raising the limit raises the ceiling on concurrent per-job charges for that bucket. See [Cost](docs/cost.md).
+
 ## Journal Start Point
 
 The Solution begins processing journal records from the time the stack is deployed, not from the beginning of the journal. On stack creation, the custom resource writes an initial checkpoint per source bucket with the watermark set to the deployment timestamp. The first Lambda invocation reads from `deployment_timestamp - JournalLookbackSeconds` forward.
 
-When a source bucket is added via stack update, it receives its own checkpoint at the update timestamp. Existing buckets are not affected.
+That start point reaches slightly into the past, which cuts both ways:
 
-Objects tagged before `deployment_timestamp - JournalLookbackSeconds` are not picked up by the scheduled runs. To replicate those objects, use the manual catch-up recipe in [Backfilling After a Replication-Rule Change](docs/backfill.md).
+| Tagged | Replicated by the scheduled runs |
+|---|---|
+| After deployment | Yes |
+| Within `JournalLookbackSeconds` before deployment (2 hours by default) | Yes, by the first run. If you tagged objects while preparing to deploy, expect the first run to replicate them |
+| Earlier than that | No, and nothing retries or alerts. Use the manual catch-up recipe in [Backfilling After a Replication-Rule Change](docs/backfill.md) |
+
+The first run therefore submits a Batch Operations job as soon as it finds matching tagging activity in that period, and you are billed for that job and its manifest entries. Deploy into a quiet period if you want the first run to be a no-op.
+
+When a source bucket is added via stack update, it receives its own checkpoint at the update timestamp, and the same two-hour reach-back applies to it. Existing buckets are not affected.
 
 ## Backfilling After a Replication-Rule Change
 
@@ -192,7 +228,7 @@ Leave the rest of the state object alone while making that edit. [Checkpoint and
 
 ### CloudWatch metrics
 
-Set `MetricsNamespace` and the Solution publishes six per-bucket and run-level counters after each run: `TaggingOperationsRead`, `MatchedObjects`, `BatchJobsSubmitted`, `ArchivedObjectsExcluded`, `BucketErrors`, and `DisabledBuckets`. Leave it empty to disable this entirely; no CloudWatch permission is then required.
+Set `MetricsNamespace` and the Solution publishes eight per-bucket and run-level counters after each run: `TaggingOperationsRead`, `MatchedObjects`, `BatchJobsSubmitted`, `ArchivedObjectsExcluded`, `SubmissionDeferred`, `JournalTailShortened`, `BucketErrors`, and `DisabledBuckets`. Leave it empty to disable this entirely; no CloudWatch permission is then required.
 
 Some are withheld for an idle bucket rather than published as a zero, to avoid paying for a flat series (see [CloudWatch metric charges](docs/cost.md#cloudwatch-metric-charges)), so a missing data point carries meaning. [Monitoring Reference](docs/monitoring.md#cloudwatch-metrics) has each metric's dimension and publish condition, followed by the alarm recipes that depend on them, including how to catch a bucket that silently stopped being processed.
 
@@ -257,8 +293,7 @@ This Solution uses only pay-per-use services. There are no fixed or idle charges
 | S3 Batch Operations | Per-job plus per-object charge. One job per source bucket per run that has matches. Usually the dominant cost. |
 | Amazon Athena | Per-TB scanned, with a 10 MB per-query minimum. The journal is an Apache Iceberg table, so the `record_timestamp > <checkpoint>` predicate lets Athena skip data files that fall entirely below the checkpoint, keeping scanned volume roughly proportional to new activity rather than total journal size. |
 | AWS Lambda | Per invocation and GB-second. One invocation per run, scaled by `LambdaMemoryMB`. |
-| Amazon S3 (State Bucket) | Storage for manifests and Athena results, expired after `LifecycleExpirationDays`, plus request charges. |
-| Source-side `HeadObject` checks (optional) | GET-class requests. Only when `CompletionNotificationEmail` is set: one `HeadObject` per still-`PENDING` tracked object per run, capped at `CompletionCheckBatchSize`, until `x-amz-replication-status` resolves. |
+| Amazon S3 (State Bucket) | Storage for manifests, Athena results, and completion reports, expired after `LifecycleExpirationDays`, plus request charges. Completion outcomes are resolved by reading those reports from this bucket. |
 | Amazon CloudWatch (optional) | Only when `MetricsNamespace` is set: per custom metric per month, billed per unique metric-and-dimension combination. Log ingestion for the structured JSON logs applies regardless. |
 | Amazon SNS (optional) | Per-notification charges when `CompletionNotificationEmail` or `AlarmEmail` is set. |
 | AWS KMS (optional) | Per-request charges when `KmsKeyArn` or `JournalKmsKeyArn` is set. |
@@ -285,6 +320,11 @@ The stack also creates the role its S3 Batch Operations jobs run as, separate fr
 
 Upgrade by repeating the Getting Started steps with the new release's assets and
 updating the stack.
+
+Check [CHANGELOG.md](CHANGELOG.md) for the release you are moving to first. A
+release that removes a stack parameter requires dropping that parameter from your
+update command, because CloudFormation rejects a parameter the template does not
+declare.
 
 `CodeLocation` must change for the Lambda code to be replaced. Give each release
 its own S3 key, which the versioned asset filename does for you if you keep the

@@ -13,11 +13,9 @@ and no destination call anywhere in this module.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from src.adapters.source_status_adapter import SourceStatusCheckKind, SourceStatusResult
 from src.core.models import CompletionState, ConfigContext, ScanState, TrackedObject
 
 if TYPE_CHECKING:
@@ -29,14 +27,13 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-def create_pending_tracked_object_updates(
+def create_report_config_context_updates(
     entries: list[ManifestEntry],
     replication_config_id: str,
     job_id: str,
     manifest_generated_at: datetime,
 ) -> dict[tuple[str, str | None], ConfigContext]:
-    """Build the per-entry new ``ConfigContext`` updates for a terminal job's
-    BOPS_Completion_Report.
+    """Build per-entry ``ConfigContext`` updates for a terminal report.
 
     For each ``ManifestEntry`` in ``entries`` (the parsed rows of a terminal
     job's BOPS_Completion_Report, not the manifest itself), produces one new
@@ -77,224 +74,99 @@ def create_pending_tracked_object_updates(
 
 
 # ---------------------------------------------------------------------------
-# Resolution — reconcile_source_status_check (Decision 3)
+# Resolution — completion-report outcomes (Decision 2)
 # ---------------------------------------------------------------------------
 
 
-def _resolve(obj: TrackedObject, resolution_method: str, outcome: str, now: datetime) -> TrackedObject:
-    """Return a new ``TrackedObject`` transitioned to ``RESOLVED``.
+def outcome_from_report_row(entry: ManifestEntry) -> str:
+    """Map one Batch Operations completion-report row to its terminal outcome.
 
-    Carries every field that resolution does not itself set through verbatim
-    from ``obj``: ``source_bucket``, ``object_key``, ``version_id``,
-    ``configs``, ``tagged_at``, ``last_modified``, ``matched_rules``, and
-    ``destinations``. Only ``state``, ``resolved_at``, ``resolution_method``,
-    and ``replication_outcome`` change here.
-
-    Every carried field must be listed explicitly — ``TrackedObject``
-    defaults them, so an omission silently reverts one to its default at the
-    moment of resolution, which is exactly when the Completion_Report reads
-    it.
+    This mapping is deliberately pure: the completion report is the source of
+    truth for a task's replication outcome, so no AWS client or state is read.
     """
+    status = (entry.task_status or "").strip().lower()
+    if status == "succeeded":
+        return "COMPLETE"
+    if status == "failed":
+        return "FAILED"
+    return "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# Legacy 1.0.1 state (Decision 5)
+# ---------------------------------------------------------------------------
+
+# Outcomes 1.0.1 could persist that 1.1.0 never produces. ``PENDING`` meant
+# "the source object's replication status still read PENDING", ``GONE`` that the
+# source object version had been deleted, and ``EXPIRED`` that the item aged out
+# of the removed ``CompletionItemTtlHours`` window.
+_LEGACY_OUTCOMES = frozenset({"PENDING", "GONE", "EXPIRED"})
+
+
+def is_legacy_item(obj: TrackedObject) -> bool:
+    """True iff *obj* carries state only 1.0.1 could have written.
+
+    Two shapes qualify: lifecycle ``PENDING``, which nothing in 1.1.0 can ever
+    advance because the source-object check that used to resolve it is gone; and
+    ``RESOLVED`` carrying one of :data:`_LEGACY_OUTCOMES`.
+    """
+    return (
+        obj.state is not CompletionState.RESOLVED
+        or obj.replication_outcome in _LEGACY_OUTCOMES
+    )
+
+
+def resolve_legacy_item(obj: TrackedObject) -> TrackedObject:
+    """Return *obj* unchanged, or an ``UNKNOWN``-resolved copy if it is legacy.
+
+    Pure, and deliberately not a persisted mutation. An earlier design wrote the
+    equivalent change back to the state object before evaluating publication;
+    that write could never succeed and its failure branch skipped the affected
+    bucket's whole publish phase on every interval. Normalizing in memory at
+    publish time reaches the same outcome through machinery that already exists:
+    the item becomes publishable, is reported as ``UNKNOWN``, and the existing
+    post-publish ``delete_completion_items`` call removes it under its own key.
+    No extra conditional write, nothing new on the critical path, and a failure
+    to publish simply leaves the item for the next interval.
+
+    ``UNKNOWN`` is the honest outcome. What 1.0.1 knew about these objects is not
+    recoverable here: the item records no report prefix or manifest key, so the
+    Batch Operations report that produced it cannot be located without an
+    unbounded prefix search. That report is still on the State Bucket under
+    ``completion-reports/`` for an operator who wants the per-object detail.
+
+    Why normalizing the two ``RESOLVED`` legacy outcomes matters as well as the
+    ``PENDING`` one: ``GONE`` and ``EXPIRED`` items are already publishable, but
+    neither value appears in ``_OUTCOME_PHRASES``, so their counts are silently
+    dropped from the human summary. A report containing only such items degrades
+    to a sentence with an empty clause list. Mapping them to ``UNKNOWN`` puts
+    them back in the summary and in the actionable count.
+
+    Fields other than ``state``, ``replication_outcome`` and
+    ``resolution_method`` are carried across unchanged, so grouping, routing and
+    the report's timestamp ranges are unaffected. ``resolved_at`` is left as it
+    was, which may be ``None`` for a lifecycle-``PENDING`` item; nothing in the
+    publish or report path reads it, and the normalized object is never written
+    back to the state object.
+
+    Requirements: 4.2, 4.6
+    """
+    if not is_legacy_item(obj):
+        return obj
     return TrackedObject(
         source_bucket=obj.source_bucket,
         object_key=obj.object_key,
         version_id=obj.version_id,
         configs=obj.configs,
         state=CompletionState.RESOLVED,
-        resolved_at=now,
-        resolution_method=resolution_method,
-        replication_outcome=outcome,
-        tagged_at=obj.tagged_at,
-        last_modified=obj.last_modified,
-        matched_rules=obj.matched_rules,
-        destinations=obj.destinations,
-    )
-
-
-def _unchanged(obj: TrackedObject) -> TrackedObject:
-    """Return a new ``TrackedObject`` with every field identical to ``obj``
-    — still whatever state it was in — to be retried at the next
-    Completion_Poll_Interval.
-
-    Mirrors ``checkpoint_logic.py::advance_checkpoint``'s convention of
-    returning a new object rather than mutating the input in place.
-    """
-    return TrackedObject(
-        source_bucket=obj.source_bucket,
-        object_key=obj.object_key,
-        version_id=obj.version_id,
-        configs=obj.configs,
-        state=obj.state,
         resolved_at=obj.resolved_at,
-        resolution_method=obj.resolution_method,
-        replication_outcome=obj.replication_outcome,
+        resolution_method="legacy_1_0_1_state",
+        replication_outcome="UNKNOWN",
         tagged_at=obj.tagged_at,
         last_modified=obj.last_modified,
         matched_rules=obj.matched_rules,
         destinations=obj.destinations,
     )
-
-
-def reconcile_source_status_check(
-    obj: TrackedObject,
-    result: SourceStatusResult,
-    now: datetime,
-) -> TrackedObject:
-    """Return the reconciled ``TrackedObject`` after a Source_Status_Check.
-
-    Operates on a single ``TrackedObject`` (object-level state). There is no
-    ``confirm_presence`` closure parameter and no
-    ``destination_access_configured`` branch — a ``COMPLETED`` header
-    resolves DIRECTLY to ``COMPLETE``, and no destination call is ever made
-    from this function (design.md Decision 3).
-
-    Branches on ``result.kind``:
-
-    * ``CHECK_FAILED`` — the ``HeadObject`` call itself failed transiently.
-      Returns the object unchanged, still in its prior state (``PENDING``),
-      to be retried at the next Completion_Poll_Interval (Requirement 3.6).
-    * ``HEADER_ABSENT`` — the call succeeded but the source object version
-      carried no ``x-amz-replication-status`` header. Returns a new object
-      transitioned to ``RESOLVED`` with
-      ``resolution_method="source_status_header"``,
-      ``replication_outcome="UNKNOWN"`` (Requirement 3.5). The accompanying
-      key-free error indication (naming only ``job_id``/
-      ``replication_config_id``) is the orchestrator's responsibility, not
-      this pure function's.
-    * ``HEADER_VALUE`` with ``result.value == "COMPLETED"`` — resolves
-      DIRECTLY to ``RESOLVED``/``COMPLETE`` (Requirement 3.2). No
-      destination call is made.
-    * ``HEADER_VALUE`` with ``result.value in ("PENDING", "FAILED")`` — the
-      header value is immediately terminal and recorded verbatim (Requirement
-      3.4).
-
-    Requirements: 3.2, 3.4, 3.5, 3.6
-    """
-    if result.kind is SourceStatusCheckKind.CHECK_FAILED:
-        return _unchanged(obj)
-
-    if result.kind is SourceStatusCheckKind.OBJECT_GONE:
-        # Terminal: the object version no longer exists, so no later check can
-        # resolve it. Resolving to GONE releases the Tracked_Object through the
-        # normal publish-then-delete path instead of retrying forever
-        # (Requirement 3.7).
-        return _resolve(obj, "object_gone", "GONE", now)
-
-    if result.kind is SourceStatusCheckKind.HEADER_ABSENT:
-        return _resolve(obj, "source_status_header", "UNKNOWN", now)
-
-    # HEADER_VALUE.
-    header_value = result.value
-    if header_value == "COMPLETED":
-        return _resolve(obj, "source_status_header", "COMPLETE", now)
-
-    # "PENDING" or "FAILED" — verbatim.
-    return _resolve(obj, "source_status_header", header_value, now)
-
-
-# ---------------------------------------------------------------------------
-# Tracked_Object expiry — the backstop for anything that never resolves
-# ---------------------------------------------------------------------------
-
-
-def tracked_object_age(obj: TrackedObject, now: datetime) -> timedelta:
-    """Age of *obj* measured from the most recent job that covered it.
-
-    Uses ``max(manifest_generated_at)`` across ``configs`` — the newest job —
-    so an object re-covered by a later job gets a fresh window rather than
-    inheriting the age of the first job that happened to include it.
-
-    Returns a zero timedelta for an object with no configs, which cannot
-    become a check candidate anyway (``select_check_candidates`` requires
-    every config to be ``bops_confirmed``, and ``all(())`` of an empty dict
-    admits it — so returning zero keeps such an object un-expirable rather
-    than instantly expired).
-    """
-    if not obj.configs:
-        return timedelta(0)
-    newest = max(ctx.manifest_generated_at for ctx in obj.configs.values())
-    return now - newest
-
-
-def is_expired(obj: TrackedObject, now: datetime, ttl: timedelta) -> bool:
-    """True iff *obj* has been tracked for longer than *ttl* without resolving.
-
-    The backstop for a Tracked_Object that can never resolve on its own. The
-    known case is a source object whose ``HeadObject`` fails permanently
-    while presenting as transient (see ``source_status_adapter``'s note on
-    403 masking), but the guarantee this provides is general: no
-    Tracked_Object occupies the state object indefinitely, whatever the
-    cause.
-
-    A non-positive *ttl* disables expiry entirely.
-
-    Requirements: 3.8
-    """
-    if ttl <= timedelta(0):
-        return False
-    return tracked_object_age(obj, now) > ttl
-
-
-def expire_tracked_object(obj: TrackedObject, now: datetime) -> TrackedObject:
-    """Resolve *obj* as ``EXPIRED`` so it leaves the state object (Req 3.8).
-
-    Deliberately reuses the normal resolution path rather than deleting the
-    object directly: the item is published in a Completion_Report and only
-    then deleted, so an operator sees which objects were abandoned and why
-    instead of them vanishing silently.
-    """
-    return _resolve(obj, "expired", "EXPIRED", now)
-
-
-# ---------------------------------------------------------------------------
-# Selection — select_check_candidates (Decision 3)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CheckCandidate:
-    """One ``TrackedObject`` selected for a Source_Status_Check this interval.
-
-    Returned by ``select_check_candidates``. Carries exactly what the
-    caller (``_run_completion_tracking_interval``) needs to look up which
-    ``TrackedObject`` this refers to and issue the check for it.
-    """
-
-    item_key: str
-    obj: TrackedObject
-
-
-def select_check_candidates(
-    items: dict[str, TrackedObject],
-) -> list[CheckCandidate]:
-    """Flatten every check-eligible ``TrackedObject`` in ``items`` into candidates.
-
-    A ``TrackedObject`` is selected iff ``state == CompletionState.PENDING``
-    AND every ``ConfigContext`` in ``configs`` has ``bops_confirmed ==
-    True`` — a ``TrackedObject`` with any unconfirmed ``ConfigContext`` is
-    skipped this interval, since the aggregate
-    ``x-amz-replication-status`` header is not read until every routing job
-    has been confirmed to have processed the object (Requirement 3.1).
-
-    There is no ``CheckKind`` and no age-gate routing — every gated
-    candidate is a Source_Status_Check candidate.
-
-    ``RESOLVED`` objects are never included — enforced structurally by
-    filtering exclusively on ``state``, never on ``replication_outcome``
-    (the literal string ``"PENDING"`` is a legal ``replication_outcome``
-    value and must never be confused with ``CompletionState.PENDING`` — see
-    Property 5) (Requirement 3.3).
-
-    Requirements: 3.1, 3.3
-    """
-    candidates: list[CheckCandidate] = []
-    for item_key, obj in items.items():
-        if obj.state != CompletionState.PENDING:
-            continue
-        if not all(ctx.bops_confirmed for ctx in obj.configs.values()):
-            continue
-        candidates.append(CheckCandidate(item_key=item_key, obj=obj))
-    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +258,8 @@ def should_publish(
 def build_completion_report(
     source_bucket: str,
     items: list[TrackedObject],
-    outstanding: int | None = None,
+    outstanding_jobs: int | None = None,
+    submission_deferred: bool = False,
 ) -> dict:
     """Build the JSON-serializable Completion_Report payload for a
     per-source_bucket batch (design.md Decision 7).
@@ -422,14 +295,47 @@ def build_completion_report(
       outcome), not per destination. Only outcomes that actually occur
       appear as keys.
 
-    ``outstanding`` is how many Tracked_Objects for ``source_bucket`` remain
-    in tracking after this report — objects whose replication has not yet
-    reached a terminal answer. A report covers what resolved since the
-    previous one (Requirement 4.2), so it is not by itself the answer to
-    "has everything I tagged arrived?": ``outstanding == 0`` is. Passing
-    ``None`` omits both the ``outstanding`` field and its summary clause,
-    which keeps a caller that does not know the count from asserting a
-    misleading zero.
+    Two fields state what is still outstanding for ``source_bucket``, both per
+    bucket and neither attributed to a tag, rule, or destination — one job covers
+    every matched object across all of a bucket's tag-scoped rules, so no job
+    belongs to a single rule:
+
+    * ``outstanding_jobs`` — Batch Operations jobs outstanding for the bucket when
+      the report was built, including the one the run just submitted. This is the
+      field that answers "is replication still in progress". ``None`` means the
+      count is not known, and is emitted as ``null`` rather than omitted, so a
+      subscriber can always read the key and tell "unknown" apart from "zero".
+      Unknown suppresses the all-clear clause exactly as a non-zero count does: a
+      bucket whose jobs were never checked, which includes one skipped as
+      disabled, must not be reported as clear.
+    * ``submission_deferred`` — whether the most recent run skipped this bucket
+      because its outstanding job count had reached
+      ``MaxConcurrentJobsPerBucket``.
+
+    ``format_version: 2``'s ``outstanding`` field is **removed** with nothing
+    taking its name. It counted objects still in tracking — replication not yet at
+    a terminal answer — and its documented contract was that ``outstanding == 0``
+    answered "has everything I tagged arrived?". Under report-derived completion an
+    object enters tracking only *after* its job's report has been read, so no count
+    of stored items can carry that meaning: by the time an object is counted, the
+    question is already settled for it. ``outstanding_jobs`` answers it instead, at
+    the level where the work is actually pending.
+
+    There is deliberately no stored-item count in the payload. An earlier draft of
+    this release carried one, as ``outstanding_items``, defined as resolved items
+    awaiting quiescence. It was removed before release because it is always zero in
+    any report a subscriber receives: quiescence is keyed per bucket, so every item
+    for a bucket is tested against the same ``ScanState``, and a report is only
+    built when at least one item is publishable. A run that matched anything records
+    a non-zero match count and publishes nothing at all; a run that matched nothing
+    records a zero-match scan later than every job creation time, so every item
+    passes. There is no ordering that leaves some items quiescent and others not,
+    which made the field a permanent zero dressed up as a signal.
+
+    The version is bumped rather than the name reused because a subscriber that
+    repointed at any similarly-named replacement would read something that does not
+    mean what ``outstanding`` meant — a silent wrong answer, which is worse for it
+    than an explicit break.
 
     ``obj.configs`` is not reported. Under the one-job-per-bucket design
     (single-batch-job-per-bucket design.md Decision D4) it holds exactly one
@@ -451,14 +357,14 @@ def build_completion_report(
 
     report: dict = {
         "summary": _format_completion_report_summary(
-            source_bucket, len(items), outcome_counts, outstanding
+            source_bucket, len(items), outcome_counts, outstanding_jobs,
         ),
-        "format_version": 2,
+        "format_version": 3,
         "source_bucket": source_bucket,
         "item_count": len(items),
     }
-    if outstanding is not None:
-        report["outstanding"] = outstanding
+    report["outstanding_jobs"] = outstanding_jobs
+    report["submission_deferred"] = submission_deferred
     report["outcome_counts"] = outcome_counts
     report["groups"] = groups
     return report
@@ -564,8 +470,9 @@ def _build_groups(items: list[TrackedObject]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # SNS rejects a Publish whose message body exceeds 256 KiB. The budget below
 # is the usable allowance for report *groups*; the remainder covers the
-# envelope (``summary``, ``format_version``, ``source_bucket``,
-# ``item_count``, ``outcome_counts``) plus pretty-printing overhead. A
+# envelope (``summary``, ``format_version``, ``source_bucket``, ``item_count``,
+# ``outstanding_jobs``, ``submission_deferred``,
+# ``outcome_counts``) plus pretty-printing overhead. A
 # rejected publish is not merely a lost notification: covered items are
 # deleted only after a successful publish, so an oversized report would fail
 # identically on every subsequent run and pin those items in the state object
@@ -650,21 +557,12 @@ _OUTCOME_PHRASES: list[tuple[str | None, str, str]] = [
     ("FAILED",
      "failed to replicate",
      "failed to replicate"),
-    ("EXPIRED",
-     "were abandoned after the tracking window expired",
-     "was abandoned after the tracking window expired"),
     ("UNKNOWN",
-     "reported no replication status",
-     "reported no replication status"),
+     "reported an unrecognized task status",
+     "reported an unrecognized task status"),
     (None,
-     "reported no replication status",
-     "reported no replication status"),
-    ("PENDING",
-     "are still replicating",
-     "is still replicating"),
-    ("GONE",
-     "were deleted before replication could be confirmed",
-     "was deleted before replication could be confirmed"),
+     "reported an unrecognized task status",
+     "reported an unrecognized task status"),
     ("COMPLETE",
      "replicated successfully",
      "replicated successfully"),
@@ -673,35 +571,39 @@ _OUTCOME_PHRASES: list[tuple[str | None, str, str]] = [
 # Outcomes that mean an object did not demonstrably reach its destination, and
 # so warrant an explicit call to action in the summary.
 _ACTIONABLE_OUTCOMES: tuple[str | None, ...] = (
-    "FAILED", "EXPIRED", "UNKNOWN", None,
+    "FAILED", "UNKNOWN", None,
 )
 
 
-def _format_outstanding_clause(outstanding: int | None) -> str:
-    """Render the trailing summary clause stating what is still being tracked.
+def _format_outstanding_clause(outstanding_jobs: int | None = None) -> str:
+    """Render the trailing summary clause stating what is still outstanding.
 
-    Empty when ``outstanding`` is ``None`` (the caller did not supply a
-    count), so a summary never implies a zero it was not told.
+    Turns entirely on ``outstanding_jobs``, the count of Batch Operations jobs
+    still running for the bucket. ``No replication jobs remain outstanding.`` is
+    the all-clear, and a known zero is the only thing that earns it.
 
-    The wording says "in tracking" rather than "in flight" deliberately: an
-    object enters tracking only once its Batch Operations job's completion
-    report has been read, so a zero means nothing is left awaiting
-    confirmation, not that no tagging work exists upstream of that point.
+    An unknown count suppresses the all-clear as firmly as a non-zero one, and the
+    clause then says nothing rather than guessing. A bucket reaches that state by
+    failing before its jobs could be checked, or by being skipped as disabled, and
+    a bucket is disabled precisely because its jobs kept failing — the worst case
+    to describe as clear. The ``outstanding_jobs: null`` in the payload is where a
+    subscriber reads the reason; the summary's job is not to over-explain an edge
+    case to someone reading an email.
     """
-    if outstanding is None:
+    if outstanding_jobs is None:
         return ""
-    if outstanding == 0:
-        return " No objects remain in tracking."
-    if outstanding == 1:
-        return " 1 object remains in tracking."
-    return f" {outstanding:,} objects remain in tracking."
+    if outstanding_jobs == 0:
+        return " No replication jobs remain outstanding."
+    if outstanding_jobs == 1:
+        return " 1 replication job is still running."
+    return f" {outstanding_jobs:,} replication jobs are still running."
 
 
 def _format_completion_report_summary(
     source_bucket: str,
     item_count: int,
     outcome_counts: dict,
-    outstanding: int | None = None,
+    outstanding_jobs: int | None = None,
 ) -> str:
     """Build the one-line, human-readable ``summary`` field for a
     Completion_Report (see :func:`build_completion_report`).
@@ -720,14 +622,14 @@ def _format_completion_report_summary(
 
     Example output::
 
-        example-source-bucket: 1,057 objects — 1,057 were deleted before
-        replication could be confirmed. No failures.
+        example-source-bucket: 1,057 objects replicated successfully. No action
+        needed.
 
         my-bucket: 1,200 objects — 150 failed to replicate, 1,000 replicated
-        successfully, 50 were deleted before replication could be confirmed.
-        Action needed: 150 of 1,200 did not replicate.
+        successfully, 50 reported an unrecognized task status. Action needed:
+        200 of 1,200 did not replicate.
     """
-    trailing = _format_outstanding_clause(outstanding)
+    trailing = _format_outstanding_clause(outstanding_jobs)
 
     if not item_count:
         return f"{source_bucket}: no objects to report.{trailing}"
@@ -778,10 +680,11 @@ def format_completion_report_subject(report: dict) -> str:
     which SNS rejects) and truncates the bucket name rather than the verdict,
     keeping the part that decides whether to open the mail.
 
-    A non-zero ``outstanding`` count is appended, so a subject carrying no
-    "still tracking" marker is the last report for that wave. The marker is
-    added only when non-zero to keep the common subject short; the zero case
-    is stated in the ``summary`` field instead.
+    A non-zero ``outstanding_jobs`` count is appended, so a subject carrying no
+    such marker is the last report for that wave. It is added only when non-zero to
+    keep the common subject short; the zero case is stated in the ``summary`` field
+    instead. It has to be there at all because without it a bare subject would read
+    as "done" while a job was still replicating.
 
     Requirements: 4.10
     """
@@ -793,9 +696,10 @@ def format_completion_report_subject(report: dict) -> str:
 
     noun = "object" if item_count == 1 else "objects"
     tail = f": {item_count:,} {noun}, {verdict}"
-    outstanding = report.get("outstanding")
-    if outstanding:
-        tail = f"{tail}, {outstanding:,} still tracking"
+    outstanding_jobs = report.get("outstanding_jobs")
+    if outstanding_jobs:
+        noun = "job" if outstanding_jobs == 1 else "jobs"
+        tail = f"{tail}, {outstanding_jobs:,} {noun} running"
     subject = f"S3 replication {bucket}{tail}"
     if len(subject) <= _SNS_MAX_SUBJECT_CHARS:
         return subject
@@ -822,3 +726,60 @@ def is_report_overdue(terminal_at: datetime, now: datetime) -> bool:
     Requirements: 8.2
     """
     return (now - terminal_at) > _REPORT_OVERDUE_THRESHOLD
+
+
+# A report that exists but has never been consumed escalates on a longer clock
+# than a report that does not exist, and against a different reference point.
+#
+# An absent report does not depend on this Solution having run at all: S3 writes
+# the report within minutes of the job terminating, so an hour after termination
+# is a safe bound.
+#
+# An unconsumed report does depend on it, because only the main Lambda can
+# consume one, and it does so only while processing that job's bucket. The bound
+# must therefore exceed the Solution's own run interval by a comfortable margin,
+# and ``CheckFrequencyMinutes`` is operator-controlled with a ``MaxValue`` of
+# 1440 (24 hours). Deriving the threshold from that ceiling rather than picking a
+# number keeps it correct at every permitted setting: 48 hours is two intervals
+# at the slowest configuration allowed, and 192 intervals at the 15-minute
+# default. A shorter fixed bound would fire before the first opportunity to read
+# the report on any stack configured to run less often than every few hours.
+#
+# There is slack to spend here. The condition means completion outcomes are not
+# being recorded, which is not urgent to the minute, and
+# ``LifecycleExpirationDays`` defaults to 30 days, so 48 hours still leaves ample
+# margin to act before the report itself expires.
+_REPORT_UNCONSUMED_THRESHOLD = timedelta(hours=48)
+
+
+def is_report_unconsumed_overdue(
+    report_written_at: datetime | None,
+    now: datetime,
+) -> bool:
+    """True iff a written-but-unconsumed report has gone unread too long.
+
+    *report_written_at* is the ``LastModified`` of the report's own top-level
+    manifest, from :func:`bops_report_reader.report_manifest_written_at`. It is
+    deliberately not a job timestamp. A job's duration is unbounded, so measuring
+    from ``TerminationDate`` (or worse, from ``CreationTime`` when that is
+    absent) makes the grace period depend on how long the job ran: a job that
+    took a day would have exhausted any threshold shorter than a day before its
+    report was even written. The manifest's own timestamp measures exactly the
+    interval in question.
+
+    ``None`` means there is no usable timestamp, and returns ``False`` rather
+    than alerting on an unknown.
+
+    The caller must already have established that the job is terminal, invoked at
+    least one task, is not recorded as processed in state, and has a report
+    manifest present. Under those conditions the report exists and the Solution
+    has had ample opportunity to consume it and has not, which is evidence of a
+    report it cannot read: a checksum mismatch, a row-count mismatch, a malformed
+    row, or a report whose objects have been removed by the State Bucket's
+    ``LifecycleExpirationDays`` rule on ``completion-reports/``.
+
+    Requirements: 1.7
+    """
+    if report_written_at is None:
+        return False
+    return (now - report_written_at) > _REPORT_UNCONSUMED_THRESHOLD

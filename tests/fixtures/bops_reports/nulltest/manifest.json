@@ -1,0 +1,13 @@
+{
+  "Format": "Report_CSV_20180820",
+  "ReportCreationDate": "2026-08-27T09:49:46.474712072Z",
+  "Results": [
+    {
+      "TaskExecutionStatus": "succeeded",
+      "Bucket": "example-state-bucket",
+      "MD5Checksum": "3b20a5f41761b65d63280e41597a7cf7",
+      "Key": "completion-reports/nulltest//job-b2f9f42d-dba4-4a77-945e-074cef95450e/results/f47b7e9d4ea62beb3251ae3ae522503744384fda.csv"
+    }
+  ],
+  "ReportSchema": "Bucket, Key, VersionId, TaskStatus, ErrorCode, HTTPStatusCode, ResultMessage"
+}

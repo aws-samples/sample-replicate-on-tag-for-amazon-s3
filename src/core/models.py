@@ -19,6 +19,45 @@ from urllib.parse import quote, unquote
 SequenceNumber = str
 
 # ---------------------------------------------------------------------------
+# Null-version markers
+# ---------------------------------------------------------------------------
+# The three spellings of "the null version" that can appear in the VersionId
+# position of a manifest row or a Batch Operations completion report row. All
+# of them mean ``version_id=None`` to this Solution.
+#
+# The completion report's VersionId column is a round-trip of whatever the
+# manifest supplied, which is why more than one spelling reaches us:
+#
+#   ``null``  A correctly serialized null version, the form
+#             :meth:`ManifestEntry.to_csv_row` emits and the form AWS's own
+#             S3 Inventory guidance prescribes. Observed echoed back verbatim
+#             in the report for job b2f9f42d-dba4-4a77-945e-074cef95450e
+#             (2026-08-27), where both null-version tasks succeeded and the
+#             source objects reached ``ReplicationStatus: COMPLETED``.
+#   ``\N``    What the report writes when the manifest supplied nothing to
+#             echo, i.e. an empty VersionId field. That manifest row always
+#             fails with ``SrcObjectNotFound: Object versionID is invalid``,
+#             so this spelling only appears on a failed row. Observed in job
+#             0f65a1b7-9b4c-4124-a1ad-06ea77d7224f (2026-07-21), before
+#             ``to_csv_row`` was changed to emit the literal ``null``.
+#   ``""``    An unversioned-bucket row.
+#
+# Matching is exact and case-sensitive on purpose: S3 version IDs are
+# case-sensitive, so a real version whose value happens to read ``NULL`` is a
+# different object from the null version.
+#
+# Shared by :meth:`ManifestEntry.from_versioned_csv_row` and the completion
+# report reader so the inbound and outbound halves cannot drift apart.
+NULL_VERSION_TOKENS = ("", "null", "\\N")
+
+
+def normalize_version_id(raw: str | None) -> str | None:
+    """Return ``None`` for any null-version spelling, else *raw* unchanged."""
+    if raw is None or raw in NULL_VERSION_TOKENS:
+        return None
+    return raw
+
+# ---------------------------------------------------------------------------
 # AppConfig / MonitoredBucket
 # ---------------------------------------------------------------------------
 
@@ -282,15 +321,15 @@ class ManifestEntry:
         Uses rpartition to split off the version_id and partition to split the
         bucket from the (URL-encoded) key, then URL-decodes the key. Because
         encoded keys never contain a literal comma, the split is unambiguous.
-        Both an empty version_id field and the literal string ``null``
-        (the form :meth:`to_csv_row` now emits for a null-version object,
-        matching the convention S3 Batch Operations itself requires — see
-        :meth:`to_csv_row`'s docstring) are returned as ``version_id=None``,
-        so round-tripping either representation is lossless.
+        Every spelling in :data:`NULL_VERSION_TOKENS` is returned as
+        ``version_id=None``, so round-tripping any of them is lossless. That
+        includes the literal string ``null``, the form :meth:`to_csv_row` emits
+        for a null-version object, matching the convention S3 Batch Operations
+        itself requires — see :meth:`to_csv_row`'s docstring.
         """
         remainder, _, version_id_raw = row.rpartition(",")
         bucket, _, key = remainder.partition(",")
-        version_id = None if version_id_raw in ("", "null") else version_id_raw
+        version_id = normalize_version_id(version_id_raw)
         return cls(
             source_bucket=bucket,
             object_key=unquote(key),
@@ -470,7 +509,24 @@ class SubmissionRecord:
     watermark_low: str = ""   # bucket watermark before this run — resume point on failure
     watermark_high: str = ""  # candidate_hwm for this run — latest watermark attempted
     consecutive_failures: int = 0  # consecutive Failed/Cancelled jobs for this config; reset to 0 on Complete
-    report_diagnosed: bool = False  # per-job; resets when next submission replaces the record
+    report_diagnosed: bool = False  # per-job; its report's task errors have been logged
+    # Per-job: this job's terminal outcome has already been folded into the
+    # bucket's recovery arithmetic, so it must not be folded in again.
+    #
+    # Needed because a record now outlives the run in which its job reached
+    # terminal. Requirement 3.2 keeps a terminal record whose completion report
+    # has not been read, so that check_report_handler can alert on it. Without
+    # this flag such a record is re-scored on every subsequent run: the watermark
+    # rolls back to the same watermark_low, the same journal range is resubmitted
+    # at a fresh per-job charge, and consecutive_failures climbs until the circuit
+    # breaker disables the bucket with a reason claiming N consecutive failures for
+    # one job that failed once. Under 1.0.1's single overwritten record this could
+    # not happen, because the record was replaced before the next run read it.
+    #
+    # Distinct from report_diagnosed on purpose: a job whose report is unreadable
+    # is scored (its status is known) but not diagnosed (its task errors are not),
+    # which is exactly the case that makes re-scoring reachable.
+    recovery_scored: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +562,21 @@ class BucketMetrics:
         they are in an archived storage class S3 will not replicate.  Defaults
         to zero so a caller constructing this without the field still gets
         valid metrics.
+    submission_deferred:
+        True when the bucket was skipped because its previous Batch Operations
+        job had not finished. Not an error, and distinct from ``errored``: the
+        run did what it should, and the tagging it did not submit stays eligible
+        for the next run. Surfaced as a metric so an operator can see a bucket
+        whose replication throughput is the limiting factor rather than
+        wondering why no job was submitted.
+    tail_shortened:
+        True when the run raised its journal-read lower bound above
+        ``last_processed_watermark - JournalLookbackSeconds`` because the
+        lookback tail would not fit the row budget. Not an error: the run read
+        every row it could afford and made progress. Surfaced as a metric
+        because it is the one condition under which the Solution re-scans less
+        of the lookback window than configured, so late-arrival tolerance is
+        reduced for as long as the backlog lasts.
     """
 
     source_bucket: str
@@ -514,6 +585,8 @@ class BucketMetrics:
     submitted: int
     errored: bool
     archived_excluded: int = 0
+    submission_deferred: bool = False
+    tail_shortened: bool = False
 
 
 @dataclass(frozen=True)
@@ -574,19 +647,27 @@ class RunOutcome:
 # CompletionState / ConfigContext / TrackedObject
 # ---------------------------------------------------------------------------
 #
-# Per-object aggregate (Tracked_Object) model — source-status-only,
-# BOPS-completion-report-gated. Because x-amz-replication-status is a single
-# aggregate value per source object version (COMPLETED only once every
-# destination is done, PENDING if any is outstanding, FAILED if any failed),
-# a Tracked_Object carries ONE outcome, not one per destination. A
-# ConfigContext per replication_config_id records only which
-# Batch_Replication_Job covered the object for that rule and whether that
-# job's BOPS_Completion_Report has confirmed it — it carries no outcome of
-# its own. See design.md Decision 2.
+# Per-object aggregate (Tracked_Object) model. A ready S3 Batch Operations
+# completion report provides one aggregate task outcome for an object, rather
+# than an outcome per destination. A ConfigContext records the
+# Batch_Replication_Job that covered the object; it carries no outcome of its
+# own. See the report-derived-completion design, Decision 2.
 
 
 class CompletionState(Enum):
-    """Per-Tracked_Object lifecycle value."""
+    """Per-Tracked_Object lifecycle value.
+
+    ``PENDING`` is retained so a state object written by 1.0.1 stays
+    deserializable. Nothing in 1.1.0 produces it, and nothing can advance it:
+    the source-object check that used to resolve a ``PENDING`` item is gone. It
+    also remains the dataclass default for :class:`TrackedObject`, which
+    ``merge_completion_report`` constructs transiently before setting
+    ``RESOLVED``.
+
+    An item deserialized in this state is normalized to ``RESOLVED``/``UNKNOWN``
+    in memory by ``completion_tracker.resolve_legacy_item`` when the publish
+    phase evaluates it, so it drains rather than accumulating.
+    """
 
     PENDING = "PENDING"
     RESOLVED = "RESOLVED"
@@ -594,27 +675,27 @@ class CompletionState(Enum):
 
 @dataclass
 class ConfigContext:
-    """Per-(matching replication_config_id) context for a Tracked_Object:
-    which BOPS job covered this object for that config, that job's
-    manifest-generation time (for the Quiescence_Check), and whether that
-    config's BOPS job has been confirmed terminal AND its completion report
-    lists this object version (the gating signal for the
-    Source_Status_Check — see design.md Decision 3)."""
+    """Per-replication-config context for a tracked object.
+
+    ``bops_confirmed`` is retained only in serialized state so a 1.1.0 state
+    object remains readable after a rollback to 1.0.1. Report-derived contexts
+    write it as ``True``. Completion behavior does not inspect the field.
+    """
 
     replication_config_id: str
     job_id: str                         # the Batch_Replication_Job that covered this config
     manifest_generated_at: datetime     # Job.CreationTime — used by the Quiescence_Check
-    bops_confirmed: bool = False
+    bops_confirmed: bool = True
 
 
 @dataclass
 class TrackedObject:
     """The completion-tracking unit.
 
-    Identity is (source_bucket, object_key, version_id). Carries a single
-    aggregate `state` and `replication_outcome` — never one per destination
-    — because the Source_Replication_Status_Header reflects the source
-    object version as a whole across every destination.
+    Identity is (source_bucket, object_key, version_id). Carries one aggregate
+    ``state`` and ``replication_outcome`` from the S3 Batch Operations
+    completion-report row for the task. The row does not identify a specific
+    destination when the replication configuration has more than one.
     """
 
     source_bucket: str
@@ -623,15 +704,12 @@ class TrackedObject:
     configs: dict[str, ConfigContext]   # keyed by replication_config_id
     state: CompletionState = CompletionState.PENDING
     resolved_at: datetime | None = None
-    resolution_method: str | None = None   # "source_status_header" | None while PENDING
-    # "COMPLETE" (header read COMPLETED) | verbatim x-amz-replication-status
-    # value "PENDING" | "FAILED" | "UNKNOWN" (header absent) | None while
-    # PENDING.
-    #
-    # NOTE: the string "PENDING" is a legal replication_outcome value (a
-    # source object whose header itself reads "PENDING") and is unrelated to
-    # CompletionState.PENDING. Check-candidate selection filters exclusively
-    # on `state`, never on `replication_outcome` — see Property 5.
+    resolution_method: str | None = None
+    # Newly resolved report rows use only "COMPLETE", "FAILED", or "UNKNOWN".
+    # The 1.0.1 values "PENDING", "GONE", and "EXPIRED" remain deserializable so
+    # a state object written by 1.0.1 stays readable; the publish phase
+    # normalizes them to "UNKNOWN" in memory via
+    # completion_tracker.resolve_legacy_item.
     replication_outcome: str | None = None
     tagged_at: datetime | None = None       # tag event timestamp from journal
     last_modified: datetime | None = None   # object last-modified from journal
@@ -639,11 +717,10 @@ class TrackedObject:
     # buckets those rules target. Reported so an operator can see which rules
     # fired and where the object was bound for.
     #
-    # These describe *intent*, not per-destination outcome: the source
-    # object's x-amz-replication-status header is a single aggregate across
-    # every destination (COMPLETED only when all succeed, FAILED when one or
-    # more fail), so `replication_outcome` cannot be attributed to an
-    # individual entry in `destinations`.
+    # These describe *intent*, not per-destination outcome: the Batch
+    # Operations completion-report row is the aggregate result for a task and
+    # cannot identify which destination failed when multiple destinations are
+    # configured.
     matched_rules: frozenset[str] = frozenset()
     destinations: frozenset[str] = frozenset()
 

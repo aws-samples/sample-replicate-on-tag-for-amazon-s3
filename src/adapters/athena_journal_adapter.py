@@ -305,6 +305,91 @@ def _build_boundary_query(
     return query
 
 
+def _build_tail_count_query(
+    bucket_namespace: str,
+    bucket_name: str,
+    window_start: str,
+    watermark: str,
+) -> str:
+    """Build the ``COUNT(*)`` query for the lookback tail's row count.
+
+    The tail is ``(window_start, watermark]`` — the range a run re-scans for
+    late-arriving journal rows. Carries the same ``bucket`` and
+    ``record_type = 'UPDATE_METADATA'`` predicate as :func:`_build_query`, so
+    the count is over exactly the rows :func:`read_journal` would materialise
+    for that range and the number can be budgeted against
+    ``Journal_Read_Row_Cap`` directly.
+
+    Returns one row regardless of how large the tail is, so it does not pay the
+    client-side pagination cost the cap exists to avoid — the same property that
+    makes :func:`_build_boundary_query` cheap.
+    """
+    table_path = f'"s3tablescatalog/aws-s3"."{bucket_namespace}"."journal"'
+    bucket_escaped = _escape_sql_string(bucket_name)
+    start_ts = _to_athena_timestamp_literal(window_start)
+    watermark_ts = _to_athena_timestamp_literal(watermark)
+
+    return (
+        "SELECT count(*) "
+        f"FROM {table_path} "
+        f"WHERE bucket = '{bucket_escaped}' "
+        "AND record_type = 'UPDATE_METADATA'"
+        f" AND record_timestamp > timestamp '{start_ts}'"
+        f" AND record_timestamp <= timestamp '{watermark_ts}'"
+    )
+
+
+def _build_tail_floor_query(
+    bucket_namespace: str,
+    bucket_name: str,
+    window_start: str,
+    watermark: str,
+    tail_allowance: int,
+) -> str:
+    """Build the query locating the tail's raised lower bound.
+
+    Yields the ``record_timestamp`` of the row one **past** the allowance,
+    counting **backwards** from *watermark*, so using it as an exclusive lower
+    bound admits exactly ``tail_allowance`` tail rows.
+
+    Same OFFSET trick as :func:`_build_boundary_query` with the sort reversed:
+    ``ORDER BY record_timestamp DESC`` means the offset counts down from the
+    watermark rather than up from the window start, which is what truncates the
+    tail from below. Truncating from below is the point — the rows nearest the
+    watermark are the most recently written and so the likeliest genuine late
+    arrivals, leaving the oldest and least relevant rows as the ones dropped.
+
+    The offset is ``tail_allowance``, not ``tail_allowance - 1``, and the
+    difference from :func:`_build_boundary_query` is the bound's inclusivity
+    rather than an inconsistency. That function's result is used as an inclusive
+    upper bound, so the ``row_cap``-th row is itself admitted and
+    ``OFFSET row_cap - 1`` is right. This one's result is used as an *exclusive*
+    lower bound, so the row it names is **not** admitted: naming the
+    ``tail_allowance``-th newest row would admit only ``tail_allowance - 1``
+    rows, and at an allowance of 1 would admit none at all — discarding the whole
+    tail while the run advances the watermark past it, which is the loss the
+    truncation is bounded specifically to avoid.
+
+    Yields zero rows when the tail holds ``tail_allowance`` rows or fewer, which
+    is exactly the case where the whole tail fits its allowance and no truncation
+    is needed.
+    """
+    table_path = f'"s3tablescatalog/aws-s3"."{bucket_namespace}"."journal"'
+    bucket_escaped = _escape_sql_string(bucket_name)
+    start_ts = _to_athena_timestamp_literal(window_start)
+    watermark_ts = _to_athena_timestamp_literal(watermark)
+
+    return (
+        "SELECT record_timestamp "
+        f"FROM {table_path} "
+        f"WHERE bucket = '{bucket_escaped}' "
+        "AND record_type = 'UPDATE_METADATA'"
+        f" AND record_timestamp > timestamp '{start_ts}'"
+        f" AND record_timestamp <= timestamp '{watermark_ts}'"
+        f" ORDER BY record_timestamp DESC OFFSET {tail_allowance} LIMIT 1"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal Athena execution helpers
 # ---------------------------------------------------------------------------
@@ -370,7 +455,9 @@ def _run_scalar_query(
     """Run a query expected to return at most one row/column; return its
     value, or ``None`` if the result set is empty.
 
-    Shared submit/poll/fetch-one-row helper for :func:`find_row_count_boundary`.
+    Shared submit/poll/fetch-one-row helper for
+    :func:`find_row_count_boundary`, :func:`find_tail_row_count`, and
+    :func:`find_tail_floor`.
     Raises ``ClientError``/``ValueError`` on failure, exactly like
     :func:`_start_query`/:func:`_poll_query` — the caller is expected to
     treat this the same as any other Athena failure.
@@ -462,6 +549,169 @@ def find_row_count_boundary(
     if parsed is None:
         raise ValueError(
             f"Boundary query returned an unparseable record_timestamp: {raw_value!r}"
+        )
+    return to_watermark(parsed)
+
+
+def find_tail_row_count(
+    athena_client,
+    bucket_name: str,
+    window_start: str,
+    watermark: str,
+    athena_workgroup: str = "primary",
+    output_location: str = "",
+) -> int:
+    """Count the journal rows in the lookback tail ``(window_start, watermark]``.
+
+    The tail is the range a run re-scans for late-arriving journal rows. Almost
+    all of it is already in the checkpoint's ``processed_window``, but the
+    row-cap boundary query cannot tell — it counts raw rows — so the tail's true
+    row count is what the caller must budget against ``Journal_Read_Row_Cap``.
+    See :func:`src.core.row_cap_validation.split_row_budget`.
+
+    Counted rather than derived from ``len(processed_window)``, which is free and
+    wrong: ``processed_window`` holds one entry per submitted *logical
+    operation*, while the cap and this count are over ``UPDATE_METADATA``
+    *rows*, and the rows-per-object factor varies with how many times an object
+    was retagged.
+
+    A single-row aggregate, so its cost does not scale with the tail's size
+    (Requirement 5.1). It never paginates.
+
+    Parameters
+    ----------
+    athena_client:
+        boto3 Athena client.
+    bucket_name:
+        Source bucket name.
+    window_start:
+        Lookback window start as a canonical watermark string, exclusive.
+    watermark:
+        The bucket's current ``last_processed_watermark``, inclusive.
+    athena_workgroup, output_location:
+        Same as :func:`read_journal`.
+
+    Returns
+    -------
+    int
+        The number of ``UPDATE_METADATA`` rows in the tail. Zero when the tail
+        is empty.
+
+    Raises
+    ------
+    ValueError
+        When the query fails, times out, or returns an unparseable count.
+    ClientError
+        On other Athena failures.
+    """
+    bucket_namespace = "b_" + bucket_name.replace(".", "_")
+    query = _build_tail_count_query(
+        bucket_namespace, bucket_name, window_start, watermark
+    )
+
+    raw_value = _run_scalar_query(
+        athena_client, query, athena_workgroup, output_location
+    )
+    if raw_value is None or raw_value == "":
+        # COUNT(*) always returns a row, so an empty result set means the
+        # response shape was not what this function assumes. Treating that as
+        # zero would silently hand the caller a tail-free budget split.
+        raise ValueError(
+            f"Tail count query for bucket {bucket_name!r} returned no value"
+        )
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Tail count query returned an unparseable count: {raw_value!r}"
+        ) from exc
+
+
+def find_tail_floor(
+    athena_client,
+    bucket_name: str,
+    window_start: str,
+    watermark: str,
+    tail_allowance: int,
+    athena_workgroup: str = "primary",
+    output_location: str = "",
+) -> str | None:
+    """Find the raised lower bound admitting exactly *tail_allowance* tail rows.
+
+    Returns the ``record_timestamp`` of the row one past the allowance, counting
+    backwards from *watermark*, as a canonical watermark string. The result is an
+    **exclusive** lower bound, matching :func:`read_journal`'s ``since``
+    semantics, so passing it admits ``tail_allowance`` rows below the watermark —
+    fewer only when rows tie on that timestamp, which errs under the allowance
+    rather than over it.
+
+    The tie direction is the opposite of :func:`find_row_count_boundary`'s, and
+    deliberately so. At the upper bound a split tie would leave rows below an
+    advancing watermark without ever having been submitted, so ``until`` is
+    inclusive and a tie is never split. At the lower bound the rows in question
+    are re-scan candidates that were almost certainly already submitted, while
+    admitting a whole tie could push the read past its allowance — so excluding
+    is the safe direction here.
+
+    Returns ``None`` when the tail holds ``tail_allowance`` rows or fewer,
+    meaning the whole tail fits and the caller should keep
+    ``watermark - lookback`` as its lower bound.
+
+    A single-row query, so it does not read the tail to find its floor
+    (Requirement 5.2).
+
+    Parameters
+    ----------
+    athena_client:
+        boto3 Athena client.
+    bucket_name:
+        Source bucket name.
+    window_start:
+        Lookback window start as a canonical watermark string, exclusive.
+    watermark:
+        The bucket's current ``last_processed_watermark``, inclusive.
+    tail_allowance:
+        How many tail rows the row budget admits. Must be a positive integer;
+        an allowance of zero has no floor to find, and the caller handles that
+        case by dropping the tail entirely.
+    athena_workgroup, output_location:
+        Same as :func:`read_journal`.
+
+    Returns
+    -------
+    str | None
+        A canonical watermark string to use as an exclusive lower bound, or
+        ``None`` when the tail is smaller than *tail_allowance*.
+
+    Raises
+    ------
+    ValueError
+        If ``tail_allowance`` is not a positive integer, or the query
+        fails/times out/returns an unparseable timestamp.
+    ClientError
+        On other Athena failures.
+    """
+    if tail_allowance <= 0:
+        raise ValueError(
+            f"tail_allowance must be a positive integer, got {tail_allowance!r}"
+        )
+
+    bucket_namespace = "b_" + bucket_name.replace(".", "_")
+    query = _build_tail_floor_query(
+        bucket_namespace, bucket_name, window_start, watermark, tail_allowance
+    )
+
+    raw_value = _run_scalar_query(
+        athena_client, query, athena_workgroup, output_location
+    )
+    if raw_value is None:
+        return None
+
+    parsed = _parse_event_time(raw_value)
+    if parsed is None:
+        raise ValueError(
+            f"Tail floor query returned an unparseable record_timestamp: "
+            f"{raw_value!r}"
         )
     return to_watermark(parsed)
 

@@ -447,3 +447,84 @@ class TestProperty6CheckpointAdvancementAndEligibility:
         refs = [ProcessedRef(logical_operation_id="op", watermark=_wm_from_seconds(hwm_s))]
         new_state = advance_checkpoint(state, refs, _LOOKBACK)
         assert new_state.last_processed_watermark == _wm_from_seconds(checkpoint_s)
+
+
+# ---------------------------------------------------------------------------
+# A newly created stack replicates tagging from just before it existed
+# Feature: report-derived-completion
+# Requirements: 7.1
+# ---------------------------------------------------------------------------
+
+
+class TestFreshlySeededCheckpointCoversPreCreationTagging:
+    """A new stack picks up tagging done shortly before it was deployed.
+
+    ``deploy/config_resource/index.py`` seeds ``last_processed_watermark`` to the
+    moment of stack creation with an empty ``processed_window``. That seeded value
+    is the newest point already accounted for, not the oldest point that can be
+    read: a run scans from ``watermark - lookback``, and an empty
+    ``processed_window`` suppresses nothing in that range. So the first run of a
+    new stack reads the lookback period preceding creation and replicates whatever
+    was tagged in it.
+
+    This is operator-visible behavior rather than an implementation detail. The
+    "Journal Start Point" section of ``README.md`` tells an operator to expect the
+    first run to replicate objects they tagged while preparing to deploy, and to be
+    billed for the resulting Batch Operations job. Asserted here so that
+    documentation cannot quietly stop being true.
+    """
+
+    _CREATED_AT_MINUTE = 60
+
+    def _seeded_state(self) -> CheckpointState:
+        """State exactly as the stack-create custom resource writes it."""
+        return make_state(
+            watermark=wm(self._CREATED_AT_MINUTE),
+            lease=None,
+            processed_window=[],
+        )
+
+    def test_tagging_inside_the_lookback_window_before_creation_is_eligible(self):
+        state = self._seeded_state()
+
+        # _LOOKBACK is 10 minutes, so creation-minus-1 and creation-minus-9 are
+        # inside the window.
+        assert is_eligible(make_op(self._CREATED_AT_MINUTE - 1), state, _LOOKBACK)
+        assert is_eligible(make_op(self._CREATED_AT_MINUTE - 9), state, _LOOKBACK)
+
+    def test_tagging_at_the_moment_of_creation_is_eligible(self):
+        state = self._seeded_state()
+
+        assert is_eligible(make_op(self._CREATED_AT_MINUTE), state, _LOOKBACK)
+
+    def test_tagging_older_than_the_lookback_window_is_not_eligible(self):
+        """The coverage is bounded, which is why the note still warns."""
+        state = self._seeded_state()
+
+        assert not is_eligible(make_op(self._CREATED_AT_MINUTE - 10), state, _LOOKBACK)
+        assert not is_eligible(make_op(self._CREATED_AT_MINUTE - 11), state, _LOOKBACK)
+        assert not is_eligible(make_op(self._CREATED_AT_MINUTE - 30), state, _LOOKBACK)
+
+    def test_coverage_survives_until_the_first_successful_run(self):
+        """The window is anchored on the watermark, not on wall-clock time.
+
+        The watermark advances only when a run succeeds, so a delayed or
+        throttled first run does not erode the pre-creation coverage. Once a run
+        does succeed and advances the watermark past the window, the pre-creation
+        period is out of scope permanently.
+        """
+        state = self._seeded_state()
+        pre_creation = make_op(self._CREATED_AT_MINUTE - 5)
+
+        assert is_eligible(pre_creation, state, _LOOKBACK)
+
+        # After a successful run the watermark has moved past the window that
+        # reached back before creation. How advance_checkpoint decides to move it
+        # is covered by TestAdvanceCheckpointSuccess; what matters here is that
+        # the pre-creation period is then permanently out of scope.
+        after_first_run = make_state(
+            watermark=wm(self._CREATED_AT_MINUTE + 20),
+            processed_window=[],
+        )
+
+        assert not is_eligible(pre_creation, after_first_run, _LOOKBACK)

@@ -88,10 +88,29 @@ see it).
 If a future re-run of ``benchmarks/real_manifest_benchmark.py`` measures
 materially different figures, this table (and this docstring) should be
 updated together.
+
+The cap is divided between two ranges
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A run's read spans the lookback tail — ``(watermark - lookback, watermark]``,
+re-scanned for late-arriving journal rows — and the rows above the watermark,
+which are the only rows that can advance the checkpoint.
+:func:`split_row_budget` divides ``Journal_Read_Row_Cap`` between the two and
+reserves a floor for the new rows, so a tail larger than the cap cannot leave
+the new-row range empty. What the ceiling table below bounds is the **sum** of
+the two allowances, which is the whole read, so the ceilings and the measured
+per-row figures they are anchored to are unaffected by the split:
+:data:`IN_MEMORY_MEMORY_CEILING` and :func:`validate_row_cap` are unchanged by
+it.
 """
 from __future__ import annotations
 
+from math import floor
+
 from src.core.config_loader import ConfigError
+from src.core.manifest_strategy import (
+    MIN_NEW_ROW_BUDGET,
+    TAIL_ROW_BUDGET_FRACTION,
+)
 
 # ---------------------------------------------------------------------------
 # Supported LambdaMemoryMB values (deploy/template.yaml, LambdaMemoryMB
@@ -112,6 +131,55 @@ IN_MEMORY_MEMORY_CEILING: dict[int, int] = {
     8192: 2_000_000,
     10240: 2_500_000,
 }
+
+
+def split_row_budget(row_cap: int, tail_rows: int) -> tuple[int, int]:
+    """Divide *row_cap* between the lookback tail and the rows above the watermark.
+
+    Returns ``(tail_allowance, new_row_budget)``. The two values sum to at most
+    *row_cap*, so the total rows a run reads stays bounded by the cap exactly as
+    it was before the budget was split. ``new_row_budget`` is never zero: it is
+    floored at :data:`~src.core.manifest_strategy.MIN_NEW_ROW_BUDGET`, because a
+    new-row budget of zero is what lets a bucket stop draining.
+
+    Three cases, and the first two leave behavior unchanged:
+
+    ==========================  ================  =====================
+    Tail size                   ``tail_allowance``  ``new_row_budget``
+    ==========================  ================  =====================
+    0                           0                 ``row_cap``
+    Fits the tail fraction      ``tail_rows``     ``row_cap - tail_rows``
+    Exceeds the tail fraction   the fraction      the remainder
+    ==========================  ================  =====================
+
+    Pure: no AWS, no I/O.
+
+    Parameters
+    ----------
+    row_cap:
+        The configured ``Journal_Read_Row_Cap``. Must be a positive integer.
+    tail_rows:
+        Rows in the lookback tail — the range ``(watermark - lookback,
+        watermark]``. Must be non-negative.
+
+    Returns
+    -------
+    tuple[int, int]
+        ``(tail_allowance, new_row_budget)``.
+
+    Raises
+    ------
+    ValueError
+        When ``row_cap`` is not positive, or ``tail_rows`` is negative.
+    """
+    if row_cap <= 0:
+        raise ValueError(f"row_cap must be a positive integer, got {row_cap!r}")
+    if tail_rows < 0:
+        raise ValueError(f"tail_rows must be non-negative, got {tail_rows!r}")
+
+    tail_allowance = min(tail_rows, floor(row_cap * TAIL_ROW_BUDGET_FRACTION))
+    new_row_budget = max(MIN_NEW_ROW_BUDGET, row_cap - tail_allowance)
+    return tail_allowance, new_row_budget
 
 
 def _nearest_supported_memory_mb(lambda_memory_mb: int) -> int:

@@ -17,6 +17,7 @@ from botocore.exceptions import ClientError
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from src.adapters.bops_report_reader import BopsCompletionReport
 from src.adapters.state_store import ConditionalWriteError, StateStore
 from src.core.checkpoint_serializer import deserialize, serialize
 from src.core.completion_serializer import item_key as _item_key_fn
@@ -487,11 +488,11 @@ class TestRecordSubmission:
         store.record_submission(client, _STATE_BUCKET, self._make_submission(), _ETAG)
         kwargs = client.put_object.call_args[1]
         body = json.loads(kwargs["Body"])
-        # Now written as a dict keyed by the per-bucket sentinel (source_bucket,
-        # design.md D3) under "submission_records", not by config_id.
+        # Keyed by job_id under "submission_records", so a job submitted while an
+        # earlier one is still running cannot displace it.
         assert "submission_records" in body
-        assert _SRC_BUCKET in body["submission_records"]
-        assert body["submission_records"][_SRC_BUCKET]["job_id"] == "job-abc-123"
+        assert "job-abc-123" in body["submission_records"]
+        assert body["submission_records"]["job-abc-123"]["job_id"] == "job-abc-123"
 
     def test_submission_preserves_existing_checkpoint(self):
         """Record submission does not clobber the checkpoint (Req 7.4)."""
@@ -781,15 +782,15 @@ class TestGetSubmissionRecords:
         client.get_object.return_value = {"Body": body, "ETag": etag}
         return client
 
-    def test_returns_dict_keyed_by_config_id(self):
-        """get_submission_records returns records keyed by replication_config_id."""
+    def test_returns_dict_keyed_by_job_id(self):
+        """get_submission_records returns records keyed by their own job_id."""
         rec = self._make_submission(config_id="cfg-1")
         body = self._state_json_with_submission_records({"cfg-1": rec})
         client = self._mock_s3_get_raw(body)
         store = StateStore()
         result = store.get_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert "cfg-1" in result
-        assert result["cfg-1"].job_id == "job-abc-123"
+        assert "job-abc-123" in result
+        assert result["job-abc-123"].job_id == "job-abc-123"
 
     def test_round_trips_watermark_fields(self):
         """watermark_low and watermark_high survive the serialize→get cycle."""
@@ -801,8 +802,8 @@ class TestGetSubmissionRecords:
         client = self._mock_s3_get_raw(body)
         store = StateStore()
         result = store.get_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert result["cfg-1"].watermark_low == _WM_042
-        assert result["cfg-1"].watermark_high == _WM_077
+        assert result["job-abc-123"].watermark_low == _WM_042
+        assert result["job-abc-123"].watermark_high == _WM_077
 
     def test_returns_empty_dict_when_no_submission_records(self):
         """Absent submission_records → empty dict (no KeyError)."""
@@ -840,17 +841,17 @@ class TestGetSubmissionRecords:
         result = store.get_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
         assert result == {}
 
-    def test_multiple_configs_all_returned(self):
-        """Multiple config_ids in submission_records are all returned."""
+    def test_multiple_records_all_returned_keyed_by_job_id(self):
+        """Every stored record is returned, re-keyed by its own job_id."""
         rec_a = self._make_submission(config_id="cfg-a", job_id="job-a")
         rec_b = self._make_submission(config_id="cfg-b", job_id="job-b")
         body = self._state_json_with_submission_records({"cfg-a": rec_a, "cfg-b": rec_b})
         client = self._mock_s3_get_raw(body)
         store = StateStore()
         result = store.get_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert set(result.keys()) == {"cfg-a", "cfg-b"}
-        assert result["cfg-a"].job_id == "job-a"
-        assert result["cfg-b"].job_id == "job-b"
+        assert set(result.keys()) == {"job-a", "job-b"}
+        assert result["job-a"].job_id == "job-a"
+        assert result["job-b"].job_id == "job-b"
 
 
 # ---------------------------------------------------------------------------
@@ -872,8 +873,7 @@ class TestRecordSubmissionUpdated:
         )
 
     def test_writes_submission_records_dict(self):
-        """record_submission now writes submission_records dict, keyed by the
-        per-bucket sentinel (source_bucket), not by config_id (design.md D3)."""
+        """record_submission writes submission_records keyed by job_id."""
         state = _make_state()
         client = _mock_s3_get(state)
         store = StateStore()
@@ -881,17 +881,17 @@ class TestRecordSubmissionUpdated:
         kwargs = client.put_object.call_args[1]
         body = __import__("json").loads(kwargs["Body"])
         assert "submission_records" in body
-        assert _SRC_BUCKET in body["submission_records"]
+        assert "job-cfg-1" in body["submission_records"]
 
     def test_watermark_fields_persisted(self):
-        """watermark_low and watermark_high are stored in the per-bucket record."""
+        """watermark_low and watermark_high are stored on the job's record."""
         state = _make_state()
         client = _mock_s3_get(state)
         store = StateStore()
         store.record_submission(client, _STATE_BUCKET, self._make_submission(), _ETAG)
         kwargs = client.put_object.call_args[1]
         body = __import__("json").loads(kwargs["Body"])
-        rec = body["submission_records"][_SRC_BUCKET]
+        rec = body["submission_records"]["job-cfg-1"]
         assert rec["watermark_low"] == _WM_042
         assert rec["watermark_high"] == _WM_077
 
@@ -917,11 +917,12 @@ class TestRecordSubmissionUpdated:
         written = json.loads(kwargs["Body"])
         assert "submission_record" not in written
 
-    def test_legacy_config_entries_dropped_on_write(self):
-        """A legacy config_id-keyed entry already present is DROPPED by
-        record_submission's collapse-to-one-record write (design.md D3's
-        migration-on-write, implemented in task 4.2): only the per-bucket
-        sentinel entry survives."""
+    def test_existing_entry_is_re_keyed_and_kept_not_dropped(self):
+        """An entry already present is preserved, re-keyed by its own job_id.
+
+        Dropping it was the defect: the discarded job's completion report was
+        never read, the report-missing check could not see it, and a later failure
+        left no watermark_low to roll back to (Requirement 1.1)."""
         import json
         state = _make_state()
         from src.core.checkpoint_serializer import serialize, serialize_submission_record
@@ -943,9 +944,14 @@ class TestRecordSubmissionUpdated:
         )
         kwargs = client.put_object.call_args[1]
         written = json.loads(kwargs["Body"])
-        # Legacy per-config entry is dropped -- exactly one entry remains.
-        assert set(written["submission_records"].keys()) == {_SRC_BUCKET}
-        assert written["submission_records"][_SRC_BUCKET]["job_id"] == "job-cfg-new"
+        assert set(written["submission_records"].keys()) == {
+            "job-cfg-existing", "job-cfg-new",
+        }
+        assert written["submission_records"]["job-cfg-new"]["job_id"] == "job-cfg-new"
+        assert (
+            written["submission_records"]["job-cfg-existing"]["job_id"]
+            == "job-cfg-existing"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -957,7 +963,7 @@ class TestRecordSubmissionUpdated:
 
 class TestSingleRecordRoundTrip:
     """A SubmissionRecord written via record_submission is read back via
-    get_submission_records under the bucket-name key, with every field
+    get_submission_records under its job_id key, with every field
     intact (Req 2.2)."""
 
     def _make_submission(self) -> SubmissionRecord:
@@ -989,8 +995,8 @@ class TestSingleRecordRoundTrip:
 
         result = store.get_submission_records(read_client, _STATE_BUCKET, _SRC_BUCKET)
 
-        assert set(result.keys()) == {_SRC_BUCKET}
-        rec = result[_SRC_BUCKET]
+        assert set(result.keys()) == {"job-round-trip"}
+        rec = result["job-round-trip"]
         assert rec.job_id == submission.job_id
         assert rec.manifest_key == submission.manifest_key
         assert rec.status == submission.status
@@ -1014,8 +1020,7 @@ class TestSingleRecordRoundTrip:
 class TestLegacyMultiConfigStateRead:
     """A legacy state object whose submission_records dict is keyed by
     multiple old-style replication_config_id values reads without error and
-    returns every legacy record, correctly keyed by its original config_id
-    (Req 2.4)."""
+    returns every record, re-keyed by its own job_id (Req 1.2)."""
 
     def _legacy_record(self, config_id: str, job_id: str) -> SubmissionRecord:
         return SubmissionRecord(
@@ -1047,22 +1052,22 @@ class TestLegacyMultiConfigStateRead:
 
         result = store.get_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
 
-        assert set(result.keys()) == {"cfg-1", "cfg-2"}
-        assert result["cfg-1"].job_id == "job-cfg-1"
-        assert result["cfg-1"].replication_config_id == "cfg-1"
-        assert result["cfg-2"].job_id == "job-cfg-2"
-        assert result["cfg-2"].replication_config_id == "cfg-2"
+        assert set(result.keys()) == {"job-cfg-1", "job-cfg-2"}
+        assert result["job-cfg-1"].replication_config_id == "cfg-1"
+        assert result["job-cfg-2"].replication_config_id == "cfg-2"
 
 
 class TestLegacyMultiConfigStateAfterOneWrite:
-    """Per task 4.2's implementation of design.md D3's migration-on-write
-    ("It then writes the single per-bucket record and drops the legacy
-    per-config entries"), record_submission collapses submission_records
-    down to exactly one entry -- keyed by the per-bucket sentinel -- on
-    every write. This test documents that a legacy multi-config state
-    object, after one record_submission call, converges to the single
-    bucket-keyed record and no longer carries the legacy per-config entries
-    (Req 2.4).
+    """One record_submission re-keys a legacy state object by job_id.
+
+    The migration is free: every SubmissionRecord carries its own job_id, so a
+    payload keyed by bucket name or by replication_config_id loads correctly on
+    read and the first write persists the new keying as a side effect. No
+    migration write, no schema version, nothing for an operator to do (Req 1.2).
+
+    Crucially the legacy records are re-keyed rather than dropped. Dropping them
+    is what discarded a running job's id along with its report, its
+    report-missing check, and its rollback target.
     """
 
     def _legacy_record(self, config_id: str, job_id: str) -> SubmissionRecord:
@@ -1088,7 +1093,7 @@ class TestLegacyMultiConfigStateAfterOneWrite:
         }
         return payload
 
-    def test_one_write_collapses_to_single_bucket_record(self):
+    def test_one_write_re_keys_every_record_by_job_id(self):
         payload = self._legacy_multi_config_payload()
         client = _mock_s3_get_raw_payload(payload)
         store = StateStore()
@@ -1106,18 +1111,54 @@ class TestLegacyMultiConfigStateAfterOneWrite:
         written = json.loads(client.put_object.call_args[1]["Body"])
         records = written["submission_records"]
 
-        # Converges to exactly one record, keyed by the per-bucket sentinel
-        # (design.md D3's migration-on-write, task 4.2): the legacy cfg-1
-        # and cfg-2 entries are dropped by this write.
-        assert set(records.keys()) == {_SRC_BUCKET}
-        assert records[_SRC_BUCKET]["job_id"] == "job-new-union"
+        assert set(records.keys()) == {"job-cfg-1", "job-cfg-2", "job-new-union"}
+        assert records["job-new-union"]["job_id"] == "job-new-union"
 
-        # get_submission_records reads the collapsed single-record form
-        # without error.
+        # And reads back in the new keying without error.
         read_client = _mock_s3_get_raw_payload(written)
         result = store.get_submission_records(read_client, _STATE_BUCKET, _SRC_BUCKET)
-        assert set(result.keys()) == {_SRC_BUCKET}
-        assert result[_SRC_BUCKET].job_id == "job-new-union"
+        assert set(result.keys()) == {"job-cfg-1", "job-cfg-2", "job-new-union"}
+
+    def test_a_bucket_name_keyed_record_is_re_keyed_by_its_job_id(self):
+        """The shape 1.0.1 and the interim 1.1.0 build actually wrote."""
+        from src.core.checkpoint_serializer import serialize_submission_record
+
+        payload = json.loads(serialize(_make_state()))
+        payload["submission_records"] = {
+            _SRC_BUCKET: serialize_submission_record(
+                self._legacy_record(_SRC_BUCKET, "job-from-1-0-1")
+            )
+        }
+        client = _mock_s3_get_raw_payload(payload)
+
+        result = StateStore().get_submission_records(
+            client, _STATE_BUCKET, _SRC_BUCKET
+        )
+
+        assert set(result.keys()) == {"job-from-1-0-1"}
+        client.put_object.assert_not_called()  # no migration write
+
+    def test_a_record_with_no_job_id_is_dropped_on_read(self):
+        """It identifies no job, so nothing can be described, merged, or rolled
+        back from it, and keeping it would put a "" key in the dict (Req 1.2)."""
+        from src.core.checkpoint_serializer import serialize_submission_record
+
+        payload = json.loads(serialize(_make_state()))
+        payload["submission_records"] = {
+            _SRC_BUCKET: serialize_submission_record(
+                self._legacy_record(_SRC_BUCKET, "")
+            ),
+            "job-real": serialize_submission_record(
+                self._legacy_record(_SRC_BUCKET, "job-real")
+            ),
+        }
+        client = _mock_s3_get_raw_payload(payload)
+
+        result = StateStore().get_submission_records(
+            client, _STATE_BUCKET, _SRC_BUCKET
+        )
+
+        assert set(result.keys()) == {"job-real"}
 
 
 class TestRecordSubmissionPreservesOtherTopLevelKeys:
@@ -1165,7 +1206,7 @@ class TestRecordSubmissionPreservesOtherTopLevelKeys:
         assert written["completion_items"] == payload["completion_items"]
         assert written["completion_processed_job_ids"] == ["job-already-processed"]
         # And the new submission record was still written correctly.
-        assert written["submission_records"][_SRC_BUCKET]["job_id"] == "job-new"
+        assert written["submission_records"]["job-new"]["job_id"] == "job-new"
 
 
 # ---------------------------------------------------------------------------
@@ -1175,7 +1216,7 @@ class TestRecordSubmissionPreservesOtherTopLevelKeys:
 
 class TestSerializerSubmissionRecordWatermarks:
     def test_watermark_fields_serialize_round_trip(self):
-        """serialize_submission_record / _deserialize_submission_record round-trips."""
+        """serialize_submission_record / deserialize_submission_record round-trips."""
         from src.core.checkpoint_serializer import (
             serialize_submission_record,
             deserialize_submission_records,
@@ -1224,8 +1265,8 @@ class TestSerializerSubmissionRecordWatermarks:
 
 
 # ---------------------------------------------------------------------------
-# completion_job_exists / merge_completion_configs /
-# get_check_eligible_items / delete_completion_items — Task 10.1
+# completion_job_exists / merge_completion_report /
+# delete_completion_items — Task 10.1
 # (Requirements 2.1, 2.4, 2.6, 3.1)
 # ---------------------------------------------------------------------------
 
@@ -1338,21 +1379,32 @@ class TestCompletionJobExists:
         client.put_object.assert_not_called()
 
 
-class TestMergeCompletionConfigs:
-    def _entries(self, *keys: str) -> list[ManifestEntry]:
-        return [ManifestEntry(source_bucket=_SRC_BUCKET, object_key=k, version_id="v1") for k in keys]
+class TestMergeCompletionReport:
+    def _report(self, *keys: str) -> BopsCompletionReport:
+        return BopsCompletionReport(
+            created_at=_JOB_T0,
+            entries=tuple(
+                ManifestEntry(
+                    source_bucket=_SRC_BUCKET,
+                    object_key=key,
+                    version_id="v1",
+                    task_status="succeeded",
+                )
+                for key in keys
+            ),
+        )
 
-    def test_creates_new_item_with_pending_state_and_confirmed_config(self):
+    def test_creates_new_item_with_resolved_state_and_confirmed_config(self):
         client = MagicMock()
         client.get_object.side_effect = _client_error("NoSuchKey")
         client.put_object.return_value = {"ETag": _NEW_ETAG}
         store = StateStore()
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-a"),
+            report=self._report("key-a"),
             replication_config_id="cfg-1",
             job_id="job-new",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=None,
         )
         kwargs = client.put_object.call_args[1]
@@ -1360,7 +1412,8 @@ class TestMergeCompletionConfigs:
         item_key = _item_key_fn("key-a", "v1")
         assert item_key in body["completion_items"]
         item = body["completion_items"][item_key]
-        assert item["state"] == "PENDING"
+        assert item["state"] == "RESOLVED"
+        assert item["replication_outcome"] == "COMPLETE"
         cfg = item["configs"]["cfg-1"]
         assert cfg["job_id"] == "job-new"
         assert cfg["bops_confirmed"] is True
@@ -1371,12 +1424,12 @@ class TestMergeCompletionConfigs:
         client.get_object.side_effect = _client_error("NoSuchKey")
         client.put_object.return_value = {"ETag": _NEW_ETAG}
         store = StateStore()
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-a"),
+            report=self._report("key-a"),
             replication_config_id="cfg-1",
             job_id="job-new",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=None,
         )
         kwargs = client.put_object.call_args[1]
@@ -1389,12 +1442,12 @@ class TestMergeCompletionConfigs:
         payload["submission_records"] = {"cfg-x": {"job_id": "old-job"}}
         client = _mock_s3_get_raw_payload(payload)
         store = StateStore()
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-a"),
+            report=self._report("key-a"),
             replication_config_id="cfg-1",
             job_id="job-new",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=_ETAG,
         )
         kwargs = client.put_object.call_args[1]
@@ -1415,12 +1468,12 @@ class TestMergeCompletionConfigs:
         payload = _payload_with_completion_items({_item_key_fn("key-a", "v1"): existing_item})
         client = _mock_s3_get_raw_payload(payload)
         store = StateStore()
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-a"),
+            report=self._report("key-a"),
             replication_config_id="cfg-new",
             job_id="job-new",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=_ETAG,
         )
         kwargs = client.put_object.call_args[1]
@@ -1436,12 +1489,12 @@ class TestMergeCompletionConfigs:
         payload = _payload_with_completion_items({_item_key_fn("key-existing", "v1"): existing_item})
         client = _mock_s3_get_raw_payload(payload)
         store = StateStore()
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-new"),
+            report=self._report("key-new"),
             replication_config_id="cfg-1",
             job_id="job-new",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=_ETAG,
         )
         kwargs = client.put_object.call_args[1]
@@ -1453,12 +1506,12 @@ class TestMergeCompletionConfigs:
         payload = _payload_with_completion_items({})
         client = _mock_s3_get_raw_payload(payload)
         store = StateStore()
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-a"),
+            report=self._report("key-a"),
             replication_config_id="cfg-1",
             job_id="job-new",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=_ETAG,
         )
         kwargs = client.put_object.call_args[1]
@@ -1470,12 +1523,12 @@ class TestMergeCompletionConfigs:
         client.put_object.side_effect = _client_error("PreconditionFailed")
         store = StateStore()
         with pytest.raises(ConditionalWriteError):
-            store.merge_completion_configs(
+            store.merge_completion_report(
                 client, _STATE_BUCKET, _SRC_BUCKET,
-                entries=self._entries("key-a"),
+                report=self._report("key-a"),
                 replication_config_id="cfg-1",
                 job_id="job-new",
-                manifest_generated_at=_JOB_T0,
+                job_created_at=_JOB_T0,
                 current_etag="stale",
             )
 
@@ -1483,12 +1536,12 @@ class TestMergeCompletionConfigs:
         payload = _payload_with_completion_items({})
         client = _mock_s3_get_raw_payload(payload)
         store = StateStore()
-        new_etag = store.merge_completion_configs(
+        new_etag = store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-a"),
+            report=self._report("key-a"),
             replication_config_id="cfg-1",
             job_id="job-new",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=_ETAG,
         )
         assert new_etag == _NEW_ETAG
@@ -1497,7 +1550,7 @@ class TestMergeCompletionConfigs:
         """D4 formalization (task 5.1): design.md D4 says the single
         per-bucket job produces ONE ConfigContext per object, keyed by the
         per-bucket sentinel. If the orchestrator calls
-        merge_completion_configs twice for the SAME object with
+        merge_completion_report twice for the SAME object with
         replication_config_id == the bucket sentinel each time (e.g. two
         legacy jobs terminating in the same migration-window run), the
         SECOND call's ConfigContext must overwrite the first under that one
@@ -1511,24 +1564,24 @@ class TestMergeCompletionConfigs:
         store = StateStore()
 
         # First legacy job's report merge, keyed by the bucket sentinel.
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-a"),
+            report=self._report("key-a"),
             replication_config_id=_SRC_BUCKET,
             job_id="job-legacy-a",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=None,
         )
         first_body = json.loads(client.put_object.call_args[1]["Body"])
 
         # Simulate the second call reading back what the first call wrote.
         client2 = _mock_s3_get_raw_payload(first_body)
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client2, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-a"),
+            report=self._report("key-a"),
             replication_config_id=_SRC_BUCKET,
             job_id="job-legacy-b",
-            manifest_generated_at=_JOB_T1,
+            job_created_at=_JOB_T1,
             current_etag=_ETAG,
         )
         second_body = json.loads(client2.put_object.call_args[1]["Body"])
@@ -1549,23 +1602,23 @@ class TestMergeCompletionConfigs:
         client.put_object.return_value = {"ETag": _NEW_ETAG}
         store = StateStore()
 
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-only-in-first"),
+            report=self._report("key-only-in-first"),
             replication_config_id=_SRC_BUCKET,
             job_id="job-first",
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=None,
         )
         first_body = json.loads(client.put_object.call_args[1]["Body"])
 
         client2 = _mock_s3_get_raw_payload(first_body)
-        store.merge_completion_configs(
+        store.merge_completion_report(
             client2, _STATE_BUCKET, _SRC_BUCKET,
-            entries=self._entries("key-only-in-second"),
+            report=self._report("key-only-in-second"),
             replication_config_id=_SRC_BUCKET,
             job_id="job-second",
-            manifest_generated_at=_JOB_T1,
+            job_created_at=_JOB_T1,
             current_etag=_ETAG,
         )
         second_body = json.loads(client2.put_object.call_args[1]["Body"])
@@ -1577,140 +1630,6 @@ class TestMergeCompletionConfigs:
         assert second_key in items
         assert items[first_key]["configs"][_SRC_BUCKET]["job_id"] == "job-first"
         assert items[second_key]["configs"][_SRC_BUCKET]["job_id"] == "job-second"
-
-
-class TestGetCheckEligibleItems:
-    def test_returns_pending_item_with_all_configs_confirmed(self):
-        item = _make_item(
-            object_key="key-pending",
-            configs={"cfg-1": _make_config_context(bops_confirmed=True)},
-            state=CompletionState.PENDING,
-        )
-        payload = _payload_with_completion_items({_item_key_fn("key-pending", "v1"): item})
-        client = _mock_s3_get_raw_payload(payload)
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert _item_key_fn("key-pending", "v1") in result
-
-    def test_excludes_item_with_unconfirmed_config(self):
-        item = _make_item(
-            object_key="key-unconfirmed",
-            configs={"cfg-1": _make_config_context(bops_confirmed=False)},
-            state=CompletionState.PENDING,
-        )
-        payload = _payload_with_completion_items({_item_key_fn("key-unconfirmed", "v1"): item})
-        client = _mock_s3_get_raw_payload(payload)
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert result == {}
-
-    def test_excludes_resolved_item(self):
-        item = _make_item(
-            object_key="key-resolved",
-            configs={"cfg-1": _make_config_context(bops_confirmed=True)},
-            state=CompletionState.RESOLVED,
-        )
-        payload = _payload_with_completion_items({_item_key_fn("key-resolved", "v1"): item})
-        client = _mock_s3_get_raw_payload(payload)
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert result == {}
-
-    def test_mix_of_confirmed_and_unconfirmed_configs_excluded(self):
-        item = _make_item(
-            object_key="key-mixed",
-            configs={
-                "cfg-1": _make_config_context(replication_config_id="cfg-1", bops_confirmed=True),
-                "cfg-2": _make_config_context(replication_config_id="cfg-2", bops_confirmed=False),
-            },
-            state=CompletionState.PENDING,
-        )
-        payload = _payload_with_completion_items({_item_key_fn("key-mixed", "v1"): item})
-        client = _mock_s3_get_raw_payload(payload)
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert result == {}
-
-    def test_returns_empty_dict_when_no_completion_items_key(self):
-        state = _make_state()
-        client = _mock_s3_get(state)
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert result == {}
-
-    def test_returns_empty_dict_when_state_object_absent(self):
-        client = MagicMock()
-        client.get_object.side_effect = _client_error("NoSuchKey")
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert result == {}
-
-    def test_reraises_other_client_errors(self):
-        client = MagicMock()
-        client.get_object.side_effect = _client_error("AccessDenied")
-        store = StateStore()
-        with pytest.raises(ClientError):
-            store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-
-    def test_multiple_items_all_eligible_returned(self):
-        item_a = _make_item(object_key="key-a")
-        item_b = _make_item(object_key="key-b")
-        payload = _payload_with_completion_items(
-            {_item_key_fn("key-a", "v1"): item_a, _item_key_fn("key-b", "v1"): item_b}
-        )
-        client = _mock_s3_get_raw_payload(payload)
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert set(result.keys()) == {_item_key_fn("key-a", "v1"), _item_key_fn("key-b", "v1")}
-
-    def test_single_bucket_sentinel_confirmed_job_makes_item_eligible(self):
-        """Task 5.4 / design.md D4: a PENDING TrackedObject whose ``configs``
-        dict holds exactly ONE ConfigContext, keyed by the per-bucket
-        sentinel (the bucket's own name, as produced by
-        merge_completion_configs under the single-batch-job-per-bucket
-        design), is check-eligible as soon as that single context is
-        bops_confirmed=True. The "all bops_confirmed" gate is satisfied by
-        the single confirming job alone — there is no wait on any further
-        per-rule confirmation, unlike the generic "cfg-1" key used
-        elsewhere in this class."""
-        item = _make_item(
-            object_key="key-sentinel",
-            configs={
-                _SRC_BUCKET: _make_config_context(
-                    replication_config_id=_SRC_BUCKET, job_id="job-bucket-1", bops_confirmed=True
-                )
-            },
-            state=CompletionState.PENDING,
-        )
-        payload = _payload_with_completion_items({_item_key_fn("key-sentinel", "v1"): item})
-        client = _mock_s3_get_raw_payload(payload)
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert _item_key_fn("key-sentinel", "v1") in result
-        eligible_item = result[_item_key_fn("key-sentinel", "v1")]
-        assert list(eligible_item.configs.keys()) == [_SRC_BUCKET]
-
-    def test_single_bucket_sentinel_unconfirmed_job_excludes_item(self):
-        """Mirror of the above with bops_confirmed=False under the bucket
-        sentinel key: the single job has not yet confirmed, so the item is
-        excluded — confirms the gate genuinely checks bops_confirmed and
-        is not vacuously true just because there's one context."""
-        item = _make_item(
-            object_key="key-sentinel-unconfirmed",
-            configs={
-                _SRC_BUCKET: _make_config_context(
-                    replication_config_id=_SRC_BUCKET, job_id="job-bucket-1", bops_confirmed=False
-                )
-            },
-            state=CompletionState.PENDING,
-        )
-        payload = _payload_with_completion_items(
-            {_item_key_fn("key-sentinel-unconfirmed", "v1"): item}
-        )
-        client = _mock_s3_get_raw_payload(payload)
-        store = StateStore()
-        result = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
-        assert result == {}
 
 
 class TestDeleteCompletionItems:
@@ -1814,7 +1733,7 @@ class TestDeleteCompletionItems:
 class _FakeConditionalS3:
     """A minimal fake S3 client that models one state object with real
     conditional-write (If-Match/If-None-Match) semantics, so that a second
-    merge_completion_configs call for the same job_id operates against
+    merge_completion_report call for the same job_id operates against
     the state as it would actually evolve across two real calls."""
 
     def __init__(self) -> None:
@@ -1879,171 +1798,60 @@ class TestProperty3CreatedAtMostOncePerJobId:
         client = _FakeConditionalS3()
         store = StateStore()
 
-        original_entries = [
-            ManifestEntry(source_bucket=_SRC_BUCKET, object_key=k, version_id="v1")
-            for k in original_keys
-        ]
-        etag = store.merge_completion_configs(
+        original_report = BopsCompletionReport(
+            created_at=_JOB_T0,
+            entries=tuple(
+                ManifestEntry(
+                    source_bucket=_SRC_BUCKET,
+                    object_key=key,
+                    version_id="v1",
+                    task_status="succeeded",
+                )
+                for key in original_keys
+            ),
+        )
+        etag = store.merge_completion_report(
             client, _STATE_BUCKET, _SRC_BUCKET,
-            entries=original_entries,
+            report=original_report,
             replication_config_id="cfg-1",
             job_id=job_id,
-            manifest_generated_at=_JOB_T0,
+            job_created_at=_JOB_T0,
             current_etag=None,
         )
 
         # Mirror the orchestrator's guard: only merge if not already present.
         if not store.completion_job_exists(client, _STATE_BUCKET, _SRC_BUCKET, job_id):
-            other_entries = [
-                ManifestEntry(source_bucket=_SRC_BUCKET, object_key=k, version_id="v1")
-                for k in other_keys
-            ]
-            store.merge_completion_configs(
+            other_report = BopsCompletionReport(
+                created_at=_JOB_T0,
+                entries=tuple(
+                    ManifestEntry(
+                        source_bucket=_SRC_BUCKET,
+                        object_key=key,
+                        version_id="v1",
+                        task_status="succeeded",
+                    )
+                    for key in other_keys
+                ),
+            )
+            store.merge_completion_report(
                 client, _STATE_BUCKET, _SRC_BUCKET,
-                entries=other_entries,
+                report=other_report,
                 replication_config_id="cfg-1",
                 job_id=job_id,
-                manifest_generated_at=_JOB_T0,
+                job_created_at=_JOB_T0,
                 current_etag=etag,
             )
 
         # The guard must have prevented the second merge: exactly the
         # original set of item keys carry a config created by job_id.
-        eligible = store.get_check_eligible_items(client, _STATE_BUCKET, _SRC_BUCKET)
+        items = store.get_all_completion_items(client, _STATE_BUCKET, _SRC_BUCKET)
         keys_touched_by_job = {
             item_key
-            for item_key, item in eligible.items()
+            for item_key, item in items.items()
             if any(ctx.job_id == job_id for ctx in item.configs.values())
         }
         expected_keys = {_item_key_fn(k, "v1") for k in original_keys}
         assert keys_touched_by_job == expected_keys
-
-
-# ---------------------------------------------------------------------------
-# apply_completion_resolutions — bounded-retry conditional write (Task 11.1 /
-# Requirements 3.6)
-# ---------------------------------------------------------------------------
-
-
-class TestApplyCompletionResolutions:
-    def test_succeeds_after_simulated_first_attempt_conditional_write_error(self):
-        """A ConditionalWriteError on the first PutObject attempt is retried
-        and the mutation succeeds on the second attempt."""
-        item = _make_item(object_key="key-a")
-        payload = _payload_with_completion_items({_item_key_fn("key-a", "v1"): item})
-        client = _mock_s3_get_raw_payload(payload)
-        client.put_object.side_effect = [
-            _client_error("PreconditionFailed"),
-            {"ETag": _NEW_ETAG},
-        ]
-        store = StateStore()
-
-        calls = {"count": 0}
-        ikey = _item_key_fn("key-a", "v1")
-
-        def mutate_fn(p):
-            calls["count"] += 1
-            p["completion_items"][ikey]["state"] = "RESOLVED"
-            return p
-
-        new_etag = store.apply_completion_resolutions(
-            client, _STATE_BUCKET, _SRC_BUCKET, mutate_fn, max_attempts=5
-        )
-        assert new_etag == _NEW_ETAG
-        # mutate_fn re-invoked on retry (once per attempt, twice total).
-        assert calls["count"] == 2
-        # The final successful attempt wrote the mutated state.
-        kwargs = client.put_object.call_args[1]
-        body = json.loads(kwargs["Body"])
-        assert body["completion_items"][ikey]["state"] == "RESOLVED"
-
-    def test_exhausting_max_attempts_raises_conditional_write_error(self):
-        """Every attempt failing the precondition propagates ConditionalWriteError."""
-        item = _make_item(object_key="key-a")
-        payload = _payload_with_completion_items({_item_key_fn("key-a", "v1"): item})
-        client = _mock_s3_get_raw_payload(payload)
-        client.put_object.side_effect = _client_error("PreconditionFailed")
-        store = StateStore()
-
-        def mutate_fn(p):
-            return p
-
-        with pytest.raises(ConditionalWriteError):
-            store.apply_completion_resolutions(
-                client, _STATE_BUCKET, _SRC_BUCKET, mutate_fn, max_attempts=3
-            )
-        assert client.put_object.call_count == 3
-
-    def test_preserves_checkpoint_lease_and_submission_records(self):
-        """The mutation only touches completion_items; other keys survive."""
-        state = _make_state(watermark=_WM_042, lease=_make_lease())
-        item = _make_item(object_key="key-a")
-        payload = json.loads(serialize(state))
-        ikey = _item_key_fn("key-a", "v1")
-        payload["completion_items"] = serialize_completion_items({ikey: item})
-        payload["submission_records"] = {"cfg-x": {"job_id": "old-job"}}
-        client = _mock_s3_get_raw_payload(payload)
-        store = StateStore()
-
-        def mutate_fn(p):
-            p["completion_items"][ikey]["state"] = "RESOLVED"
-            return p
-
-        store.apply_completion_resolutions(
-            client, _STATE_BUCKET, _SRC_BUCKET, mutate_fn, max_attempts=5
-        )
-        kwargs = client.put_object.call_args[1]
-        body = json.loads(kwargs["Body"])
-        assert body["last_processed_watermark"] == _WM_042
-        assert body["lease"] is not None
-        assert body["submission_records"] == {"cfg-x": {"job_id": "old-job"}}
-
-    def test_missing_state_object_defaults_to_fresh_checkpoint(self):
-        """NoSuchKey on the first read is tolerated and produces a default state."""
-        client = MagicMock()
-        client.get_object.side_effect = _client_error("NoSuchKey")
-        client.put_object.return_value = {"ETag": _NEW_ETAG}
-        store = StateStore()
-
-        def mutate_fn(p):
-            p["completion_items"] = {}
-            return p
-
-        new_etag = store.apply_completion_resolutions(
-            client, _STATE_BUCKET, _SRC_BUCKET, mutate_fn, max_attempts=3
-        )
-        assert new_etag == _NEW_ETAG
-        kwargs = client.put_object.call_args[1]
-        assert kwargs.get("IfNoneMatch") == "*"
-
-    def test_zero_max_attempts_raises_value_error_not_bare_assertion(self):
-        """max_attempts=0 must raise a clear ValueError before any I/O,
-        rather than falling through the empty loop into a bare
-        AssertionError (code-review-remediation spec Req 8.1)."""
-        client = MagicMock()
-        store = StateStore()
-
-        def mutate_fn(p):
-            return p
-
-        with pytest.raises(ValueError, match="max_attempts"):
-            store.apply_completion_resolutions(
-                client, _STATE_BUCKET, _SRC_BUCKET, mutate_fn, max_attempts=0
-            )
-        client.get_object.assert_not_called()
-        client.put_object.assert_not_called()
-
-    def test_negative_max_attempts_raises_value_error(self):
-        client = MagicMock()
-        store = StateStore()
-
-        def mutate_fn(p):
-            return p
-
-        with pytest.raises(ValueError, match="max_attempts"):
-            store.apply_completion_resolutions(
-                client, _STATE_BUCKET, _SRC_BUCKET, mutate_fn, max_attempts=-1
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -2678,12 +2486,44 @@ class TestMarkReportDiagnosed:
         store = StateStore()
 
         store.mark_report_diagnosed(
-            client, _STATE_BUCKET, _SRC_BUCKET, _SRC_BUCKET, current_etag=_ETAG
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123", current_etag=_ETAG
         )
 
         body = json.loads(client.put_object.call_args.kwargs["Body"])
         rec = body["submission_records"][_SRC_BUCKET]
         assert rec["report_diagnosed"] is True
+
+    def test_matches_on_job_id_not_on_the_stored_key(self):
+        """The payload here is still keyed by bucket name, as 1.0.1 wrote it.
+
+        Keying the lookup would silently stop writing the flag until the first
+        record_submission re-keyed the object, and a flag never set means the
+        report diagnostic repeats on every run."""
+        payload = self._payload_with_submission(diagnosed=False)
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().mark_report_diagnosed(
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123", current_etag=_ETAG
+        )
+
+        body = json.loads(client.put_object.call_args.kwargs["Body"])
+        assert body["submission_records"][_SRC_BUCKET]["report_diagnosed"] is True
+
+    def test_leaves_a_sibling_job_untouched(self):
+        payload = self._payload_with_submission(diagnosed=False)
+        payload["submission_records"]["job-sibling"] = {
+            **payload["submission_records"][_SRC_BUCKET],
+            "job_id": "job-sibling",
+        }
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().mark_report_diagnosed(
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123", current_etag=_ETAG
+        )
+
+        body = json.loads(client.put_object.call_args.kwargs["Body"])
+        assert body["submission_records"][_SRC_BUCKET]["report_diagnosed"] is True
+        assert body["submission_records"]["job-sibling"]["report_diagnosed"] is False
 
     def test_preserves_other_submission_fields(self):
         """The write does not clobber other fields on the submission record."""
@@ -2701,14 +2541,14 @@ class TestMarkReportDiagnosed:
         assert rec["consecutive_failures"] == 0
         assert rec["watermark_low"] == _WM_042
 
-    def test_no_op_when_config_id_not_in_records(self):
-        """If the config_id is absent, the write still happens (no crash)."""
+    def test_no_op_when_job_id_not_in_records(self):
+        """If the job_id is absent, the write still happens (no crash)."""
         payload = self._payload_with_submission(diagnosed=False)
         client = _mock_s3_get_raw_payload(payload)
         store = StateStore()
 
         store.mark_report_diagnosed(
-            client, _STATE_BUCKET, _SRC_BUCKET, "nonexistent-bucket",
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-nonexistent",
             current_etag=_ETAG,
         )
 
@@ -2723,7 +2563,7 @@ class TestMarkReportDiagnosed:
         store = StateStore()
 
         store.mark_report_diagnosed(
-            client, _STATE_BUCKET, _SRC_BUCKET, _SRC_BUCKET, current_etag=_ETAG
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123", current_etag=_ETAG
         )
 
         assert client.put_object.call_args.kwargs["IfMatch"] == _ETAG
@@ -2737,7 +2577,7 @@ class TestMarkReportDiagnosed:
 
         with pytest.raises(ConditionalWriteError):
             store.mark_report_diagnosed(
-                client, _STATE_BUCKET, _SRC_BUCKET, _SRC_BUCKET,
+                client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123",
                 current_etag="stale",
             )
 
@@ -2778,7 +2618,7 @@ class TestStateWriterMarkReportDiagnosed:
         store = StateStore()
         writer = StateWriter(store, client, _STATE_BUCKET, _SRC_BUCKET, _ETAG)
 
-        writer.mark_report_diagnosed(_SRC_BUCKET)
+        writer.mark_report_diagnosed("job-xyz")
 
         body = json.loads(client.put_object.call_args.kwargs["Body"])
         assert body["submission_records"][_SRC_BUCKET]["report_diagnosed"] is True
@@ -2793,7 +2633,7 @@ class TestStateWriterMarkReportDiagnosed:
         store = StateStore()
         writer = StateWriter(store, client, _STATE_BUCKET, _SRC_BUCKET, _ETAG)
 
-        writer.mark_report_diagnosed(_SRC_BUCKET)
+        writer.mark_report_diagnosed("job-xyz")
 
 
 # ---------------------------------------------------------------------------
@@ -2877,3 +2717,1172 @@ class TestLeaseDiscardedAudit:
             if call[0] and isinstance(call[0][0], dict)
         ]
         assert "lease_discarded" not in actions
+
+
+class TestMergeCompletionReport:
+    """Focused tests for report-derived atomic resolution (Req 1.4, 2.6)."""
+
+    def test_resolves_rows_preserves_enrichment_and_records_job_in_one_write(self):
+        payload = _payload_with_completion_items({})
+        item_a = _item_key_fn("key-a", "v1")
+        item_b = _item_key_fn("key-b", "v1")
+        payload["completion_timestamps"] = {
+            item_a: {"tagged_at": _JOB_T0.isoformat(), "last_modified": _JOB_T1.isoformat()}
+        }
+        payload["completion_routing"] = {
+            item_a: {"matched_rules": ["rule-a"], "destinations": ["dest-a"]}
+        }
+        client = _mock_s3_get_raw_payload(payload)
+        report_created_at = datetime(2024, 6, 17, 9, 15, tzinfo=timezone.utc)
+
+        StateStore().merge_completion_report(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            report=BopsCompletionReport(
+                created_at=report_created_at,
+                entries=(
+                    ManifestEntry(_SRC_BUCKET, "key-a", "v1", task_status=" succeeded "),
+                    ManifestEntry(_SRC_BUCKET, "key-b", "v1", task_status="FAILED"),
+                ),
+            ),
+            replication_config_id="cfg-1",
+            job_id="job-report",
+            job_created_at=_JOB_T1,
+            current_etag=_ETAG,
+        )
+
+        client.put_object.assert_called_once()
+        kwargs = client.put_object.call_args.kwargs
+        assert kwargs["IfMatch"] == _ETAG
+        body = json.loads(kwargs["Body"])
+        assert "job-report" in body["completion_processed_job_ids"]
+        assert body["completion_items"][item_a] == {
+            "source_bucket": _SRC_BUCKET,
+            "object_key": "key-a",
+            "version_id": "v1",
+            "state": "RESOLVED",
+            "resolved_at": report_created_at.isoformat(),
+            "resolution_method": "bops_completion_report",
+            "replication_outcome": "COMPLETE",
+            "configs": {
+                "cfg-1": {
+                    "replication_config_id": "cfg-1",
+                    "job_id": "job-report",
+                    "manifest_generated_at": _JOB_T1.isoformat(),
+                    "bops_confirmed": True,
+                }
+            },
+            "tagged_at": _JOB_T0.isoformat(),
+            "last_modified": _JOB_T1.isoformat(),
+            "matched_rules": ["rule-a"],
+            "destinations": ["dest-a"],
+        }
+        assert body["completion_items"][item_b]["replication_outcome"] == "FAILED"
+
+    @pytest.mark.parametrize(
+        ("stored_job_id", "incoming_job_id"),
+        [("job-new", "job-old"), ("job-z", "job-a")],
+    )
+    def test_older_report_preserves_newer_resolution_and_records_processed_id(
+        self, stored_job_id, incoming_job_id
+    ):
+        """An older creation time or equal-time lower job ID cannot regress a row.
+
+        **Validates: Requirements 2.7**
+        """
+        item_key = _item_key_fn("key-a", "v1")
+        newer_resolved_at = datetime(2024, 6, 17, 10, tzinfo=timezone.utc)
+        existing_item = TrackedObject(
+            source_bucket=_SRC_BUCKET,
+            object_key="key-a",
+            version_id="v1",
+            configs={
+                "cfg-1": ConfigContext(
+                    replication_config_id="cfg-1",
+                    job_id=stored_job_id,
+                    manifest_generated_at=_JOB_T1,
+                    bops_confirmed=True,
+                )
+            },
+            state=CompletionState.RESOLVED,
+            resolved_at=newer_resolved_at,
+            resolution_method="bops_completion_report",
+            replication_outcome="FAILED",
+        )
+        client = _mock_s3_get_raw_payload(
+            _payload_with_completion_items({item_key: existing_item})
+        )
+
+        StateStore().merge_completion_report(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            report=BopsCompletionReport(
+                created_at=_JOB_T0,
+                entries=(
+                    ManifestEntry(
+                        _SRC_BUCKET, "key-a", "v1", task_status="succeeded"
+                    ),
+                ),
+            ),
+            replication_config_id="cfg-1",
+            job_id=incoming_job_id,
+            job_created_at=_JOB_T0 if stored_job_id == "job-new" else _JOB_T1,
+            current_etag=_ETAG,
+        )
+
+        body = json.loads(client.put_object.call_args.kwargs["Body"])
+        item = body["completion_items"][item_key]
+        assert item["configs"]["cfg-1"]["job_id"] == stored_job_id
+        assert item["replication_outcome"] == "FAILED"
+        assert item["resolved_at"] == newer_resolved_at.isoformat()
+        assert incoming_job_id in body["completion_processed_job_ids"]
+
+    def test_mapping_failure_leaves_processed_job_id_and_items_unwritten(self):
+        payload = _payload_with_completion_items({}, processed_job_ids={"job-old"})
+        client = _mock_s3_get_raw_payload(payload)
+        with patch(
+            "src.adapters.state_store.completion_tracker.outcome_from_report_row",
+            side_effect=ValueError("invalid report status"),
+        ):
+            with pytest.raises(ValueError, match="invalid report status"):
+                StateStore().merge_completion_report(
+                    client, _STATE_BUCKET, _SRC_BUCKET,
+                    report=BopsCompletionReport(
+                        created_at=_JOB_T1,
+                        entries=(ManifestEntry(_SRC_BUCKET, "key-a", "v1"),),
+                    ),
+                    replication_config_id="cfg-1",
+                    job_id="job-new",
+                    job_created_at=_JOB_T0,
+                    current_etag=_ETAG,
+                )
+        client.put_object.assert_not_called()
+
+    def test_serialization_failure_leaves_processed_job_id_and_items_unwritten(self):
+        payload = _payload_with_completion_items({}, processed_job_ids={"job-old"})
+        client = _mock_s3_get_raw_payload(payload)
+        with patch(
+            "src.adapters.state_store.completion_serializer.serialize_completion_items",
+            side_effect=ValueError("cannot serialize completion items"),
+        ):
+            with pytest.raises(ValueError, match="cannot serialize completion items"):
+                StateStore().merge_completion_report(
+                    client, _STATE_BUCKET, _SRC_BUCKET,
+                    report=BopsCompletionReport(
+                        created_at=_JOB_T1,
+                        entries=(
+                            ManifestEntry(
+                                _SRC_BUCKET, "key-a", "v1", task_status="succeeded"
+                            ),
+                        ),
+                    ),
+                    replication_config_id="cfg-1",
+                    job_id="job-new",
+                    job_created_at=_JOB_T0,
+                    current_etag=_ETAG,
+                )
+        client.put_object.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Report-derived resolution state transitions — task 2.5 (Req 8.2)
+# ---------------------------------------------------------------------------
+
+
+class TestReportDerivedCompletionStateTransitions:
+    """State-store coverage for report outcome mapping and job ordering.
+
+    **Validates: Requirements 1.4, 2.1, 2.2, 2.3, 2.6, 2.7, 8.2**
+    """
+
+    _REPORT_T0 = datetime(2024, 6, 17, 9, 0, tzinfo=timezone.utc)
+    _REPORT_T1 = datetime(2024, 6, 17, 10, 0, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _client(payload: dict | None = None) -> _FakeConditionalS3:
+        client = _FakeConditionalS3()
+        if payload is not None:
+            client._body = json.dumps(payload)
+            client._etag = _ETAG
+        return client
+
+    def _merge(
+        self,
+        client: _FakeConditionalS3,
+        *,
+        job_id: str,
+        job_created_at: datetime,
+        report_created_at: datetime,
+        task_status: str | None = "succeeded",
+        etag: str | None = None,
+    ) -> str:
+        return StateStore().merge_completion_report(
+            client,
+            _STATE_BUCKET,
+            _SRC_BUCKET,
+            report=BopsCompletionReport(
+                created_at=report_created_at,
+                entries=(
+                    ManifestEntry(
+                        _SRC_BUCKET, "key-a", "v1", task_status=task_status
+                    ),
+                ),
+            ),
+            replication_config_id="cfg-1",
+            job_id=job_id,
+            job_created_at=job_created_at,
+            current_etag=etag,
+        )
+
+    @staticmethod
+    def _item(client: _FakeConditionalS3) -> dict:
+        payload = json.loads(client._body)
+        return payload["completion_items"][_item_key_fn("key-a", "v1")]
+
+    @pytest.mark.parametrize(
+        ("task_status", "expected_outcome"),
+        [("succeeded", "COMPLETE"), ("failed", "FAILED"), ("unknown", "UNKNOWN")],
+    )
+    def test_report_rows_persist_each_outcome_mapping(
+        self, task_status: str, expected_outcome: str
+    ) -> None:
+        client = self._client()
+
+        self._merge(
+            client,
+            job_id=f"job-{expected_outcome.lower()}",
+            job_created_at=self._REPORT_T0,
+            report_created_at=self._REPORT_T1,
+            task_status=task_status,
+        )
+
+        item = self._item(client)
+        assert item["state"] == "RESOLVED"
+        assert item["replication_outcome"] == expected_outcome
+        assert item["resolution_method"] == "bops_completion_report"
+        assert item["resolved_at"] == self._REPORT_T1.isoformat()
+
+    def test_failed_conditional_write_retains_prior_items_and_processed_ids(self) -> None:
+        payload = _payload_with_completion_items({}, processed_job_ids={"job-old"})
+        client = self._client(payload)
+        client.put_object = MagicMock(side_effect=_client_error("PreconditionFailed"))
+        before = client._body
+
+        with pytest.raises(ConditionalWriteError):
+            self._merge(
+                client,
+                job_id="job-new",
+                job_created_at=self._REPORT_T0,
+                report_created_at=self._REPORT_T1,
+            )
+
+        assert client._body == before
+        persisted = json.loads(client._body)
+        assert persisted["completion_processed_job_ids"] == ["job-old"]
+        assert persisted["completion_items"] == {}
+
+    @pytest.mark.parametrize(
+        ("first_status", "second_status", "expected_outcome"),
+        [("failed", "succeeded", "COMPLETE"), ("succeeded", "failed", "FAILED")],
+        ids=["newer-success-replaces-failure", "newer-failure-replaces-success"],
+    )
+    def test_newer_report_replaces_prior_outcome(
+        self, first_status: str, second_status: str, expected_outcome: str
+    ) -> None:
+        client = self._client()
+        first_etag = self._merge(
+            client,
+            job_id="job-first",
+            job_created_at=self._REPORT_T0,
+            report_created_at=self._REPORT_T0,
+            task_status=first_status,
+        )
+
+        self._merge(
+            client,
+            job_id="job-second",
+            job_created_at=self._REPORT_T1,
+            report_created_at=self._REPORT_T1,
+            task_status=second_status,
+            etag=first_etag,
+        )
+
+        item = self._item(client)
+        assert item["configs"]["cfg-1"]["job_id"] == "job-second"
+        assert item["replication_outcome"] == expected_outcome
+        assert item["resolved_at"] == self._REPORT_T1.isoformat()
+
+    def test_older_report_arriving_last_records_job_without_regressing_outcome(self) -> None:
+        client = self._client()
+        latest_etag = self._merge(
+            client,
+            job_id="job-new",
+            job_created_at=self._REPORT_T1,
+            report_created_at=self._REPORT_T1,
+            task_status="failed",
+        )
+
+        self._merge(
+            client,
+            job_id="job-old",
+            job_created_at=self._REPORT_T0,
+            report_created_at=self._REPORT_T0,
+            task_status="succeeded",
+            etag=latest_etag,
+        )
+
+        item = self._item(client)
+        payload = json.loads(client._body)
+        assert item["configs"]["cfg-1"]["job_id"] == "job-new"
+        assert item["replication_outcome"] == "FAILED"
+        assert item["resolved_at"] == self._REPORT_T1.isoformat()
+        assert set(payload["completion_processed_job_ids"]) == {"job-new", "job-old"}
+
+    def test_equal_creation_time_uses_job_id_as_deterministic_tie_break(self) -> None:
+        client = self._client()
+        first_etag = self._merge(
+            client,
+            job_id="job-a",
+            job_created_at=self._REPORT_T0,
+            report_created_at=self._REPORT_T0,
+            task_status="failed",
+        )
+
+        self._merge(
+            client,
+            job_id="job-z",
+            job_created_at=self._REPORT_T0,
+            report_created_at=self._REPORT_T1,
+            task_status="succeeded",
+            etag=first_etag,
+        )
+
+        item = self._item(client)
+        assert item["configs"]["cfg-1"]["job_id"] == "job-z"
+        assert item["replication_outcome"] == "COMPLETE"
+        assert item["resolved_at"] == self._REPORT_T1.isoformat()
+
+    def test_empty_zero_task_report_records_only_the_processed_job_id(self) -> None:
+        client = self._client()
+
+        StateStore().merge_completion_report(
+            client,
+            _STATE_BUCKET,
+            _SRC_BUCKET,
+            report=BopsCompletionReport(created_at=self._REPORT_T0, entries=()),
+            replication_config_id="cfg-1",
+            job_id="job-zero-tasks",
+            job_created_at=self._REPORT_T0,
+            current_etag=None,
+        )
+
+        payload = json.loads(client._body)
+        assert payload["completion_items"] == {}
+        assert payload["completion_processed_job_ids"] == ["job-zero-tasks"]
+
+
+# ---------------------------------------------------------------------------
+# Legacy completion-state migration — task 4.2 (Requirements 4.1–4.3)
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyCompletionOutcomeTolerance:
+    """A 1.0.1 state object stays readable, and nothing rewrites it.
+
+    An earlier design migrated legacy 1.0.1 outcomes to ``RESOLVED/UNKNOWN``
+    through ``migrate_legacy_completion_items``. That mutation could never
+    succeed against an existing state object, and its failure branch skipped the
+    affected bucket's whole publish phase on every interval. Upgrading is now a
+    reinstall, so the migration is deleted rather than repaired
+    (design.md Decision 5). What remains required is that deserialization
+    tolerate legacy values, so a rollback to 1.0.1 or a hand-inspected state
+    object does not raise.
+
+    **Validates: Requirements 4.1, 4.2, 4.6**
+    """
+
+    @staticmethod
+    def _item(*, object_key: str, state: CompletionState, outcome: str | None) -> TrackedObject:
+        return TrackedObject(
+            source_bucket=_SRC_BUCKET,
+            object_key=object_key,
+            version_id="v1",
+            configs={"cfg-1": _make_config_context()},
+            state=state,
+            resolved_at=_JOB_T0 if state is CompletionState.RESOLVED else None,
+            resolution_method="source_status_header" if state is CompletionState.RESOLVED else None,
+            replication_outcome=outcome,
+            tagged_at=_JOB_T0,
+            last_modified=_JOB_T1,
+            matched_rules=frozenset({"rule-a"}),
+            destinations=frozenset({"destination-a"}),
+        )
+
+    def test_every_legacy_shape_deserializes_without_raising(self) -> None:
+        items = {
+            _item_key_fn("lifecycle-pending", "v1"): self._item(
+                object_key="lifecycle-pending",
+                state=CompletionState.PENDING,
+                outcome=None,
+            ),
+            _item_key_fn("outcome-pending", "v1"): self._item(
+                object_key="outcome-pending",
+                state=CompletionState.RESOLVED,
+                outcome="PENDING",
+            ),
+            _item_key_fn("outcome-gone", "v1"): self._item(
+                object_key="outcome-gone",
+                state=CompletionState.RESOLVED,
+                outcome="GONE",
+            ),
+            _item_key_fn("outcome-expired", "v1"): self._item(
+                object_key="outcome-expired",
+                state=CompletionState.RESOLVED,
+                outcome="EXPIRED",
+            ),
+        }
+        payload = _payload_with_completion_items(items, processed_job_ids={"job-1"})
+        client = _mock_s3_get_raw_payload(payload)
+
+        read_back = StateStore().get_all_completion_items(
+            client, _STATE_BUCKET, _SRC_BUCKET
+        )
+
+        assert set(read_back) == set(items)
+        assert read_back[_item_key_fn("outcome-gone", "v1")].replication_outcome == "GONE"
+        assert read_back[_item_key_fn("outcome-expired", "v1")].replication_outcome == "EXPIRED"
+        assert read_back[_item_key_fn("outcome-pending", "v1")].replication_outcome == "PENDING"
+        assert (
+            read_back[_item_key_fn("lifecycle-pending", "v1")].state
+            is CompletionState.PENDING
+        )
+
+    def test_reading_legacy_state_writes_nothing(self) -> None:
+        """Deserialization neither mutates lifecycle state nor persists."""
+        items = {
+            _item_key_fn("outcome-gone", "v1"): self._item(
+                object_key="outcome-gone",
+                state=CompletionState.RESOLVED,
+                outcome="GONE",
+            ),
+        }
+        payload = _payload_with_completion_items(items)
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().get_all_completion_items(client, _STATE_BUCKET, _SRC_BUCKET)
+
+        client.put_object.assert_not_called()
+        assert json.loads(client.get_object.return_value["Body"].read()) == payload
+
+    def test_state_store_exposes_no_migration_method(self) -> None:
+        """The deleted path cannot return unnoticed."""
+        assert not hasattr(StateStore, "migrate_legacy_completion_items")
+        assert not any(
+            "migrate" in name for name in dir(StateStore) if not name.startswith("__")
+        ), [name for name in dir(StateStore) if "migrate" in name]
+
+
+# ---------------------------------------------------------------------------
+# Per-job keying, pruning, and the record ceiling — bounded-concurrent-jobs
+# task 1.5 (Requirements 1.1, 1.2, 3.1, 3.2, 3.3, 7.1)
+# ---------------------------------------------------------------------------
+
+
+class _RecordFixtures:
+    """Shared builders for the per-job keying tests below."""
+
+    @staticmethod
+    def _record(
+        job_id: str,
+        *,
+        submitted_at: datetime | None = None,
+        report_diagnosed: bool = False,
+        recovery_scored: bool = False,
+    ) -> SubmissionRecord:
+        return SubmissionRecord(
+            replication_config_id=_SRC_BUCKET,
+            source_bucket=_SRC_BUCKET,
+            job_id=job_id,
+            manifest_key=f"manifests/{_SRC_BUCKET}/{job_id}.csv",
+            submitted_at=submitted_at or _NOW,
+            status=SubmissionStatus.SUBMITTED,
+            watermark_low=_WM_042,
+            watermark_high=_WM_077,
+            report_diagnosed=report_diagnosed,
+            recovery_scored=recovery_scored,
+        )
+
+    @classmethod
+    def _payload(
+        cls,
+        records: dict[str, SubmissionRecord],
+        processed_job_ids: list[str] | None = None,
+    ) -> dict:
+        from src.core.checkpoint_serializer import serialize_submission_record
+
+        payload = json.loads(serialize(_make_state()))
+        payload["submission_records"] = {
+            key: serialize_submission_record(rec) for key, rec in records.items()
+        }
+        if processed_job_ids is not None:
+            payload["completion_processed_job_ids"] = processed_job_ids
+        return payload
+
+    @staticmethod
+    def _written_records(client) -> dict:
+        return json.loads(client.put_object.call_args[1]["Body"])["submission_records"]
+
+
+class TestRecordSubmissionMergesWithoutDisturbingSiblings(_RecordFixtures):
+    """The fix for the data loss: a second submission must not displace the first.
+
+    Overwriting discarded the running job's id, and with it the read of its
+    completion report, the report-missing check that would have noticed, and any
+    watermark_low to roll back to had it later failed (Requirement 1.1).
+    """
+
+    def test_adding_preserves_the_other_jobs_entry(self):
+        client = _mock_s3_get_raw_payload(
+            self._payload({"job-running": self._record("job-running")})
+        )
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG
+        )
+
+        records = self._written_records(client)
+        assert set(records) == {"job-running", "job-new"}
+        assert records["job-running"]["job_id"] == "job-running"
+
+    def test_re_submitting_the_same_job_id_updates_in_place(self):
+        client = _mock_s3_get_raw_payload(
+            self._payload({"job-a": self._record("job-a")})
+        )
+
+        updated = SubmissionRecord(
+            replication_config_id=_SRC_BUCKET,
+            source_bucket=_SRC_BUCKET,
+            job_id="job-a",
+            manifest_key="manifests/updated.csv",
+            submitted_at=_NOW,
+            status=SubmissionStatus.SUBMITTED,
+            consecutive_failures=7,
+        )
+        StateStore().record_submission(client, _STATE_BUCKET, updated, _ETAG)
+
+        records = self._written_records(client)
+        assert set(records) == {"job-a"}
+        assert records["job-a"]["manifest_key"] == "manifests/updated.csv"
+        assert records["job-a"]["consecutive_failures"] == 7
+
+    def test_three_concurrent_jobs_all_persist(self):
+        client = _mock_s3_get_raw_payload(
+            self._payload({
+                "job-1": self._record("job-1"),
+                "job-2": self._record("job-2"),
+            })
+        )
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-3"), _ETAG
+        )
+
+        assert set(self._written_records(client)) == {"job-1", "job-2", "job-3"}
+
+
+class TestRecordSubmissionPrunesSettledRecords(_RecordFixtures):
+    """Settled means terminal AND diagnosed AND (merged OR tracking disabled)."""
+
+    def test_a_settled_record_is_pruned(self):
+        client = _mock_s3_get_raw_payload(
+            self._payload(
+                {"job-done": self._record("job-done", report_diagnosed=True)},
+                processed_job_ids=["job-done"],
+            )
+        )
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+            terminal_job_ids={"job-done"},
+            completion_tracking_enabled=True,
+        )
+
+        assert set(self._written_records(client)) == {"job-new"}
+
+    def test_a_terminal_record_whose_report_is_unread_is_kept(self):
+        """This is exactly the record check_report_handler needs to raise the
+        missing-or-unconsumed report alert, so pruning on terminal alone would
+        delete the evidence the alert exists for (Requirement 3.2)."""
+        client = _mock_s3_get_raw_payload(
+            self._payload(
+                {"job-done": self._record("job-done", report_diagnosed=True)},
+                processed_job_ids=[],
+            )
+        )
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+            terminal_job_ids={"job-done"},
+            completion_tracking_enabled=True,
+        )
+
+        assert set(self._written_records(client)) == {"job-done", "job-new"}
+
+    def test_an_undiagnosed_record_is_kept(self):
+        client = _mock_s3_get_raw_payload(
+            self._payload(
+                {"job-done": self._record("job-done", report_diagnosed=False)},
+                processed_job_ids=["job-done"],
+            )
+        )
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+            terminal_job_ids={"job-done"},
+        )
+
+        assert "job-done" in self._written_records(client)
+
+    def test_a_non_terminal_record_is_kept_even_if_somehow_processed(self):
+        client = _mock_s3_get_raw_payload(
+            self._payload(
+                {"job-running": self._record("job-running", report_diagnosed=True)},
+                processed_job_ids=["job-running"],
+            )
+        )
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+            terminal_job_ids=set(),
+        )
+
+        assert "job-running" in self._written_records(client)
+
+    def test_with_tracking_disabled_the_processed_set_is_not_required(self):
+        """Nothing populates completion_processed_job_ids when tracking is off,
+        so requiring it would mean records never prune (Requirement 3.1)."""
+        client = _mock_s3_get_raw_payload(
+            self._payload(
+                {"job-done": self._record("job-done", report_diagnosed=True)},
+                processed_job_ids=[],
+            )
+        )
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+            terminal_job_ids={"job-done"},
+            completion_tracking_enabled=False,
+        )
+
+        assert set(self._written_records(client)) == {"job-new"}
+
+    def test_the_record_being_written_is_never_pruned(self):
+        """It was submitted moments ago, so it cannot have settled — even if the
+        caller passes its id in terminal_job_ids by mistake."""
+        client = _mock_s3_get_raw_payload(self._payload({}))
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET,
+            self._record("job-new", report_diagnosed=True), _ETAG,
+            terminal_job_ids={"job-new"},
+            completion_tracking_enabled=False,
+        )
+
+        assert set(self._written_records(client)) == {"job-new"}
+
+
+class TestRecordSubmissionCeiling(_RecordFixtures):
+    """The backstop against a record that can never settle (Requirement 3.3)."""
+
+    def _many(self, count: int) -> dict[str, SubmissionRecord]:
+        return {
+            f"job-{index:03d}": self._record(
+                f"job-{index:03d}",
+                submitted_at=_NOW + timedelta(minutes=index),
+            )
+            for index in range(count)
+        }
+
+    def test_the_ceiling_is_the_limit_plus_twenty(self):
+        from src.adapters.state_store import submission_record_ceiling
+
+        assert submission_record_ceiling(3) == 23
+        assert submission_record_ceiling(1) == 21
+
+    def test_no_eviction_at_the_ceiling(self):
+        ceiling = 23  # max_concurrent_jobs=3
+        client = _mock_s3_get_raw_payload(self._payload(self._many(ceiling - 1)))
+
+        with patch("src.adapters.state_store.observability.emit") as emit:
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+                max_concurrent_jobs=3,
+            )
+
+        assert len(self._written_records(client)) == ceiling
+        assert emit.call_count == 0
+
+    def test_above_the_ceiling_the_oldest_is_evicted(self):
+        client = _mock_s3_get_raw_payload(self._payload(self._many(23)))
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+                max_concurrent_jobs=3,
+            )
+
+        records = self._written_records(client)
+        assert len(records) == 23
+        assert "job-000" not in records  # oldest by submitted_at
+        assert "job-001" in records
+        assert "job-new" in records
+
+    def test_each_eviction_emits_an_error_naming_the_job(self):
+        """An error, not an audit entry: this discards tracking state for a job
+        whose outcome is unknown, which is a loss rather than a decision."""
+        client = _mock_s3_get_raw_payload(self._payload(self._many(25)))
+
+        emitted: list = []
+        with patch(
+            "src.adapters.state_store.observability.emit",
+            side_effect=emitted.append,
+        ):
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+                max_concurrent_jobs=3,
+            )
+
+        errors = [e for e in emitted if e.get("event") == "error"]
+        assert len(errors) == 3  # 25 + 1 written, down to 23
+        assert len(self._written_records(client)) == 23
+        named = " ".join(e["cause"] for e in errors)
+        for job_id in ("job-000", "job-001", "job-002"):
+            assert job_id in named
+        assert all(e["bucket"] == _SRC_BUCKET for e in errors)
+
+    def test_the_record_being_written_survives_eviction(self):
+        client = _mock_s3_get_raw_payload(self._payload(self._many(40)))
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().record_submission(
+                client, _STATE_BUCKET,
+                # Oldest of all by submitted_at, and still must survive: it is
+                # the job this write exists to record.
+                self._record("job-new", submitted_at=_NOW - timedelta(days=30)),
+                _ETAG,
+                max_concurrent_jobs=3,
+            )
+
+        assert "job-new" in self._written_records(client)
+
+    def test_a_naive_submitted_at_does_not_break_the_ordering(self):
+        """A hand-edited state object can carry one, and raising here would fail
+        the write that persists a submission record."""
+        records = self._many(23)
+        records["job-naive"] = SubmissionRecord(
+            replication_config_id=_SRC_BUCKET,
+            source_bucket=_SRC_BUCKET,
+            job_id="job-naive",
+            manifest_key="manifests/naive.csv",
+            submitted_at=datetime(2020, 1, 1),  # noqa: DTZ001 — the point of the test
+            status=SubmissionStatus.SUBMITTED,
+        )
+        client = _mock_s3_get_raw_payload(self._payload(records))
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+                max_concurrent_jobs=3,
+            )
+
+        records_written = self._written_records(client)
+        assert len(records_written) == 23
+        assert "job-naive" not in records_written  # oldest, so evicted first
+
+    def test_no_ceiling_when_the_limit_is_not_supplied(self):
+        client = _mock_s3_get_raw_payload(self._payload(self._many(40)))
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+        )
+
+        assert len(self._written_records(client)) == 41
+
+
+# ---------------------------------------------------------------------------
+# One bad record must not cost the rest
+#
+# record_submission now READS the stored records in order to merge into them.
+# Before per-job keying it overwrote them unread, so a corrupt entry healed
+# itself on the next write. Now an unisolated deserialization failure would make
+# every read and every write raise for that bucket, forever, leaving it
+# submitting jobs it never records.
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedRecordIsolation(_RecordFixtures):
+    def _payload_with_bad_entry(self, bad: object) -> dict:
+        from src.core.checkpoint_serializer import serialize_submission_record
+
+        payload = json.loads(serialize(_make_state()))
+        payload["submission_records"] = {
+            "job-good": serialize_submission_record(self._record("job-good")),
+            "job-bad": bad,
+        }
+        return payload
+
+    def test_an_unparseable_status_does_not_lose_the_sibling(self):
+        payload = self._payload_with_bad_entry({
+            "replication_config_id": _SRC_BUCKET,
+            "source_bucket": _SRC_BUCKET,
+            "job_id": "job-bad",
+            "manifest_key": "manifests/bad.csv",
+            "submitted_at": _NOW.isoformat(),
+            "status": "NOT_A_REAL_STATUS",
+        })
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            result = StateStore().get_submission_records(
+                client, _STATE_BUCKET, _SRC_BUCKET
+            )
+
+        assert set(result) == {"job-good"}
+
+    def test_a_missing_required_key_does_not_lose_the_sibling(self):
+        payload = self._payload_with_bad_entry({"job_id": "job-bad"})
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            result = StateStore().get_submission_records(
+                client, _STATE_BUCKET, _SRC_BUCKET
+            )
+
+        assert set(result) == {"job-good"}
+
+    def test_an_unparseable_submitted_at_does_not_lose_the_sibling(self):
+        payload = self._payload_with_bad_entry({
+            "replication_config_id": _SRC_BUCKET,
+            "source_bucket": _SRC_BUCKET,
+            "job_id": "job-bad",
+            "manifest_key": "manifests/bad.csv",
+            "submitted_at": "not-a-timestamp",
+            "status": SubmissionStatus.SUBMITTED.value,
+        })
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            result = StateStore().get_submission_records(
+                client, _STATE_BUCKET, _SRC_BUCKET
+            )
+
+        assert set(result) == {"job-good"}
+
+    def test_record_submission_still_writes_alongside_a_bad_entry(self):
+        """The regression that matters: without isolation the just-submitted job
+        would never be recorded, every run."""
+        payload = self._payload_with_bad_entry({"job_id": "job-bad"})
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG
+            )
+
+        records = self._written_records(client)
+        assert set(records) == {"job-good", "job-new"}
+        # The bad entry is gone from the object, so it stops costing an error.
+        assert "job-bad" not in records
+
+    def test_dropping_a_record_is_reported_as_an_error(self):
+        """Every other path in this module that discards persisted state reports
+        it, because a silent drop is how tracking is lost unnoticed."""
+        payload = self._payload_with_bad_entry({"job_id": "job-bad"})
+        client = _mock_s3_get_raw_payload(payload)
+
+        emitted: list = []
+        with patch(
+            "src.adapters.state_store.observability.emit",
+            side_effect=emitted.append,
+        ):
+            StateStore().get_submission_records(client, _STATE_BUCKET, _SRC_BUCKET)
+
+        errors = [entry for entry in emitted if entry.get("event") == "error"]
+        assert len(errors) == 1
+        assert "job-bad" in errors[0]["cause"]
+        assert errors[0]["bucket"] == _SRC_BUCKET
+
+    def test_dropping_an_empty_job_id_is_reported_as_an_error(self):
+        from src.core.checkpoint_serializer import serialize_submission_record
+
+        payload = json.loads(serialize(_make_state()))
+        payload["submission_records"] = {
+            _SRC_BUCKET: serialize_submission_record(self._record("")),
+        }
+        client = _mock_s3_get_raw_payload(payload)
+
+        emitted: list = []
+        with patch(
+            "src.adapters.state_store.observability.emit",
+            side_effect=emitted.append,
+        ):
+            result = StateStore().get_submission_records(
+                client, _STATE_BUCKET, _SRC_BUCKET
+            )
+
+        assert result == {}
+        errors = [entry for entry in emitted if entry.get("event") == "error"]
+        assert len(errors) == 1
+        assert "no job_id" in errors[0]["cause"]
+
+    def test_a_non_dict_submission_records_yields_nothing_and_reports(self):
+        payload = json.loads(serialize(_make_state()))
+        payload["submission_records"] = ["not", "a", "dict"]
+        client = _mock_s3_get_raw_payload(payload)
+
+        emitted: list = []
+        with patch(
+            "src.adapters.state_store.observability.emit",
+            side_effect=emitted.append,
+        ):
+            result = StateStore().get_submission_records(
+                client, _STATE_BUCKET, _SRC_BUCKET
+            )
+
+        assert result == {}
+        assert [e for e in emitted if e.get("event") == "error"]
+
+
+class TestEvictionPrefersTerminalRecords(_RecordFixtures):
+    """Age alone would evict the longest-running job first — on a
+    bandwidth-bound bucket, the one still replicating. Losing its record
+    discards the watermark_low its rollback needs and the report its objects
+    would be counted from, which is the silent loss this design removes.
+    """
+
+    def _payload_at_ceiling(self) -> dict:
+        # job-000 is the oldest and is still running; job-001..022 are newer and
+        # terminal. Age ordering would take job-000 first.
+        records = {
+            f"job-{index:03d}": self._record(
+                f"job-{index:03d}",
+                submitted_at=_NOW + timedelta(minutes=index),
+            )
+            for index in range(23)
+        }
+        return self._payload(records)
+
+    def _terminal(self) -> set[str]:
+        return {f"job-{index:03d}" for index in range(1, 23)}
+
+    def test_a_terminal_record_is_evicted_before_a_running_one(self):
+        client = _mock_s3_get_raw_payload(self._payload_at_ceiling())
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+                terminal_job_ids=self._terminal(),
+                max_concurrent_jobs=3,
+            )
+
+        records = self._written_records(client)
+        assert len(records) == 23
+        assert "job-000" in records, "the running job's record must survive"
+        assert "job-001" not in records, "the oldest terminal record goes first"
+
+    def test_age_still_orders_within_the_terminal_records(self):
+        client = _mock_s3_get_raw_payload(self._payload_at_ceiling())
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+                terminal_job_ids=self._terminal(),
+                max_concurrent_jobs=1,  # ceiling 21, so 3 must go
+            )
+
+        records = self._written_records(client)
+        assert len(records) == 21
+        assert {"job-001", "job-002", "job-003"}.isdisjoint(records)
+        assert "job-000" in records
+
+    def test_a_running_record_is_evicted_only_when_nothing_else_is_left(self):
+        """Non-vacuous: the preference is an ordering, not an exemption. The
+        ceiling has to stay a hard bound or the state object grows unchecked."""
+        client = _mock_s3_get_raw_payload(self._payload_at_ceiling())
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+                terminal_job_ids=set(),  # nothing terminal to prefer
+                max_concurrent_jobs=3,
+            )
+
+        records = self._written_records(client)
+        assert len(records) == 23
+        assert "job-000" not in records
+
+
+class TestAlertSuppressionIsClearedWithTheRecord(_RecordFixtures):
+    """Suppression is keyed by job_id and is otherwise cleared only when a report
+    is finally merged. An entry is written because a report is missing, which need
+    never recover, so once the record goes nothing could ever match the entry.
+    """
+
+    def test_pruning_a_record_clears_its_suppression_entry(self):
+        payload = self._payload(
+            {"job-done": self._record("job-done", report_diagnosed=True)},
+            processed_job_ids=["job-done"],
+        )
+        payload["completion_report_alerted_configs"] = ["job-done", "job-other"]
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+            terminal_job_ids={"job-done"},
+        )
+
+        written = json.loads(client.put_object.call_args[1]["Body"])
+        assert written["completion_report_alerted_configs"] == ["job-other"]
+
+    def test_eviction_clears_its_suppression_entry(self):
+        records = {
+            f"job-{index:03d}": self._record(
+                f"job-{index:03d}", submitted_at=_NOW + timedelta(minutes=index)
+            )
+            for index in range(23)
+        }
+        payload = self._payload(records)
+        payload["completion_report_alerted_configs"] = ["job-000", "job-022"]
+        client = _mock_s3_get_raw_payload(payload)
+
+        with patch("src.adapters.state_store.observability.emit"):
+            StateStore().record_submission(
+                client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+                max_concurrent_jobs=3,
+            )
+
+        written = json.loads(client.put_object.call_args[1]["Body"])
+        assert written["completion_report_alerted_configs"] == ["job-022"]
+
+    def test_a_retained_records_entry_is_left_alone(self):
+        """Non-vacuous: suppression must still work for a record that is still
+        there, or the missing-report alert repeats every five minutes."""
+        payload = self._payload(
+            {"job-unread": self._record("job-unread", report_diagnosed=True)},
+            processed_job_ids=[],
+        )
+        payload["completion_report_alerted_configs"] = ["job-unread"]
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().record_submission(
+            client, _STATE_BUCKET, self._record("job-new"), _ETAG,
+            terminal_job_ids={"job-unread"},
+        )
+
+        written = json.loads(client.put_object.call_args[1]["Body"])
+        assert written["completion_report_alerted_configs"] == ["job-unread"]
+
+    def test_disabling_a_bucket_clears_every_suppression_entry(self):
+        payload = self._payload({
+            "job-a": self._record("job-a"),
+            "job-b": self._record("job-b"),
+        })
+        payload["completion_report_alerted_configs"] = ["job-a", "job-b"]
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().disable_bucket(
+            client, _STATE_BUCKET, _SRC_BUCKET,
+            reason="breaker tripped", now=_NOW, current_etag=_ETAG,
+        )
+
+        written = json.loads(client.put_object.call_args[1]["Body"])
+        assert written["submission_records"] == {}
+        assert written["completion_report_alerted_configs"] == []
+
+
+# ---------------------------------------------------------------------------
+# mark_report_diagnosed sets either per-job flag, in one write
+# ---------------------------------------------------------------------------
+
+
+class TestMarkJobFlags(_RecordFixtures):
+    def _payload_with(self, **flags) -> dict:
+        record = self._record("job-abc-123", **flags)
+        return self._payload({"job-abc-123": record})
+
+    def _written_record(self, client) -> dict:
+        return self._written_records(client)["job-abc-123"]
+
+    def test_recovery_scored_can_be_set_on_its_own(self):
+        """The case an unreadable report produces: scored, not diagnosed."""
+        client = _mock_s3_get_raw_payload(self._payload_with())
+
+        StateStore().mark_report_diagnosed(
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123",
+            current_etag=_ETAG,
+            report_diagnosed=False,
+            recovery_scored=True,
+        )
+
+        written = self._written_record(client)
+        assert written["recovery_scored"] is True
+        assert written["report_diagnosed"] is False
+
+    def test_both_flags_can_be_set_in_one_write(self):
+        client = _mock_s3_get_raw_payload(self._payload_with())
+
+        StateStore().mark_report_diagnosed(
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123",
+            current_etag=_ETAG,
+            report_diagnosed=True,
+            recovery_scored=True,
+        )
+
+        assert client.put_object.call_count == 1
+        written = self._written_record(client)
+        assert written["recovery_scored"] is True
+        assert written["report_diagnosed"] is True
+
+    def test_a_false_argument_never_clears_a_set_flag(self):
+        """Both flags record something that happened once and cannot un-happen, so
+        no path should be able to clear one."""
+        client = _mock_s3_get_raw_payload(
+            self._payload_with(report_diagnosed=True, recovery_scored=True)
+        )
+
+        StateStore().mark_report_diagnosed(
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123",
+            current_etag=_ETAG,
+            report_diagnosed=False,
+            recovery_scored=False,
+        )
+
+        written = self._written_record(client)
+        assert written["recovery_scored"] is True
+        assert written["report_diagnosed"] is True
+
+    def test_the_default_still_sets_report_diagnosed_only(self):
+        """Keeps the pre-existing single-argument call sites meaning what they did."""
+        client = _mock_s3_get_raw_payload(self._payload_with())
+
+        StateStore().mark_report_diagnosed(
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123", current_etag=_ETAG,
+        )
+
+        written = self._written_record(client)
+        assert written["report_diagnosed"] is True
+        assert written["recovery_scored"] is False
+
+    def test_a_sibling_job_is_untouched(self):
+        payload = self._payload({
+            "job-abc-123": self._record("job-abc-123"),
+            "job-sibling": self._record("job-sibling"),
+        })
+        client = _mock_s3_get_raw_payload(payload)
+
+        StateStore().mark_report_diagnosed(
+            client, _STATE_BUCKET, _SRC_BUCKET, "job-abc-123",
+            current_etag=_ETAG, recovery_scored=True,
+        )
+
+        records = self._written_records(client)
+        assert records["job-abc-123"]["recovery_scored"] is True
+        assert records["job-sibling"]["recovery_scored"] is False

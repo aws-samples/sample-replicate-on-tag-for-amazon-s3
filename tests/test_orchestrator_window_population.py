@@ -113,7 +113,23 @@ def _harness(s3_client, ops, permanent_deletes=None):
     factory = MagicMock()
     factory.create_s3_client.return_value = s3_client
     factory.create_athena_client.return_value = MagicMock()
-    factory.create_s3control_client.return_value = MagicMock()
+    # DescribeJob must report a terminal status. These tests run a second
+    # interval after a submission, and the orchestrator now defers a bucket whose
+    # previous job has not finished, so an unconfigured mock status would make
+    # that second interval a no-op and the test would pass for the wrong reason.
+    s3control_client = MagicMock()
+    s3control_client.describe_job.return_value = {
+        "Job": {
+            "Status": "Complete",
+            "CreationTime": _BASE,
+            "TerminationDate": _BASE,
+            "ProgressSummary": {
+                "NumberOfTasksSucceeded": 1,
+                "NumberOfTasksFailed": 0,
+            },
+        }
+    }
+    factory.create_s3control_client.return_value = s3control_client
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch("src.orchestrator.ClientFactory", return_value=factory))

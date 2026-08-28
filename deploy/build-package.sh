@@ -52,15 +52,32 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$PROJ_ROOT/tmp/deploy/build"
 mkdir -p "$TMP_DIR"
 
-rm -rf "$TMP_DIR/staging"  # clean previous build
-mkdir -p "$TMP_DIR/staging"
-
-cp -r "$PROJ_ROOT/src" "$TMP_DIR/staging/src"  # copy source tree to archive root
-
 ZIP_FILE="$TMP_DIR/code-package.zip"
 rm -f "$ZIP_FILE"
 
-(cd "$TMP_DIR/staging" && zip -r "$ZIP_FILE" src/)  # zip with src/ at root
+# Zip src/ straight from the project root, so src/ lands at the archive root —
+# which is the layout ReplicationLambda's handler path requires.
+#
+# The exclusions are zip's rather than a staging copy's on purpose. An earlier
+# revision staged the tree with `rsync --exclude` first, which works on a
+# developer machine and fails in CI: the `python:3.12-slim` image the
+# `build-package` job runs in has no rsync, and that job installs only `zip`.
+# `zip` is already a declared dependency of this script, so filtering here needs
+# nothing installed and removes the staging copy as well.
+#
+# Anything this script needs beyond `zip` has to be added to the job's
+# `apt-get install` line in `.gitlab-ci.yml`. Reaching for a tool that happens to
+# be on a Mac is the failure mode to avoid: `--build-only` passing locally says
+# nothing about the slim image.
+#
+# Patterns are zip's own, where `*` spans `/`, so a bare `*.pyc` matches at any
+# depth. __pycache__ and .egg-info are matched without a trailing `/*` so the
+# directory entries are excluded too, not just their contents.
+(cd "$PROJ_ROOT" && zip -r "$ZIP_FILE" src/ \
+  -x '*.DS_Store' \
+  -x '*__pycache__*' \
+  -x '*.pyc' \
+  -x '*.egg-info*')
 
 if [[ "$UPLOAD_MODE" == false ]]; then
   cp "$ZIP_FILE" "$OUT_ZIP"  # copy to caller-specified path, no S3 upload

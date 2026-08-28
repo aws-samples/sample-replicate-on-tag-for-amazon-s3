@@ -315,6 +315,23 @@ class TestLambdaFunction:
         assert isinstance(val, _CfnTag) and val.tag == "!Ref"
         assert val.value == "ReinvocationChainLimit"
 
+    def test_max_batch_job_failures_env_var_references_parameter(self, lambda_props):
+        """The parameter has existed since 1.0.0 with no test asserting it
+        actually reaches the function."""
+        env_vars = lambda_props.get("Environment", {}).get("Variables", {})
+        val = env_vars.get("MAX_BATCH_JOB_FAILURES")
+        assert isinstance(val, _CfnTag) and val.tag == "!Ref"
+        assert val.value == "MaxBatchJobFailures"
+
+    def test_max_concurrent_jobs_env_var_references_parameter(self, lambda_props):
+        """bounded-concurrent-jobs task 2.2, Requirement 2.1. Without this wiring
+        the parameter is inert and every deployment silently runs the code
+        default."""
+        env_vars = lambda_props.get("Environment", {}).get("Variables", {})
+        val = env_vars.get("MAX_CONCURRENT_JOBS_PER_BUCKET")
+        assert isinstance(val, _CfnTag) and val.tag == "!Ref"
+        assert val.value == "MaxConcurrentJobsPerBucket"
+
 
 class TestJournalReadRowCapParameter:
     """code-review-remediation verification-notes.md "scaling risk" finding."""
@@ -327,8 +344,19 @@ class TestJournalReadRowCapParameter:
         assert param.get("Type") == "Number"
         assert param.get("Default") == 500000
 
-    def test_min_value_is_1(self, param):
-        assert param.get("MinValue") == 1
+    def test_min_value_is_2_not_1(self, param):
+        """A cap of 1 gives the lookback re-scan window a share of
+        `floor(1 * 0.8) == 0`, leaving no read window that is both bounded and
+        lossless: bounding at the watermark drops the whole window and
+        permanently loses any late arrival in it. 2 is the smallest cap with a
+        non-zero share for both ranges.
+
+        Feature: row-cap-forward-progress
+        """
+        from src.core.manifest_strategy import MIN_JOURNAL_READ_ROW_CAP
+
+        assert param.get("MinValue") == 2
+        assert param.get("MinValue") == MIN_JOURNAL_READ_ROW_CAP
 
 
 class TestReinvocationChainLimitParameter:
@@ -347,6 +375,48 @@ class TestReinvocationChainLimitParameter:
         chain_limit` is always False when chain_limit is 0, so 0 is a
         legitimate (opt-out) value, not an error."""
         assert param.get("MinValue") == 0
+
+
+class TestMaxConcurrentJobsPerBucketParameter:
+    """bounded-concurrent-jobs task 2.2, Requirement 2.1."""
+
+    @pytest.fixture(scope="class")
+    def param(self, template) -> dict:
+        return template.get("Parameters", {}).get("MaxConcurrentJobsPerBucket", {})
+
+    def test_exists_with_default_3(self, param):
+        assert param.get("Type") == "Number"
+        assert param.get("Default") == 3
+
+    def test_min_value_is_1(self, param):
+        """1 reproduces strict serialization, which is a legitimate choice for an
+        operator who wants it. 0 would defer every bucket forever, so the floor is
+        1 rather than 0."""
+        assert param.get("MinValue") == 1
+
+    def test_max_value_is_10(self, param):
+        """A ceiling exists because each concurrent job carries a per-job charge
+        and counts against an account-level Batch Operations quota this Solution
+        does not model."""
+        assert param.get("MaxValue") == 10
+
+    def test_matches_the_orchestrator_default(self, param):
+        """Each governs a different entry path: the template value reaches the
+        Lambda on every CloudFormation deploy, and MAX_CONCURRENT_JOBS_DEFAULT
+        applies when the variable is unset (direct invocation, tests). A silent
+        divergence would mean the deployed bound and the documented bound differ.
+        """
+        from src.orchestrator import MAX_CONCURRENT_JOBS_DEFAULT
+
+        assert param.get("Default") == MAX_CONCURRENT_JOBS_DEFAULT
+
+    def test_it_appears_in_a_parameter_group(self, template):
+        """An ungrouped parameter is invisible in the console's grouped view."""
+        groups = template["Metadata"]["AWS::CloudFormation::Interface"][
+            "ParameterGroups"
+        ]
+        grouped = {name for group in groups for name in group["Parameters"]}
+        assert "MaxConcurrentJobsPerBucket" in grouped
 
 
 class TestJournalLookbackSecondsParameter:
@@ -1827,15 +1897,6 @@ class TestCompletionTrackingParameters:
         assert param.get("Type") == "String"
         assert param.get("Default") == ""
 
-    def test_completion_check_batch_size_parameter(self, template):
-        params = template.get("Parameters", {})
-        assert "CompletionCheckBatchSize" in params, (
-            "CompletionCheckBatchSize parameter not found"
-        )
-        param = params["CompletionCheckBatchSize"]
-        assert param.get("Type") == "Number"
-        assert param.get("Default") == 2000
-
     def test_has_completion_notification_email_condition_exists(self, template):
         conditions = template.get("Conditions", {})
         assert "HasCompletionNotificationEmail" in conditions
@@ -1857,6 +1918,13 @@ class TestCompletionTrackingParameters:
         age gate; every gated candidate goes straight to a Source_Status_Check."""
         params = template.get("Parameters", {})
         assert "CompletionSourceStatusThresholdSeconds" not in params
+
+    @pytest.mark.parametrize(
+        "parameter_name", ["CompletionCheckBatchSize", "CompletionItemTtlHours"]
+    )
+    def test_head_only_completion_parameter_is_absent(self, template, parameter_name):
+        """Report-derived resolution has no batch-size or TTL tuning surface."""
+        assert parameter_name not in template.get("Parameters", {})
 
     def test_no_destination_presence_conditions_exist(self, template):
         conditions = template.get("Conditions", {})
@@ -1887,21 +1955,31 @@ class TestCompletionTrackingParameters:
 
 
 class TestCompletionTrackingIamPolicyPermissions:
-    """Permissions smoke test for deploy/iam-policy.json (task 21.3) — confirms
-    the source-status completion tracking rewrite left ReadSourceObjectTags
-    intact, removed the destination sts:AssumeRole statement, and introduced
-    no unconditional destination-account access."""
+    """Report-derived completion must not restore source-object read grants."""
 
-    def test_read_source_object_tags_still_includes_get_object(self, iam_policy):
-        stmt = next(
-            s for s in iam_policy["Statement"]
-            if s.get("Sid") == "ReadSourceObjectTags"
-        )
-        actions = [a.lower() for a in stmt.get("Action", [])]
-        assert "s3:getobject" in actions, (
-            "ReadSourceObjectTags must still grant s3:GetObject "
-            "(required by the Source_Status_Check HeadObject call)"
-        )
+    def test_source_bucket_permissions_exclude_head_only_actions(self, iam_policy):
+        forbidden = {"s3:getobject", "s3:getobjectversion", "s3:listbucket"}
+        source_statements = []
+        for statement in iam_policy["Statement"]:
+            resources = statement.get("Resource", [])
+            if isinstance(resources, str):
+                resources = [resources]
+            if any(
+                isinstance(resource, str) and "SOURCE_BUCKET_NAME" in resource
+                for resource in resources
+            ):
+                source_statements.append(statement)
+
+        assert source_statements, "Expected a source-bucket replication-config grant"
+        for statement in source_statements:
+            actions = statement.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            action_set = {action.lower() for action in actions}
+            assert action_set.isdisjoint(forbidden), (
+                f"Source-bucket statement {statement.get('Sid')!r} regained "
+                f"HEAD-only permissions: {action_set & forbidden}"
+            )
 
     # LFGranterRole's own sts:AssumeRole (for optional LF admin elevation) is
     # an unrelated pre-existing feature on a different role. It now lives in
@@ -2088,12 +2166,6 @@ class TestCompletionTrackingLambdaEnvVars:
         cond_name = val.value[0] if isinstance(val.value, list) else None
         assert cond_name == "HasCompletionNotificationEmail"
 
-    def test_completion_check_batch_size_env_var(self, lambda_props):
-        env_vars = lambda_props.get("Environment", {}).get("Variables", {})
-        val = env_vars.get("COMPLETION_CHECK_BATCH_SIZE")
-        assert isinstance(val, _CfnTag) and val.tag == "!Ref"
-        assert val.value == "CompletionCheckBatchSize"
-
     def test_no_destination_presence_check_role_arn_env_var(self, lambda_props):
         env_vars = lambda_props.get("Environment", {}).get("Variables", {})
         assert "DESTINATION_PRESENCE_CHECK_ROLE_ARN" not in env_vars
@@ -2105,6 +2177,14 @@ class TestCompletionTrackingLambdaEnvVars:
     def test_no_completion_source_status_threshold_seconds_env_var(self, lambda_props):
         env_vars = lambda_props.get("Environment", {}).get("Variables", {})
         assert "COMPLETION_SOURCE_STATUS_THRESHOLD_SECONDS" not in env_vars
+
+    @pytest.mark.parametrize(
+        "env_var", ["COMPLETION_CHECK_BATCH_SIZE", "COMPLETION_ITEM_TTL_HOURS"]
+    )
+    def test_head_only_completion_env_var_is_absent(self, lambda_props, env_var):
+        """ReplicationLambda must not retain environment wiring for removed HEAD tuning."""
+        env_vars = lambda_props.get("Environment", {}).get("Variables", {})
+        assert env_var not in env_vars
 
 
 # ---------------------------------------------------------------------------
@@ -2179,6 +2259,24 @@ class TestCompletionReportCheckLambda:
         timeout = props.get("Timeout")
         assert isinstance(timeout, int)
         assert timeout <= 300
+
+    def test_memory_uses_retained_completion_check_parameter(
+        self, completion_report_check_lambda, template
+    ):
+        """Requirement 5.4: preserve the report-missing checker's tuning surface."""
+        parameter = template.get("Parameters", {}).get("CompletionCheckMemoryMB", {})
+        assert parameter == {
+            "Type": "Number",
+            "Default": 256,
+            "AllowedValues": [128, 256, 512, 1024, 2048],
+            "Description": "CompletionReportCheckLambda memory in MiB (see deploy/README.md).",
+        }
+
+        memory_size = completion_report_check_lambda.get("Properties", {}).get(
+            "MemorySize"
+        )
+        assert isinstance(memory_size, _CfnTag) and memory_size.tag == "!Ref"
+        assert memory_size.value == "CompletionCheckMemoryMB"
 
     def test_env_vars_present(self, completion_report_check_lambda):
         props = completion_report_check_lambda.get("Properties", {})

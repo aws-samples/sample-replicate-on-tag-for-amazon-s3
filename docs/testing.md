@@ -105,6 +105,54 @@ its record appearing in the journal. Until then the test exits 2, which is
 delivery latency, not a fault. Confirm delivery with a direct Athena count query
 against the journal before concluding anything is broken.
 
+## Reproducing a row-cap-bound drain against a deployed stack
+
+`JournalReadRowCap` covers the whole journal read: the `JournalLookbackSeconds`
+window below the Solution's journal position that each run re-scans for
+late-arriving records, and the new rows above it. The interesting case is a
+re-scan window holding more rows than the cap, which needs no large burst to set
+up — a `JournalReadRowCap` low enough makes a dozen objects sufficient.
+
+Set the cap below the row count the re-scan window will hold and leave
+`JournalLookbackSeconds` at its default:
+
+```bash
+aws cloudformation update-stack --stack-name <stack> --region "$REGION" --use-previous-template --capabilities CAPABILITY_IAM --parameters ParameterKey=JournalReadRowCap,ParameterValue=5 ParameterKey=CodeLocation,UsePreviousValue=true ParameterKey=SourceBucketNames,UsePreviousValue=true --no-cli-pager
+```
+
+Tag a dozen objects that a tag-scoped replication rule matches, wait for journal
+delivery, and let two or more runs complete. Each object produces more than one
+`UPDATE_METADATA` row, so a dozen objects comfortably exceeds a cap of 5 and the
+second run's re-scan window alone holds more rows than the cap.
+
+What a fixed run looks like:
+
+- Each run logs `journal_read_capped` with an `until_timestamp` **above** the
+  bucket's current watermark, a `tail_rows` count, and a `new_row_budget` of at
+  least 1.
+- `Matched_Objects` is non-zero and a job is submitted on each run while
+  unprocessed rows remain.
+- The bucket's watermark in
+  `s3://<state-bucket>/state/<bucket-name>.json` advances every run.
+- Once the re-scan window exceeds its 80% share of the cap, an error entry
+  beginning `Lookback tail shortened to fit the row budget` appears and the
+  `JournalTailShortened` metric is published for the bucket.
+- The backlog clears within `ceil(rows / new_row_budget)` runs.
+
+What a broken run looks like, so the two are distinguishable:
+
+- `journal_read_capped` recurs with an `until_timestamp` **equal to** the
+  watermark, run after run.
+- `Matched_Objects` is 0, no job is submitted, and `duplicate_records_discarded`
+  equals the rows read.
+- The watermark never advances, so every subsequent run reads the identical
+  window.
+- No alarm fires. `BucketErrors` is 0 and `BatchJobsSubmitted` is 0, which a
+  dashboard reads as an idle bucket rather than a stalled one.
+
+Raise `JournalReadRowCap` back to its previous value afterwards. Leaving it at 5
+throttles the stack to a handful of rows per run.
+
 ## Verifying a KMS-enabled deployment
 
 A deployment with the KMS parameters empty never executes the KMS-dependent code

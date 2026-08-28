@@ -12,7 +12,7 @@ from __future__ import annotations
 import io
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -467,6 +467,50 @@ class TestJournalReadRowCapEnvVarMapping:
         env = {**self._REQUIRED, "JOURNAL_READ_ROW_CAP": str(row_cap)}
         result = _build_runtime_config(env)
         assert result["journal_read_row_cap"] == row_cap
+
+
+class TestMaxConcurrentJobsEnvVarMapping:
+    """bounded-concurrent-jobs task 2.3, Requirement 2.1.
+
+    Parse-or-omit, as every other numeric knob here: the orchestrator owns the
+    default and the clamp, so an absent or unparseable value must leave the key
+    out rather than substitute a number this layer invented.
+    """
+
+    _REQUIRED = {
+        "STATE_BUCKET": "s3b",
+        "ATHENA_WORKGROUP": "wg",
+        "ATHENA_OUTPUT_LOCATION": "s3://s3b/r/",
+        "ACCOUNT_ID": "123456789012",
+        "BATCH_OPERATIONS_ROLE_ARN": "arn:aws:iam::123456789012:role/s3rot-batch-operations-role",
+    }
+
+    def test_present_when_set(self):
+        env = {**self._REQUIRED, "MAX_CONCURRENT_JOBS_PER_BUCKET": "5"}
+        result = _build_runtime_config(env)
+        assert result.get("max_concurrent_jobs_per_bucket") == 5
+        assert isinstance(result["max_concurrent_jobs_per_bucket"], int)
+
+    def test_absent_when_env_var_missing(self):
+        result = _build_runtime_config(self._REQUIRED)
+        assert "max_concurrent_jobs_per_bucket" not in result
+
+    def test_absent_when_env_var_empty(self):
+        env = {**self._REQUIRED, "MAX_CONCURRENT_JOBS_PER_BUCKET": ""}
+        result = _build_runtime_config(env)
+        assert "max_concurrent_jobs_per_bucket" not in result
+
+    def test_invalid_value_omitted(self):
+        env = {**self._REQUIRED, "MAX_CONCURRENT_JOBS_PER_BUCKET": "not-a-number"}
+        result = _build_runtime_config(env)
+        assert "max_concurrent_jobs_per_bucket" not in result
+
+    @given(limit=st.integers(min_value=1, max_value=10))
+    @settings(max_examples=20)
+    def test_property_every_permitted_value_is_parsed_as_int(self, limit: int):
+        env = {**self._REQUIRED, "MAX_CONCURRENT_JOBS_PER_BUCKET": str(limit)}
+        result = _build_runtime_config(env)
+        assert result["max_concurrent_jobs_per_bucket"] == limit
 
 
 # ---------------------------------------------------------------------------
@@ -1150,9 +1194,8 @@ class TestSelfReinvocation:
 
 
 class TestCompletionTrackingEnvVarMapping:
-    """Verify COMPLETION_REPORT_TOPIC_ARN and COMPLETION_CHECK_BATCH_SIZE are
-    wired correctly into _build_runtime_config, and that the three env vars
-    superseded by source-status completion tracking
+    """Verify COMPLETION_REPORT_TOPIC_ARN is wired into _build_runtime_config,
+    and that the three env vars superseded by source-status completion tracking
     (DESTINATION_PRESENCE_CHECK_ROLE_ARN, COMPLETION_DESTINATION_REGION,
     COMPLETION_SOURCE_STATUS_THRESHOLD_SECONDS) are no longer read at all."""
 
@@ -1219,47 +1262,6 @@ class TestCompletionTrackingEnvVarMapping:
         result = _build_runtime_config(env)
         assert "completion_report_topic_arn" not in result
 
-    # --- completion_check_batch_size ----------------------------------------
-
-    def test_completion_check_batch_size_present_when_set(self):
-        env = {**self._REQUIRED, "COMPLETION_CHECK_BATCH_SIZE": "500"}
-        result = _build_runtime_config(env)
-        assert result.get("completion_check_batch_size") == 500
-        assert isinstance(result["completion_check_batch_size"], int)
-
-    def test_completion_check_batch_size_absent_when_missing(self):
-        result = _build_runtime_config(self._REQUIRED)
-        assert "completion_check_batch_size" not in result
-
-    def test_completion_check_batch_size_absent_when_empty(self):
-        env = {**self._REQUIRED, "COMPLETION_CHECK_BATCH_SIZE": ""}
-        result = _build_runtime_config(env)
-        assert "completion_check_batch_size" not in result
-
-    def test_completion_check_batch_size_invalid_omitted(self):
-        env = {**self._REQUIRED, "COMPLETION_CHECK_BATCH_SIZE": "not-a-number"}
-        result = _build_runtime_config(env)
-        assert "completion_check_batch_size" not in result
-
-    # --- property: any non-empty numeric-string value parses as int --------
-
-    @given(
-        batch_size=st.integers(min_value=1, max_value=10_000_000),
-    )
-    @settings(max_examples=100)
-    def test_property_completion_check_batch_size_parsed_as_int(self, batch_size):
-        """Property: a non-empty numeric COMPLETION_CHECK_BATCH_SIZE env var
-        string always parses to its corresponding int runtime_config value.
-
-        # Feature: source-status-completion-tracking, Property: completion env var mapping
-        """
-        env = {
-            **self._REQUIRED,
-            "COMPLETION_CHECK_BATCH_SIZE": str(batch_size),
-        }
-        result = _build_runtime_config(env)
-        assert result["completion_check_batch_size"] == batch_size
-
 
 # ---------------------------------------------------------------------------
 # check_report_handler — report-missing detection (design.md Decision 9,
@@ -1304,20 +1306,176 @@ class TestCheckReportHandler:
             status=SubmissionStatus.SUBMITTED,
         )
 
-    def test_report_found_is_a_noop_and_does_not_alert(self):
-        from src.core.models import SubmissionRecord
+    def _run_report_present_case(
+        self, *, terminal_at, logs_client, mock_store, report_written_at=None
+    ):
+        """Drive check_report_handler with the report manifest present.
 
+        *report_written_at* is the manifest's ``LastModified``, which is what the
+        unconsumed-report escalation measures from. Defaults to *terminal_at*,
+        approximating S3 writing the report as the job terminates.
+        """
+        if report_written_at is None:
+            report_written_at = terminal_at
         s3_client = MagicMock()
         config_bytes = json.dumps(self._config()).encode("utf-8")
         s3_client.get_object.side_effect = lambda **kw: {"Body": io.BytesIO(config_bytes)}
 
         s3control_client = MagicMock()
-        terminal_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
         s3control_client.describe_job.return_value = {
-            "Job": {"Status": "Complete", "CreationTime": terminal_at, "TerminationDate": terminal_at}
+            "Job": {
+                "Status": "Complete",
+                "CreationTime": terminal_at,
+                "TerminationDate": terminal_at,
+            }
+        }
+
+        with patch.dict(os.environ, self._ENV, clear=True):
+            with patch(
+                "src.lambda_handler.boto3.client",
+                side_effect=self._make_boto3_clients(s3_client, s3control_client, logs_client),
+            ):
+                with patch(
+                    "src.lambda_handler.state_store_module.StateStore",
+                    return_value=mock_store,
+                ):
+                    with patch(
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=report_written_at,
+                    ):
+                        from src.lambda_handler import check_report_handler
+                        check_report_handler({}, None)
+
+    def _present_report_store(self):
+        mock_store = MagicMock()
+        mock_store.get_alerted_configs.return_value = set()
+        mock_store.get_submission_records.return_value = {"my-bucket": self._rec()}
+        mock_store.completion_job_exists.return_value = False
+        return mock_store
+
+    def test_recently_found_report_is_a_noop_and_does_not_alert(self):
+        """A report written recently is left for handler() to read and merge."""
+        logs_client = MagicMock()
+        mock_store = self._present_report_store()
+
+        self._run_report_present_case(
+            terminal_at=datetime.now(timezone.utc) - timedelta(hours=1),  # noqa: UP017
+            logs_client=logs_client,
+            mock_store=mock_store,
+        )
+
+        mock_store.add_alerted_config.assert_not_called()
+        logs_client.put_log_events.assert_not_called()
+
+    def test_a_long_running_job_gets_full_grace_after_its_report_appears(self):
+        """The grace period does not shrink with how long the job ran.
+
+        The escalation measures from when the report was written, not from a job
+        timestamp. Measuring from ``CreationTime`` — the fallback when
+        ``TerminationDate`` is absent — would give a job that ran for days no
+        grace at all, alerting the moment its report appeared.
+        """
+        logs_client = MagicMock()
+        mock_store = self._present_report_store()
+        now = datetime.now(timezone.utc)  # noqa: UP017
+
+        self._run_report_present_case(
+            terminal_at=now - timedelta(days=3),  # a job that ran for days
+            report_written_at=now - timedelta(minutes=5),  # report just appeared
+            logs_client=logs_client,
+            mock_store=mock_store,
+        )
+
+        mock_store.add_alerted_config.assert_not_called()
+        logs_client.put_log_events.assert_not_called()
+
+    def test_present_but_unconsumed_report_alerts_with_its_own_reason(self):
+        """A report the Solution has had days to read and has not escalates.
+
+        Reaching the manifest check means the job is terminal, invoked a task,
+        and is not recorded as processed. A manifest that has existed that long
+        under those conditions is a report the Solution cannot read
+        (Requirement 1.7).
+        """
+        logs_client = MagicMock()
+        mock_store = self._present_report_store()
+        now = datetime.now(timezone.utc)  # noqa: UP017
+
+        self._run_report_present_case(
+            terminal_at=now - timedelta(hours=50),
+            report_written_at=now - timedelta(hours=49),
+            logs_client=logs_client,
+            mock_store=mock_store,
+        )
+
+        mock_store.add_alerted_config.assert_called_once()
+        logs_client.put_log_events.assert_called_once()
+        logged = json.loads(
+            logs_client.put_log_events.call_args.kwargs["logEvents"][0]["message"]
+        )
+        assert logged["event"] == "completion_report_missing"
+        assert logged["reason"] == "present but unconsumed"
+        assert "without being consumed" in logged["cause"]
+
+    def test_absent_report_alert_keeps_the_missing_reason(self):
+        """The original condition is unchanged and distinguishable."""
+        s3_client = MagicMock()
+        config_bytes = json.dumps(self._config()).encode("utf-8")
+        s3_client.get_object.side_effect = lambda **kw: {"Body": io.BytesIO(config_bytes)}
+
+        s3control_client = MagicMock()
+        terminal_at = datetime.now(timezone.utc) - timedelta(hours=2)  # noqa: UP017
+        s3control_client.describe_job.return_value = {
+            "Job": {
+                "Status": "Complete",
+                "CreationTime": terminal_at,
+                "TerminationDate": terminal_at,
+            }
         }
         logs_client = MagicMock()
+        mock_store = self._present_report_store()
 
+        with patch.dict(os.environ, self._ENV, clear=True):
+            with patch(
+                "src.lambda_handler.boto3.client",
+                side_effect=self._make_boto3_clients(s3_client, s3control_client, logs_client),
+            ):
+                with patch(
+                    "src.lambda_handler.state_store_module.StateStore",
+                    return_value=mock_store,
+                ):
+                    with patch(
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
+                    ):
+                        from src.lambda_handler import check_report_handler
+                        check_report_handler({}, None)
+
+        logs_client.put_log_events.assert_called_once()
+        logged = json.loads(
+            logs_client.put_log_events.call_args.kwargs["logEvents"][0]["message"]
+        )
+        assert logged["reason"] == "missing"
+        assert "has not appeared" in logged["cause"]
+
+    def test_zero_invoked_task_job_skips_report_check_and_alert(self):
+        s3_client = MagicMock()
+        config_bytes = json.dumps(self._config()).encode("utf-8")
+        s3_client.get_object.side_effect = lambda **_kwargs: {"Body": io.BytesIO(config_bytes)}
+        s3control_client = MagicMock()
+        terminal_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        s3control_client.describe_job.return_value = {
+            "Job": {
+                "Status": "Complete",
+                "CreationTime": terminal_at,
+                "TerminationDate": terminal_at,
+                "ProgressSummary": {
+                    "NumberOfTasksSucceeded": 0,
+                    "NumberOfTasksFailed": 0,
+                },
+            }
+        }
+        logs_client = MagicMock()
         mock_store = MagicMock()
         mock_store.get_alerted_configs.return_value = set()
         mock_store.get_submission_records.return_value = {"my-bucket": self._rec()}
@@ -1333,12 +1491,12 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=True,
-                    ):
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                    ) as mock_manifest_exists:
                         from src.lambda_handler import check_report_handler
                         check_report_handler({}, None)
 
+        mock_manifest_exists.assert_not_called()
         mock_store.add_alerted_config.assert_not_called()
         logs_client.put_log_events.assert_not_called()
 
@@ -1377,8 +1535,8 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
@@ -1390,6 +1548,44 @@ class TestCheckReportHandler:
         sns_client.publish.assert_called_once()
         call_kwargs = sns_client.publish.call_args.kwargs
         assert call_kwargs["TopicArn"] == "arn:aws:sns:us-east-1:123456789012:t"
+
+    def test_sidecars_only_are_treated_as_a_missing_report(self):
+        """A result sidecar does not count until the exact manifest exists."""
+        s3_client = MagicMock()
+        config_bytes = json.dumps(self._config()).encode("utf-8")
+        s3_client.get_object.side_effect = lambda **_kwargs: {"Body": io.BytesIO(config_bytes)}
+        s3control_client = MagicMock()
+        terminal_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        s3control_client.describe_job.return_value = {
+            "Job": {"Status": "Complete", "CreationTime": terminal_at, "TerminationDate": terminal_at}
+        }
+        logs_client = MagicMock()
+        mock_store = MagicMock()
+        mock_store.get_alerted_configs.return_value = set()
+        mock_store.get_submission_records.return_value = {"my-bucket": self._rec()}
+        mock_store.completion_job_exists.return_value = False
+
+        with patch.dict(os.environ, self._ENV, clear=True):
+            with patch(
+                "src.lambda_handler.boto3.client",
+                side_effect=self._make_boto3_clients(s3_client, s3control_client, logs_client),
+            ):
+                with patch(
+                    "src.lambda_handler.state_store_module.StateStore",
+                    return_value=mock_store,
+                ):
+                    with patch(
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
+                    ) as mock_manifest_exists:
+                        with patch("src.lambda_handler.datetime") as mock_dt:
+                            mock_dt.now.return_value = datetime(2024, 1, 1, 2, tzinfo=timezone.utc)
+                            from src.lambda_handler import check_report_handler
+                            check_report_handler({}, None)
+
+        mock_manifest_exists.assert_called_once()
+        mock_store.add_alerted_config.assert_called_once()
+        logs_client.put_log_events.assert_called_once()
 
     def test_report_absent_but_not_overdue_does_not_escalate(self):
         s3_client = MagicMock()
@@ -1420,8 +1616,8 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
@@ -1484,7 +1680,7 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
                     ) as mock_exists:
                         from src.lambda_handler import check_report_handler
                         check_report_handler({}, None)
@@ -1492,31 +1688,38 @@ class TestCheckReportHandler:
 
         mock_store.add_alerted_config.assert_not_called()
 
-    def test_legacy_config_id_keyed_record_is_skipped_not_iterated(self):
-        """Requirement 3.4: the per-config_id fallback is removed. A
-        submission_records dict that carries only a legacy
-        replication_config_id-keyed entry (no bucket_name sentinel key) is
-        no longer iterated — the bucket is skipped entirely, with no
-        describe_job call and no alert.
-
-        This is the load-bearing regression test for Requirement 3.4: it
-        fails if the old ``else: records_to_check = [... for config_id, rec
-        in prior_submissions.items()]`` fallback is restored, since that
-        fallback would call describe_job for the legacy-keyed record.
+    def test_a_record_under_an_unexpected_key_is_still_checked(self):
+        """Requirement 1.4: the handler iterates the records rather than
+        indexing one, so the dict key is irrelevant to whether a record is
+        checked. The previous single-key lookup meant the one mechanism built to
+        detect an unread report was blind to a record stored under any other key.
         """
         s3_client = MagicMock()
         config_bytes = json.dumps(self._config()).encode("utf-8")
         s3_client.get_object.side_effect = lambda **kw: {"Body": io.BytesIO(config_bytes)}
 
+        terminal_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
         s3control_client = MagicMock()
+        s3control_client.describe_job.return_value = {
+            "Job": {
+                "Status": "Complete",
+                "CreationTime": terminal_at,
+                "TerminationDate": terminal_at,
+                "ProgressSummary": {
+                    "NumberOfTasksSucceeded": 1, "NumberOfTasksFailed": 0,
+                },
+            }
+        }
         logs_client = MagicMock()
 
         mock_store = MagicMock()
         mock_store.get_alerted_configs.return_value = set()
-        # Only a legacy config_id key present — no "my-bucket" sentinel key.
         mock_store.get_submission_records.return_value = {
             "cfg-legacy": self._rec(config_id="cfg-legacy", job_id="job-legacy")
         }
+        mock_store.completion_job_exists.return_value = False
+
+        fixed_now = datetime(2024, 1, 1, 2, tzinfo=timezone.utc)
 
         with patch.dict(os.environ, self._ENV, clear=True):
             with patch(
@@ -1527,12 +1730,19 @@ class TestCheckReportHandler:
                     "src.lambda_handler.state_store_module.StateStore",
                     return_value=mock_store,
                 ):
-                    from src.lambda_handler import check_report_handler
-                    check_report_handler({}, None)
+                    with patch(
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
+                    ):
+                        with patch("src.lambda_handler.datetime") as mock_dt:
+                            mock_dt.now.return_value = fixed_now
+                            from src.lambda_handler import check_report_handler
+                            check_report_handler({}, None)
 
-        s3control_client.describe_job.assert_not_called()
-        mock_store.completion_job_exists.assert_not_called()
-        mock_store.add_alerted_config.assert_not_called()
+        s3control_client.describe_job.assert_called_once()
+        assert s3control_client.describe_job.call_args.kwargs["JobId"] == "job-legacy"
+        mock_store.add_alerted_config.assert_called_once()
+        assert mock_store.add_alerted_config.call_args[0][3] == "job-legacy"
 
     def test_already_confirmed_job_is_skipped(self):
         """completion_job_exists True — nothing to detect as missing."""
@@ -1592,8 +1802,8 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
@@ -1655,8 +1865,8 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
@@ -1666,16 +1876,12 @@ class TestCheckReportHandler:
         # bucket-good must still have been alerted despite bucket-bad raising.
         mock_store.add_alerted_config.assert_called_once()
         call_args = mock_store.add_alerted_config.call_args
-        assert call_args[0][3] == "bucket-good"
+        assert call_args[0][3] == "job-good"
 
-    def test_migrated_single_bucket_sentinel_record_uses_bucket_name_as_identity(self):
-        """design.md D6 (task 6.1): once a bucket has migrated (its
-        ``submission_records`` dict holds exactly one entry keyed by the
-        per-bucket sentinel, ``bucket_name`` itself), escalation/suppression
-        must use ``bucket_name`` as the identity passed to
-        ``get_alerted_configs``/``add_alerted_config`` and to
-        ``_publish_report_missing_alert``'s ``replication_config_id`` — not
-        any legacy config_id string (there isn't one to use)."""
+    def test_the_alert_identity_is_the_job_id(self):
+        """Requirement 1.5: suppression is per job. Keying it on the bucket would
+        let one job's alert hide every other job's for that bucket, which is the
+        same blindness the single-record lookup produced."""
         s3_client = MagicMock()
         config_bytes = json.dumps(self._config()).encode("utf-8")
         s3_client.get_object.side_effect = lambda **kw: {"Body": io.BytesIO(config_bytes)}
@@ -1690,10 +1896,8 @@ class TestCheckReportHandler:
 
         mock_store = MagicMock()
         mock_store.get_alerted_configs.return_value = set()
-        # Migrated form: the ONLY key in submission_records is the bucket's
-        # own name (record_submission's D3 collapse, task 3.1/4.2).
         mock_store.get_submission_records.return_value = {
-            "my-bucket": self._rec(config_id="my-bucket", job_id="job-migrated"),
+            "job-migrated": self._rec(config_id="my-bucket", job_id="job-migrated"),
         }
         mock_store.completion_job_exists.return_value = False
 
@@ -1712,8 +1916,8 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
@@ -1722,26 +1926,25 @@ class TestCheckReportHandler:
 
         mock_store.add_alerted_config.assert_called_once()
         add_call_args = mock_store.add_alerted_config.call_args
-        assert add_call_args[0][3] == "my-bucket"
+        assert add_call_args[0][3] == "job-migrated"
 
         mock_store.get_alerted_configs.assert_called_once()
 
-        # The email body is prose; the per-bucket sentinel identity is asserted
-        # against the structured log entry, which retains the field.
+        # The email body is prose; the identity is asserted against the
+        # structured log entry, which retains the field.
         logged = json.loads(
             logs_client.put_log_events.call_args.kwargs["logEvents"][0]["message"]
         )
-        assert logged["replication_config_id"] == "my-bucket"
+        assert logged["replication_config_id"] == "job-migrated"
 
         body = sns_client.publish.call_args.kwargs["Message"]
         assert "my-bucket" in body
         assert "completion report has never appeared" in body
         assert "reporting gap, not a confirmed replication failure" in body
 
-    def test_legacy_keyed_records_without_bucket_sentinel_are_skipped(self):
-        """After removal of the per-config_id fallback: a bucket whose
-        submission_records has only legacy per-config_id keys (no
-        bucket-name sentinel key) is now skipped — no check is performed."""
+    def test_every_record_for_a_bucket_is_checked_not_just_one(self):
+        """Requirement 1.4. A bucket may have several jobs outstanding at once,
+        and a missing report for any of them has to be detected."""
         s3_client = MagicMock()
         config_bytes = json.dumps(self._config()).encode("utf-8")
         s3_client.get_object.side_effect = lambda **kw: {"Body": io.BytesIO(config_bytes)}
@@ -1749,16 +1952,22 @@ class TestCheckReportHandler:
         terminal_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
         s3control_client = MagicMock()
         s3control_client.describe_job.return_value = {
-            "Job": {"Status": "Failed", "CreationTime": terminal_at, "TerminationDate": terminal_at}
+            "Job": {
+                "Status": "Failed",
+                "CreationTime": terminal_at,
+                "TerminationDate": terminal_at,
+                "ProgressSummary": {
+                    "NumberOfTasksSucceeded": 1, "NumberOfTasksFailed": 0,
+                },
+            }
         }
         logs_client = MagicMock()
 
         mock_store = MagicMock()
         mock_store.get_alerted_configs.return_value = set()
-        # Legacy form: two distinct per-config_id keys, no "my-bucket" key.
         mock_store.get_submission_records.return_value = {
-            "cfg-legacy-1": self._rec(config_id="cfg-legacy-1", job_id="job-legacy-1"),
-            "cfg-legacy-2": self._rec(config_id="cfg-legacy-2", job_id="job-legacy-2"),
+            "job-a": self._rec(config_id="my-bucket", job_id="job-a"),
+            "job-b": self._rec(config_id="my-bucket", job_id="job-b"),
         }
         mock_store.completion_job_exists.return_value = False
 
@@ -1774,27 +1983,82 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
                             from src.lambda_handler import check_report_handler
                             check_report_handler({}, None)
 
-        # No alert is fired — the bucket is skipped because no sentinel key exists
-        mock_store.add_alerted_config.assert_not_called()
-        s3control_client.describe_job.assert_not_called()
+        described = {
+            call.kwargs["JobId"]
+            for call in s3control_client.describe_job.call_args_list
+        }
+        assert described == {"job-a", "job-b"}
+        alerted = {
+            call[0][3] for call in mock_store.add_alerted_config.call_args_list
+        }
+        assert alerted == {"job-a", "job-b"}
 
-    def test_migrated_bucket_sentinel_escalation_fires_at_most_once(self):
-        """Requirement 8.5 / design.md D6: for a migrated bucket (the only
-        ``submission_records`` key is the bucket-name sentinel), a
-        persistently overdue-and-missing report must escalate on the first
-        ``check_report_handler`` invocation and then be suppressed on the
-        next scheduled invocation, once ``add_alerted_config``'s effect is
-        reflected in ``get_alerted_configs``'s return value — exactly the
-        same suppression contract already proven for the legacy per-config_id
-        identity, now applied to the bucket-name identity."""
+    def test_one_jobs_suppression_does_not_suppress_another(self):
+        """Requirement 1.5. Per-bucket suppression would hide job-b entirely."""
+        s3_client = MagicMock()
+        config_bytes = json.dumps(self._config()).encode("utf-8")
+        s3_client.get_object.side_effect = lambda **kw: {"Body": io.BytesIO(config_bytes)}
+
+        terminal_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        s3control_client = MagicMock()
+        s3control_client.describe_job.return_value = {
+            "Job": {
+                "Status": "Failed",
+                "CreationTime": terminal_at,
+                "TerminationDate": terminal_at,
+                "ProgressSummary": {
+                    "NumberOfTasksSucceeded": 1, "NumberOfTasksFailed": 0,
+                },
+            }
+        }
+        logs_client = MagicMock()
+
+        mock_store = MagicMock()
+        # job-a already alerted; a bucket-name entry left by an earlier build is
+        # present too and must be inert.
+        mock_store.get_alerted_configs.return_value = {"job-a", "my-bucket"}
+        mock_store.get_submission_records.return_value = {
+            "job-a": self._rec(config_id="my-bucket", job_id="job-a"),
+            "job-b": self._rec(config_id="my-bucket", job_id="job-b"),
+        }
+        mock_store.completion_job_exists.return_value = False
+
+        fixed_now = datetime(2024, 1, 1, 2, tzinfo=timezone.utc)
+
+        with patch.dict(os.environ, self._ENV, clear=True):
+            with patch(
+                "src.lambda_handler.boto3.client",
+                side_effect=self._make_boto3_clients(s3_client, s3control_client, logs_client),
+            ):
+                with patch(
+                    "src.lambda_handler.state_store_module.StateStore",
+                    return_value=mock_store,
+                ):
+                    with patch(
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
+                    ):
+                        with patch("src.lambda_handler.datetime") as mock_dt:
+                            mock_dt.now.return_value = fixed_now
+                            from src.lambda_handler import check_report_handler
+                            check_report_handler({}, None)
+
+        mock_store.add_alerted_config.assert_called_once()
+        assert mock_store.add_alerted_config.call_args[0][3] == "job-b"
+
+    def test_per_job_escalation_fires_at_most_once(self):
+        """Requirement 8.5: a persistently overdue-and-missing report escalates on
+        the first ``check_report_handler`` invocation and is suppressed on the
+        next, once ``add_alerted_config``'s effect is reflected in
+        ``get_alerted_configs``'s return value — now under the job's identity."""
         s3_client = MagicMock()
         config_bytes = json.dumps(self._config()).encode("utf-8")
         s3_client.get_object.side_effect = lambda **kw: {"Body": io.BytesIO(config_bytes)}
@@ -1811,11 +2075,9 @@ class TestCheckReportHandler:
         # First invocation: not yet alerted. Second invocation (simulating
         # the next 5-minute schedule): add_alerted_config's effect from the
         # first invocation has persisted.
-        mock_store.get_alerted_configs.side_effect = [set(), {"my-bucket"}]
-        # Migrated form: the ONLY key in submission_records is the bucket's
-        # own name (record_submission's D3 collapse, task 3.1/4.2).
+        mock_store.get_alerted_configs.side_effect = [set(), {"job-migrated"}]
         mock_store.get_submission_records.return_value = {
-            "my-bucket": self._rec(config_id="my-bucket", job_id="job-migrated"),
+            "job-migrated": self._rec(config_id="my-bucket", job_id="job-migrated"),
         }
         mock_store.completion_job_exists.return_value = False
 
@@ -1834,8 +2096,8 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
@@ -1846,13 +2108,13 @@ class TestCheckReportHandler:
 
         mock_store.add_alerted_config.assert_called_once()
         add_call_args = mock_store.add_alerted_config.call_args
-        assert add_call_args[0][3] == "my-bucket"
+        assert add_call_args[0][3] == "job-migrated"
         logs_client.put_log_events.assert_called_once()
         sns_client.publish.assert_called_once()
 
         # Second invocation (next 5-minute schedule): get_alerted_configs now
         # reflects the first invocation's add_alerted_config call, so the
-        # already-alerted bucket must be suppressed — no second escalation.
+        # already-alerted job must be suppressed — no second escalation.
         with patch.dict(os.environ, env, clear=True):
             with patch(
                 "src.lambda_handler.boto3.client",
@@ -1865,8 +2127,8 @@ class TestCheckReportHandler:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
@@ -1984,11 +2246,11 @@ class TestProperty20BatchIsolation:
 
         from src.core.models import SubmissionRecord, SubmissionStatus
 
-        # Each bucket has exactly one record keyed by its own name (the sentinel)
+        # Each bucket has one record, keyed by its job_id.
         def get_submission_records(client, state_bucket, bucket_name):
             idx = int(bucket_name.split("-")[1])
             return {
-                bucket_name: SubmissionRecord(
+                f"job-{idx}": SubmissionRecord(
                     replication_config_id=bucket_name,
                     source_bucket=bucket_name,
                     job_id=f"job-{idx}",
@@ -2022,15 +2284,15 @@ class TestProperty20BatchIsolation:
                     return_value=mock_store,
                 ):
                     with patch(
-                        "src.lambda_handler.bops_report_reader.report_object_exists",
-                        return_value=False,
+                        "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                        return_value=None,
                     ):
                         with patch("src.lambda_handler.datetime") as mock_dt:
                             mock_dt.now.return_value = fixed_now
                             from src.lambda_handler import check_report_handler
                             check_report_handler({}, None)
 
-        expected_alerted = {f"bucket-{i}" for i in range(num_configs) if i not in failing}
+        expected_alerted = {f"job-{i}" for i in range(num_configs) if i not in failing}
         assert set(alerted_configs) == expected_alerted
 
     @staticmethod
@@ -2177,8 +2439,8 @@ class TestReportMissingAlertSuppressionAcrossInvocations:
                 side_effect=lambda service, **kw: clients[service],
             ):
                 with patch(
-                    "src.lambda_handler.bops_report_reader.report_object_exists",
-                    return_value=False,
+                    "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                    return_value=None,
                 ):
                     with patch("src.lambda_handler.datetime") as mock_dt:
                         mock_dt.now.return_value = self._NOW
@@ -2204,7 +2466,8 @@ class TestReportMissingAlertSuppressionAcrossInvocations:
         self._invoke(fake_s3, MagicMock(), MagicMock())
 
         state = fake_s3.body_of(f"state/{self._SOURCE_BUCKET}.json")
-        assert state["completion_report_alerted_configs"] == [self._SOURCE_BUCKET]
+        # Suppression is keyed by job_id, not by the bucket.
+        assert state["completion_report_alerted_configs"] == [self._JOB_ID]
         # Every other top-level key survives the suppression write.
         assert self._SOURCE_BUCKET in state["submission_records"]
 
@@ -2219,7 +2482,7 @@ class TestReportMissingAlertSuppressionAcrossInvocations:
 
         self._invoke(fake_s3, MagicMock(), sns_client)
         StateStore().clear_alerted_config(
-            fake_s3, self._STATE_BUCKET, self._SOURCE_BUCKET, self._SOURCE_BUCKET
+            fake_s3, self._STATE_BUCKET, self._SOURCE_BUCKET, self._JOB_ID
         )
         self._invoke(fake_s3, MagicMock(), sns_client)
 
@@ -2313,8 +2576,8 @@ class TestCheckReportHandlerStateWriteEncryption:
                 side_effect=lambda service, **kw: clients[service],
             ):
                 with patch(
-                    "src.lambda_handler.bops_report_reader.report_object_exists",
-                    return_value=False,
+                    "src.lambda_handler.bops_report_reader.report_manifest_written_at",
+                    return_value=None,
                 ):
                     with patch("src.lambda_handler.datetime") as mock_dt:
                         mock_dt.now.return_value = self._NOW

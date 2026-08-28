@@ -1,374 +1,327 @@
-"""BOPS_Completion_Report reader — list-then-read of the S3 Batch Operations
-job completion report.
-
-This adapter reads a BOPS-service-written CSV under a service-generated
-subpath, with its own column schema. The report is authored and located by
-S3 Batch Operations rather than by the Solution, and accessed with a
-list-then-read pattern rather than a direct single-object read.
-
-The report transposes ``ErrorCode`` and ``HTTPStatusCode`` relative to the
-order AWS documents, and the layout belongs to the report schema version named
-by ``Report.Format`` rather than being fixed. This reader therefore resolves
-those two columns by content instead of by position, so it parses either order
-correctly. See ``_REPORT_COLUMN_ORDER_NOTE`` in this module before altering
-that.
-
-S3 Batch Operations writes the report under a service-generated subpath
-(``job-<job_id>/results/<manifest-hash>.csv``) of the configured
-``Report.Prefix``, so the reader must list every object under the prefix
-before reading any of them — the exact final key is not knowable in
-advance.
-
-Requirements: 2.1, 2.7
-"""
+"""Read and validate S3 Batch Operations completion reports."""
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
 import io
+import json
+from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import unquote
 
-from src.core.models import ManifestEntry
+from botocore.exceptions import ClientError
 
-# ---------------------------------------------------------------------------
-# read_bops_completion_report — public interface
-# ---------------------------------------------------------------------------
-
-
-def read_bops_completion_report(
-    s3_client,
-    state_bucket: str,
-    report_prefix: str,
-) -> list[ManifestEntry]:
-    """List every CSV object under ``report_prefix``, read and parse each,
-    and return one ``ManifestEntry`` per row.
-
-    Parses all seven columns of the report CSV; every listed object version is
-    included regardless of its per-task ``TaskStatus``, since even a
-    task-failed object has a source replication status worth reporting
-    (design.md Decision 4). ``ErrorCode`` is empty (parsed as ``None``) for a
-    succeeded task, and carries the service error code (e.g.
-    ``InitiateReplicationNotPermitted``, ``SrcObjectNotEligible``) for a
-    failed one.
-
-    The column order used is the verified one, not the documented one — see
-    ``_REPORT_COLUMN_ORDER_NOTE``.
-
-    An empty ``VersionId`` column (an unversioned bucket) is parsed as
-    ``version_id=None`` — the null-version marker used elsewhere in the
-    Solution's manifest handling (Requirement 2.3).
-
-    Parameters
-    ----------
-    s3_client:
-        A boto3 ``s3`` client scoped to the account/region that owns
-        ``state_bucket``.
-    state_bucket:
-        The State_Bucket where the BOPS_Completion_Report was written.
-    report_prefix:
-        The prefix passed as ``Report.Prefix`` to ``submit_batch_job`` for
-        this job — the reader lists every object under this prefix
-        (paginating as needed) rather than reading one specific key,
-        because the service-generated subpath under it is not knowable in
-        advance.
-
-    Returns
-    -------
-    list[ManifestEntry]
-        One entry per report row, across every CSV object found under
-        ``report_prefix``, in listing then row order. Empty when no report
-        object exists yet under the prefix.
-
-    Raises
-    ------
-    Exception
-        Any exception from the underlying S3 ``list_objects_v2`` or
-        ``get_object`` calls is propagated unchanged — the caller (the
-        orchestrator's per-config ``DescribeJob`` loop) is responsible for
-        isolating this failure per Requirement 6.1.
-
-    Requirements: 2.1, 2.7
-    """
-    entries: list[ManifestEntry] = []
-    for key in _list_report_object_keys(s3_client, state_bucket, report_prefix):
-        if not _is_report_results_csv_key(key):
-            # Skip the job's manifest.json and manifest.json.md5 sidecar
-            # objects written alongside the results/ CSV under the same
-            # prefix — only the results/*.csv files contain per-object
-            # completion rows; the sidecars are not CSV and would otherwise
-            # be misparsed as garbage rows.
-            continue
-        response = s3_client.get_object(Bucket=state_bucket, Key=key)
-        csv_text = response["Body"].read().decode("utf-8")
-        entries.extend(_parse_report_csv(csv_text))
-    return entries
-
-
-# ---------------------------------------------------------------------------
-# report_object_exists — public interface (design.md Decision 9)
-# ---------------------------------------------------------------------------
-
-
-def report_object_exists(
-    s3_client,
-    state_bucket: str,
-    report_prefix: str,
-) -> bool:
-    """Existence-only check for whether a BOPS_Completion_Report object has
-    appeared under ``report_prefix``.
-
-    A lighter variant of :func:`read_bops_completion_report`'s list step:
-    issues a single ``list_objects_v2`` call (capped at one page via
-    ``MaxKeys=1`` — a single listed object is enough to answer the
-    existence question, so there is no need to paginate through every
-    object under the prefix) and returns whether any object was found. Does
-    NOT read or parse any CSV content — used by ``check_report_handler``
-    (design.md Decision 9) to cheaply detect whether a terminal job's report
-    has appeared, without paying the cost of a full read-and-parse.
-
-    Parameters
-    ----------
-    s3_client:
-        A boto3 ``s3`` client scoped to the account/region that owns
-        ``state_bucket``.
-    state_bucket:
-        The State_Bucket where the BOPS_Completion_Report would be written.
-    report_prefix:
-        The prefix passed as ``Report.Prefix`` to ``submit_batch_job`` for
-        the job being checked.
-
-    Returns
-    -------
-    bool
-        ``True`` if at least one object exists under ``report_prefix``,
-        ``False`` if the prefix is empty (no report has appeared yet).
-
-    Raises
-    ------
-    Exception
-        Any exception from the underlying ``list_objects_v2`` call is
-        propagated unchanged — the caller (``check_report_handler``) is
-        responsible for isolating this failure per Requirement 8.8.
-
-    Requirements: 8.1
-    """
-    response = s3_client.list_objects_v2(
-        Bucket=state_bucket, Prefix=report_prefix, MaxKeys=1
-    )
-    return bool(response.get("Contents"))
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _is_report_results_csv_key(key: str) -> bool:
-    """True iff *key* is a BOPS_Completion_Report results CSV, not a sidecar.
-
-    S3 Batch Operations writes three object types under ``Report.Prefix``:
-    ``job-<job_id>/manifest.json`` (an envelope describing the report),
-    ``job-<job_id>/manifest.json.md5`` (its checksum), and one or more
-    ``job-<job_id>/results/<hash>.csv`` files containing the actual
-    per-object completion rows. Only the ``results/`` CSVs should be parsed
-    as report data; the manifest and its checksum are not row-oriented CSV
-    and would otherwise be misparsed as garbage entries.
-    """
-    return "/results/" in key and key.endswith(".csv")
-
-
-def _list_report_object_keys(s3_client, state_bucket: str, report_prefix: str) -> list[str]:
-    """List every object key under ``report_prefix``, paginating as needed."""
-    keys: list[str] = []
-    continuation_token: str | None = None
-    while True:
-        kwargs: dict = {"Bucket": state_bucket, "Prefix": report_prefix}
-        if continuation_token is not None:
-            kwargs["ContinuationToken"] = continuation_token
-        response = s3_client.list_objects_v2(**kwargs)
-        for obj in response.get("Contents", []):
-            keys.append(obj["Key"])
-        if response.get("IsTruncated"):
-            continuation_token = response.get("NextContinuationToken")
-        else:
-            break
-    return keys
-
+from src.core.models import ManifestEntry, normalize_version_id
 
 _REPORT_COLUMN_ORDER_NOTE = """\
 The completion report's ``ErrorCode`` and ``HTTPStatusCode`` columns are not
-in the order AWS documents, so this reader does not rely on their position.
+emitted in the order AWS documents, so this reader does not rely on their
+position.
 
 Under report schema version ``Report_CSV_20180820`` the observed layout is:
 
     0 Bucket, 1 Key, 2 VersionId, 3 TaskStatus,
     4 HTTPStatusCode, 5 ErrorCode, 6 ResultMessage
 
-Both "Examples: S3 Batch Operations completion reports" and the
-``ReportSchema`` string the service writes into the report's own
-``manifest.json`` instead declare:
+while the ``ReportSchema`` string inside the report's own ``manifest.json``
+declares:
 
     Bucket, Key, VersionId, TaskStatus, ErrorCode, HTTPStatusCode, ResultMessage
 
-Observed on a two-task job, one succeeding and one failing, so both row shapes
-were available. Its manifest.json carried the declaration above while its
-results rows read:
+Observed on two real jobs in ``us-west-2``:
 
-    ...,succeeded,200,,success
-    ...,failed,500,SrcObjectNotEligible,Object is not eligible for replication
+    0f65a1b7-9b4c-4124-a1ad-06ea77d7224f  2026-07-21  100,001 succeeded, 1 failed
+    b2f9f42d-dba4-4a77-945e-074cef95450e  2026-08-27  3 succeeded, 0 failed
 
-The values identify themselves: 200 and 500 are HTTP status codes,
-SrcObjectNotEligible is an error code, and "success" is the ResultMessage. A
-succeeded row leaves ErrorCode empty, which in the documented order would put
-the empty field at index 4; instead the empty field is at index 5 and index 4
-holds 200.
+The second has no failed task at all and still emits HTTP status before error
+code (``succeeded,200,,success``), so the ordering is a property of the schema
+version rather than of failure rows. A schema version this Solution has not seen
+could present the two either way round, which is why
+:func:`_resolve_status_and_error` decides by content.
 
-The documented order is also contradicted by AWS's own published examples. On
-the "Examples: S3 Batch Operations completion reports" page, every example
-row across the Lambda-invoke and Compute-checksum sets places the status code
-before the error code, matching what is observed rather than the column lists
-and ``ReportSchema`` string on that same page. For instance the documented
-failed Lambda row is ``...,failed,200,PermanentFailure,"Lambda returned
-function error: ..."``, where 200 is the status and PermanentFailure the code.
-
-``Report.Format`` names a report *schema version*, so this layout is a property
-of that version rather than a fixed fact, and a future version could reasonably
-present these columns in the declared order instead. That is why the two are
-resolved by content here rather than by index: it costs almost nothing and it
-removes the layout from the set of things this reader can be wrong about. See
-:func:`_resolve_status_and_error`.
-
-Getting these two columns the wrong way round fails silently rather than
-loudly, which is what makes the content check worth having. Both are strings,
-and both are populated on a failure, so a transposed read yields a
-plausible-looking value instead of an error: reading ErrorCode from the status
-column returns a number that never equals any real error code, so every
-comparison against a known code fails while every succeeded task appears to
-carry the error code "200". That defect was live in this reader and no test
-caught it, because the test helper encoded the same wrong order.
+Both reports are committed under ``tests/fixtures/bops_reports/`` and asserted on
+by ``tests/test_bops_report_golden.py``, so this note cannot drift away from the
+behavior without a test failing.
 """
 
-# Bounds for recognising an HTTP status code. Both ends are inclusive.
-_HTTP_STATUS_MIN = 100
-_HTTP_STATUS_MAX = 599
+_REPORT_FORMAT = "Report_CSV_20180820"
+_REPORT_SCHEMA = (
+    "Bucket",
+    "Key",
+    "VersionId",
+    "TaskStatus",
+    "ErrorCode",
+    "HTTPStatusCode",
+    "ResultMessage",
+)
 
 
-def _looks_like_http_status(value: str) -> bool:
-    """True iff *value* is a bare three-digit HTTP status code.
+@dataclass(frozen=True)
+class BopsCompletionReport:
+    """A validated S3 Batch Operations completion report."""
 
-    Deliberately strict. An ``ErrorCode`` is either empty or a symbolic
-    identifier such as ``SrcObjectNotEligible``, ``PermanentFailure``, or
-    ``AccessDenied``, none of which satisfies this, so the test cleanly
-    separates the two columns.
+    created_at: datetime
+    entries: tuple[ManifestEntry, ...]
+
+
+class CompletionReportNotReady(Exception):
+    """Raised when a completion report has not been fully written yet."""
+
+
+class CompletionReportMalformed(Exception):
+    """Raised when a completion report fails integrity or schema validation."""
+
+
+def read_bops_completion_report(
+    s3_client,
+    state_bucket: str,
+    report_prefix: str,
+    job_id: str,
+    expected_row_count: int,
+) -> BopsCompletionReport:
+    """Read a complete, manifest-led completion report for one job.
+
+    The top-level manifest is the commit marker. Missing objects remain
+    retryable; invalid manifests, rows, checksums, identities, and row counts
+    are rejected rather than returning a partial report.
+
+    *expected_row_count* is ``NumberOfTasksSucceeded + NumberOfTasksFailed``
+    from ``DescribeJob``, and those counts are a sound signal. Job
+    ``0f65a1b7-9b4c-4124-a1ad-06ea77d7224f`` reports
+    ``TotalNumberOfTasks: 100002, NumberOfTasksSucceeded: 100001,
+    NumberOfTasksFailed: 1``, and its report parses to exactly 100,002 rows
+    across two result objects. An earlier docstring in ``job_recovery`` claimed
+    these counts were unreliable at large object counts, citing that same job
+    with the two figures transposed; the job is still queryable and it is not.
+
+    The caller must not pass ``0`` for a job whose ``DescribeJob`` response
+    carried no ``ProgressSummary`` at all. An absent summary means the count is
+    unknown, not zero, and zero takes the caller's synthetic-empty-report path,
+    which would mark the job processed with no outcomes.
     """
-    candidate = value.strip()
-    if len(candidate) != 3 or not candidate.isdigit():
+    if expected_row_count < 0:
+        raise ValueError("expected_row_count must not be negative")
+
+    manifest_key = _manifest_key(report_prefix, job_id)
+    manifest_body = _get_object_body(s3_client, state_bucket, manifest_key)
+    manifest = _parse_manifest(manifest_body)
+    created_at, result_descriptors = _validate_manifest(manifest)
+
+    entries: list[ManifestEntry] = []
+    for descriptor in result_descriptors:
+        result_key = descriptor["Key"]
+        result_body = _get_object_body(s3_client, state_bucket, result_key)
+        _verify_md5(result_body, descriptor["MD5Checksum"], result_key)
+        entries.extend(_parse_report_csv(result_body.decode("utf-8")))
+
+    if len(entries) != expected_row_count:
+        raise CompletionReportMalformed(
+            f"report contains {len(entries)} rows; expected {expected_row_count}"
+        )
+
+    identities = {
+        (entry.source_bucket, entry.object_key, entry.version_id) for entry in entries
+    }
+    if len(identities) != len(entries):
+        raise CompletionReportMalformed("report contains duplicate object identities")
+
+    return BopsCompletionReport(created_at=created_at, entries=tuple(entries))
+
+
+def report_manifest_written_at(
+    s3_client,
+    state_bucket: str,
+    report_prefix: str,
+    job_id: str,
+) -> datetime | None:
+    """Return when a job's top-level completion-report manifest was written.
+
+    ``None`` means the manifest does not exist. The report manifest is the
+    completion report's commit marker, so checking this exact key prevents
+    sidecar or partially visible result objects from suppressing a
+    report-missing alert.
+
+    The timestamp is returned rather than a bare boolean because it is the only
+    honest clock for "how long has this report gone unread". Job timestamps are
+    not: a job's duration is unbounded, so measuring from ``CreationTime``
+    (the fallback when ``TerminationDate`` is absent) gives a long-running job no
+    grace at all. ``LastModified`` on the manifest measures exactly the interval
+    that matters and is independent of how long the job took.
+
+    ``None`` is also returned when the response carries no ``LastModified``,
+    which no live S3 response does, so a caller cannot mistake an unusable
+    timestamp for a fresh one.
+    """
+    try:
+        response = s3_client.head_object(
+            Bucket=state_bucket,
+            Key=_manifest_key(report_prefix, job_id),
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise
+    written_at = response.get("LastModified")
+    return written_at if isinstance(written_at, datetime) else None
+
+
+def _manifest_key(report_prefix: str, job_id: str) -> str:
+    """Return the exact manifest key S3 Batch Operations writes.
+
+    S3 appends ``/job-<id>/manifest.json`` to the submitted report prefix.
+    The Solution submits prefixes ending in ``/``, so S3 places the manifest
+    below a double slash. Preserve the prefix rather than normalizing it: a
+    historical job must be read from the same key S3 wrote.
+
+    Verified on two real jobs in ``us-west-2`` whose report manifests are at
+    ``<prefix>//job-<id>/manifest.json``:
+    ``0f65a1b7-9b4c-4124-a1ad-06ea77d7224f`` (2026-07-21) and
+    ``b2f9f42d-dba4-4a77-945e-074cef95450e`` (2026-08-27). The 1.0.1 reader
+    listed the prefix and was insensitive to the separator; this exact-key read
+    is not, so the double slash is load-bearing rather than cosmetic.
+    """
+    return f"{report_prefix}/job-{job_id}/manifest.json"
+
+
+def _get_object_body(s3_client, bucket: str, key: str) -> bytes:
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            raise CompletionReportNotReady(f"report object is not available: {key}") from exc
+        raise
+
+    try:
+        body = response["Body"].read()
+    except (KeyError, AttributeError) as exc:
+        raise CompletionReportMalformed(f"report object has no readable body: {key}") from exc
+    if not isinstance(body, bytes):
+        raise CompletionReportMalformed(f"report object body is not bytes: {key}")
+    return body
+
+
+def _parse_manifest(body: bytes) -> dict:
+    try:
+        manifest = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CompletionReportMalformed("report manifest is not valid JSON") from exc
+    if not isinstance(manifest, dict):
+        raise CompletionReportMalformed("report manifest must be an object")
+    return manifest
+
+
+def _validate_manifest(manifest: dict) -> tuple[datetime, list[dict[str, str]]]:
+    if manifest.get("Format") != _REPORT_FORMAT:
+        raise CompletionReportMalformed("report manifest has an unsupported format")
+
+    schema = manifest.get("ReportSchema")
+    if not isinstance(schema, str) or tuple(part.strip() for part in schema.split(",")) != _REPORT_SCHEMA:
+        raise CompletionReportMalformed("report manifest has an unsupported schema")
+
+    creation_date = manifest.get("ReportCreationDate")
+    if not isinstance(creation_date, str):
+        raise CompletionReportMalformed("report manifest has no creation date")
+    try:
+        created_at = datetime.fromisoformat(creation_date.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CompletionReportMalformed("report manifest has an invalid creation date") from exc
+    if created_at.tzinfo is None:
+        raise CompletionReportMalformed("report manifest creation date has no timezone")
+
+    results = manifest.get("Results")
+    if not isinstance(results, list):
+        raise CompletionReportMalformed("report manifest has no results list")
+
+    validated_results: list[dict[str, str]] = []
+    for result in results:
+        if not isinstance(result, dict):
+            raise CompletionReportMalformed("report manifest contains an invalid result descriptor")
+        key = result.get("Key")
+        checksum = result.get("MD5Checksum")
+        if not isinstance(key, str) or not key:
+            raise CompletionReportMalformed("report result has no object key")
+        if not isinstance(checksum, str):
+            raise CompletionReportMalformed("report result has no MD5 checksum")
+        if not _is_valid_md5_checksum(checksum):
+            raise CompletionReportMalformed("report result has an invalid MD5 checksum")
+        validated_results.append({"Key": key, "MD5Checksum": checksum})
+
+    return created_at, validated_results
+
+
+def _is_valid_md5_checksum(checksum: str) -> bool:
+    """Accept the hexadecimal form S3 emits and the base64 form used by fixtures."""
+    if len(checksum) == hashlib.md5(usedforsecurity=False).digest_size * 2:
+        try:
+            bytes.fromhex(checksum)
+        except ValueError:
+            return False
+        return True
+    try:
+        decoded_checksum = base64.b64decode(checksum, validate=True)
+    except ValueError:
         return False
-    return _HTTP_STATUS_MIN <= int(candidate) <= _HTTP_STATUS_MAX
+    return len(decoded_checksum) == hashlib.md5(usedforsecurity=False).digest_size
 
 
-def _resolve_status_and_error(first: str, second: str) -> tuple[str, str]:
-    """Resolve report columns 4 and 5 into ``(http_status_code, error_code)``.
-
-    Decided per row by content rather than by position, so the reader is
-    correct under both the emitted order and the declared order. The layout is
-    a property of the report schema version named by ``Report.Format`` (see
-    :data:`_REPORT_COLUMN_ORDER_NOTE`), so a version this Solution has not seen
-    could present these two columns either way round. Resolving by content
-    means such a difference needs no change here and cannot silently corrupt a
-    parse.
-
-    The two columns are trivially separable: exactly one of them is ever a
-    bare three-digit number.
-
-    Ambiguous inputs fall back to the order observed under
-    ``Report_CSV_20180820``, which is the version this Solution requests:
-
-    * Neither value looks like a status code, which is the case when both are
-      empty. The choice cannot matter, since an empty ``ErrorCode`` parses to
-      ``None`` either way.
-    * Both values look like a status code. Not observed in any report or in
-      any documented example, and it would require a numeric ``ErrorCode``.
-      Preferring the known layout keeps behavior predictable if it ever
-      happens.
-    """
-    first_is_status = _looks_like_http_status(first)
-    second_is_status = _looks_like_http_status(second)
-
-    if second_is_status and not first_is_status:
-        # Declared order: ErrorCode then HTTPStatusCode.
-        return second, first
-    # Observed order under Report_CSV_20180820, and the fallback for the two
-    # ambiguous cases described above.
-    return first, second
+def _verify_md5(body: bytes, expected_checksum: str, key: str) -> None:
+    digest = hashlib.md5(body, usedforsecurity=False).digest()
+    actual_checksum = (
+        digest.hex()
+        if len(expected_checksum) == len(digest) * 2
+        else base64.b64encode(digest).decode("ascii")
+    )
+    if actual_checksum != expected_checksum:
+        raise CompletionReportMalformed(f"report result checksum does not match: {key}")
 
 
 def _parse_report_csv(csv_text: str) -> list[ManifestEntry]:
-    """Parse a single BOPS_Completion_Report CSV's rows into ``ManifestEntry`` values.
+    """Parse strictly valid seven-column BOPS result rows.
 
-    Headerless CSV — S3 Batch Operations completion reports carry no header
-    row, matching the Solution's own manifest CSV convention.
+    A blank line yields ``[]`` from :func:`csv.reader` and is skipped rather
+    than rejected: result objects are CRLF-terminated, so a trailing or
+    interior blank line must not make an otherwise valid report permanently
+    malformed. Any other unexpected column count is still malformed.
+
+    ``VersionId`` is normalized through :func:`normalize_version_id`, so every
+    spelling of the null version becomes ``None`` and a null-version object
+    carries the same identity here as it does in the manifest and in state.
 
     ``HTTPStatusCode`` and ``ErrorCode`` are resolved by content rather than by
-    position, so both the emitted and the declared column order parse
-    correctly. See :data:`_REPORT_COLUMN_ORDER_NOTE`.
+    position; see :data:`_REPORT_COLUMN_ORDER_NOTE`.
     """
     entries: list[ManifestEntry] = []
-    reader = csv.reader(io.StringIO(csv_text))
-    for row in reader:
+    for row in csv.reader(io.StringIO(csv_text)):
         if not row:
             continue
-        bucket = row[0]
-        # The key is percent-decoded to match the form Tracked_Objects are
-        # keyed by. The Solution's own manifest percent-encodes object keys
-        # (``ManifestEntry.to_csv_row``, ``/`` preserved) so that a comma or
-        # newline in a key cannot break the CSV, and S3 Batch Operations
-        # echoes the manifest's key into the completion report rather than
-        # the decoded original — so without this the report's key never
-        # matches the Tracked_Object for any key containing a character
-        # that needed encoding, and that object never resolves.
-        #
-        # AWS does not document the report's key encoding, and every example
-        # in "Examples: S3 Batch Operations completion reports" uses a key
-        # needing no encoding. Verified empirically instead, against job
-        # ceeee132-7fb2-4abf-826e-4d05b6272ec0 in the us-west-2 test
-        # deployment: an object keyed ``retag-verify/pct%20literal.txt`` (a
-        # literal percent sequence) was written into the manifest as
-        # ``retag-verify/pct%2520literal.txt``, and the completion report's
-        # Key column came back byte-identical to the manifest form, not as
-        # the original key. So the report echoes the manifest key and this
-        # decode is its exact inverse.
-        #
-        # A literal percent sequence is the only key shape that
-        # distinguishes the two possibilities — for every other key, the
-        # encoded and original forms decode to the same string — which is
-        # why the test for this in tests/adapters/test_bops_report_reader.py
-        # centres on that case.
-        key = unquote(row[1]) if len(row) > 1 else ""
-        version_id_raw = row[2] if len(row) > 2 else ""
-        version_id = version_id_raw if version_id_raw else None
-        # ErrorCode (column index 4): empty for a succeeded task. Carried
-        # through so the orchestrator can diagnose a permission-shaped
-        # failure (e.g. InitiateReplicationNotPermitted) without a second
-        # read of the report — see _CompletionHooks.on_job_terminal.
-        # Columns 4 and 5 carry HTTPStatusCode and ErrorCode, in an order that
-        # is a property of the report schema version rather than a fixed fact,
-        # so they are resolved by content. See _REPORT_COLUMN_ORDER_NOTE.
-        task_status_raw = row[3] if len(row) > 3 else ""
-        http_status_raw, error_code_raw = _resolve_status_and_error(
-            row[4] if len(row) > 4 else "",
-            row[5] if len(row) > 5 else "",
-        )
-        result_message_raw = row[6] if len(row) > 6 else ""
-        error_code = error_code_raw if error_code_raw else None
+        if len(row) != len(_REPORT_SCHEMA):
+            raise CompletionReportMalformed("report contains a malformed row")
+        bucket, encoded_key, version_id_raw, task_status, first, second, result_message = row
+        if not bucket or not encoded_key:
+            raise CompletionReportMalformed("report contains a malformed row")
+        http_status, error_code = _resolve_status_and_error(first, second)
         entries.append(
             ManifestEntry(
                 source_bucket=bucket,
-                object_key=key,
-                version_id=version_id,
-                error_code=error_code,
-                task_status=task_status_raw if task_status_raw else None,
-                http_status_code=http_status_raw if http_status_raw else None,
-                result_message=result_message_raw if result_message_raw else None,
+                object_key=unquote(encoded_key),
+                version_id=normalize_version_id(version_id_raw),
+                error_code=error_code or None,
+                task_status=task_status or None,
+                http_status_code=http_status or None,
+                result_message=result_message or None,
             )
         )
     return entries
+
+
+def _looks_like_http_status(value: str) -> bool:
+    candidate = value.strip()
+    return len(candidate) == 3 and candidate.isdigit() and 100 <= int(candidate) <= 599
+
+
+def _resolve_status_and_error(first: str, second: str) -> tuple[str, str]:
+    """Resolve the two service variants for status and error column order."""
+    if _looks_like_http_status(second) and not _looks_like_http_status(first):
+        return second, first
+    return first, second

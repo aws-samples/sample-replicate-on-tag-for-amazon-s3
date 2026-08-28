@@ -15,28 +15,40 @@ Requirements: 3.4, 3.5, 3.6, 4.4, 7.3, 8.1, 8.2, 9.1, 11.1, 12.3, 12.4, 12.5, 13
 """
 from __future__ import annotations
 
+import contextlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
+from src.adapters.bops_report_reader import (
+    BopsCompletionReport,
+    CompletionReportMalformed,
+    CompletionReportNotReady,
+)
 from src.adapters.batch_operations_adapter import SubmissionResult
 from src.adapters.inventory_manifest_writer import WrittenManifest
 from src.adapters.replication_config_adapter import SkipReport
+from src.adapters.sns_report_adapter import PublishResult
+from src.core import completion_tracker
 from src.core.models import (
     BucketDisableState,
     CheckpointState,
+    CompletionState,
+    ConfigContext,
     DestinationRef,
     DerivedReplicationRule,
     ManifestEntry,
     RunResult,
     S3Location,
+    ScanState,
     SubmissionRecord,
     SubmissionStatus,
     TaggingOperation,
+    TrackedObject,
 )
 from src.core.rule_deriver import derive_rules
 from src.orchestrator import run_interval
@@ -822,6 +834,7 @@ def _run_with_recovery_mocks(
     describe_responses: dict,  # job_id → str status or Exception
     bucket_name: str = "my-bucket",
     progress_summaries: dict | None = None,  # job_id → ProgressSummary dict
+    job_extras: dict | None = None,  # job_id → extra Job fields (e.g. TerminationDate)
 ) -> list:
     """Run one interval with recovery-aware mocks; returns emitted events list."""
     mock_factory_cls = MagicMock()
@@ -830,6 +843,7 @@ def _run_with_recovery_mocks(
 
     mock_s3control = MagicMock()
     progress_summaries = progress_summaries or {}
+    job_extras = job_extras or {}
 
     def describe_job(AccountId, JobId):
         resp = describe_responses.get(JobId)
@@ -838,6 +852,7 @@ def _run_with_recovery_mocks(
         job: dict = {"Status": resp}
         if JobId in progress_summaries:
             job["ProgressSummary"] = progress_summaries[JobId]
+        job.update(job_extras.get(JobId, {}))
         return {"Job": job}
 
     mock_s3control.describe_job.side_effect = describe_job
@@ -892,6 +907,22 @@ def _run_with_recovery_mocks(
         run_interval(_config([bucket_name]), _BASE_RUNTIME)
 
     return emitted
+
+
+def _diagnosed_flags(mock_store) -> dict:
+    """The per-job flags the last mark_report_diagnosed call asked to set.
+
+    One store method sets both ``report_diagnosed`` and ``recovery_scored``, so
+    "was it called" no longer says which happened. They are set on different
+    conditions: a job whose completion report cannot be read is scored but not
+    diagnosed.
+    """
+    mock_store.mark_report_diagnosed.assert_called()
+    kwargs = mock_store.mark_report_diagnosed.call_args.kwargs
+    return {
+        "report_diagnosed": kwargs.get("report_diagnosed", True),
+        "recovery_scored": kwargs.get("recovery_scored", False),
+    }
 
 
 def _audits(emitted: list, action: str) -> list:
@@ -976,9 +1007,8 @@ class TestFailedJobRecovery:
 
     def test_completed_job_partial_failure_not_treated_as_effective_failure(self):
         """A large NumberOfTasksFailed alongside a nonzero
-        NumberOfTasksSucceeded is not treated as a failure — mirrors the
-        real 100k-object job where NumberOfTasksFailed was a reporting
-        artifact, not a real incident (see job_recovery.py docstring)."""
+        NumberOfTasksSucceeded is a partially failed job, not an effective
+        failure, so recovery does not readmit the whole window."""
         emitted = _run_with_recovery_mocks(
             prior_submissions={"rule-1": _prior_rec(job_id="job-partial")},
             describe_responses={"job-partial": "Complete"},
@@ -1043,25 +1073,26 @@ class TestFailedJobRecovery:
         assert _WM_B in wm_lows
 
     def test_multi_config_min_watermark_low_wins(self):
-        """When two configs fail, rollback uses the minimum watermark_low."""
+        """When two jobs fail, rollback uses the minimum watermark_low."""
         _WM_EARLIER = "2024-01-01T00:00:05.000000Z"
         _WM_LATER = "2024-01-01T00:00:40.000000Z"
         prior = {
-            "rule-a": _prior_rec("rule-a", "job-a", watermark_low=_WM_EARLIER),
-            "rule-b": _prior_rec("rule-b", "job-b", watermark_low=_WM_LATER),
+            "job-a": _prior_rec("rule-a", "job-a", watermark_low=_WM_EARLIER),
+            "job-b": _prior_rec("rule-b", "job-b", watermark_low=_WM_LATER),
         }
         emitted = _run_with_recovery_mocks(
             prior_submissions=prior,
             describe_responses={"job-a": "Failed", "job-b": "Failed"},
         )
-        # Two readmit audits emitted (one per config)
+        # One readmit audit per failed job.
         readmits = _audits(emitted, "batch_job_failure_readmit")
         assert len(readmits) == 2
-        # The audit for rule-a has the earlier watermark_low
-        rule_a_audit = next(
-            r for r in readmits if r["config_id"] == "rule-a"
-        )
-        assert rule_a_audit["watermark_low"] == _WM_EARLIER
+        # The audits are distinguished by job_id — the identifier that names one
+        # job. `config_id` is the bucket, since the completion-report prefix is
+        # derived from the bucket name at submission time.
+        job_a_audit = next(r for r in readmits if r["job_id"] == "job-a")
+        assert job_a_audit["watermark_low"] == _WM_EARLIER
+        assert job_a_audit["config_id"] == "my-bucket"
 
     def test_describe_job_called_for_each_submission(self):
         """describe_job is invoked exactly once per submission record."""
@@ -1380,8 +1411,14 @@ def _run_completion_tracking_hook(
     completion_job_exists: bool = False,
     read_bops_report_side_effect=None,
     read_bops_report_return_value=None,
-    merge_completion_configs_side_effect=None,
+    merge_completion_report_side_effect=None,
     bucket_name: str = "my-bucket",
+    tasks_succeeded: int = 1,
+    tasks_failed: int = 0,
+    completion_items: dict[str, TrackedObject] | None = None,
+    scan_state_by_config: dict[str, ScanState] | None = None,
+    preflight_matches: int = 0,
+    delete_completion_items_side_effect: Exception | None = None,
 ):
     """Run one interval with the BOPS-report-based completion-tracking hook
     mocks (design.md Decision 5 / task 17.1).
@@ -1398,7 +1435,17 @@ def _run_completion_tracking_hook(
         resp = describe_responses.get(JobId)
         if isinstance(resp, Exception):
             raise resp
-        return {"Job": {"Status": resp, "CreationTime": _NOW}}
+        return {
+            "Job": {
+                "Status": resp,
+                "CreationTime": _NOW,
+                "TerminationDate": _NOW,
+                "ProgressSummary": {
+                    "NumberOfTasksSucceeded": tasks_succeeded,
+                    "NumberOfTasksFailed": tasks_failed,
+                },
+            }
+        }
 
     mock_s3control.describe_job.side_effect = describe_job
     mock_factory.create_s3control_client.return_value = mock_s3control
@@ -1413,14 +1460,45 @@ def _run_completion_tracking_hook(
     )
     mock_store.get_submission_records.return_value = prior_submissions
     mock_store.completion_job_exists.return_value = completion_job_exists
-    mock_store.merge_completion_configs.return_value = '"etag-completion"'
-    if merge_completion_configs_side_effect is not None:
-        mock_store.merge_completion_configs.side_effect = (
-            merge_completion_configs_side_effect
-        )
+    tracked_items = completion_items if completion_items is not None else {}
+
+    def _merge_ready_report(*_args, **kwargs):
+        report = kwargs["report"]
+        for entry in report.entries:
+            tracked_items[f"{entry.object_key}:{entry.version_id}"] = TrackedObject(
+                source_bucket=bucket_name,
+                object_key=entry.object_key,
+                version_id=entry.version_id,
+                configs={
+                    bucket_name: ConfigContext(
+                        replication_config_id=bucket_name,
+                        job_id=kwargs["job_id"],
+                        manifest_generated_at=kwargs["job_created_at"],
+                        bops_confirmed=True,
+                    )
+                },
+                state=CompletionState.RESOLVED,
+                resolved_at=report.created_at,
+                resolution_method="bops_completion_report",
+                replication_outcome=completion_tracker.outcome_from_report_row(entry),
+            )
+        return '"etag-completion"'
+
+    mock_store.merge_completion_report.side_effect = _merge_ready_report
+    mock_store.get_all_completion_items.side_effect = (
+        lambda _s3_client, _state_bucket, _source_bucket: tracked_items
+    )
+    mock_store.get_scan_state.side_effect = (
+        lambda _s3_client, _state_bucket, _source_bucket: scan_state_by_config or {}
+    )
+    mock_store.get_checkpoint.return_value = (_checkpoint(bucket_name), '"etag-0"')
+    if merge_completion_report_side_effect is not None:
+        mock_store.merge_completion_report.side_effect = merge_completion_report_side_effect
     mock_store.acquire_lease.return_value = '"etag-1"'
     mock_store.release_lease.return_value = '"etag-2"'
     mock_store.record_submission.return_value = '"etag-3"'
+    if delete_completion_items_side_effect is not None:
+        mock_store.delete_completion_items.side_effect = delete_completion_items_side_effect
 
     emitted: list = []
 
@@ -1431,11 +1509,15 @@ def _run_completion_tracking_hook(
     if read_bops_report_side_effect is not None:
         mock_read_bops_report = MagicMock(side_effect=read_bops_report_side_effect)
     else:
+        report_entries = (
+            read_bops_report_return_value
+            if read_bops_report_return_value is not None
+            else []
+        )
         mock_read_bops_report = MagicMock(
-            return_value=(
-                read_bops_report_return_value
-                if read_bops_report_return_value is not None
-                else []
+            return_value=BopsCompletionReport(
+                created_at=_NOW,
+                entries=tuple(report_entries),
             )
         )
 
@@ -1462,7 +1544,7 @@ def _run_completion_tracking_hook(
             "src.orchestrator.batch_operations_adapter.submit_batch_job",
             return_value=_submitted(),
         ),
-        patch("src.orchestrator.preflight_count", return_value=0),
+        patch("src.orchestrator.preflight_count", return_value=preflight_matches),
         patch("src.orchestrator.read_permanent_deletes", return_value=set()),
         patch("src.orchestrator.observability.emit", side_effect=emitted.append),
         patch(
@@ -1480,7 +1562,7 @@ class TestCompletionRecordCreationHook:
     def test_terminal_status_merges_completion_configs(self, status):
         """A terminal-status job with no existing completion job triggers the
         BOPS_Completion_Report read and a single
-        store.merge_completion_configs call (Requirements 2.1, 2.2, 2.5).
+        store.merge_completion_report call (Requirements 2.1, 2.2, 2.5).
 
         The report is read once via the shared lazy accessor; both the
         merge (in on_job_terminal) and diagnosis use the same cached
@@ -1492,22 +1574,69 @@ class TestCompletionRecordCreationHook:
         )
         # Single read via the shared lazy accessor.
         assert mock_read_report.call_count == 1
-        mock_store.merge_completion_configs.assert_called_once()
+        mock_store.merge_completion_report.assert_called_once()
 
-        merge_kwargs = mock_store.merge_completion_configs.call_args.kwargs
+        merge_kwargs = mock_store.merge_completion_report.call_args.kwargs
         assert merge_kwargs["job_id"] == f"job-{status}"
         # D4 formalization (task 5.1): the completion-tracking identity is
         # the per-bucket sentinel (bucket_name), never the legacy config_id
         # key ("rule-1") the prior-submission-record dict happened to be
         # iterated under.
         assert merge_kwargs["replication_config_id"] == "my-bucket"
-        assert merge_kwargs["entries"] == []
-        assert "manifest_generated_at" in merge_kwargs
+        assert merge_kwargs["report"].entries == ()
+        assert merge_kwargs["job_created_at"] == _NOW
+
+    def test_unknown_status_logs_once_after_successful_report_write(self):
+        """Unknown mappings produce one key-free error only after the write."""
+        prior = {"rule-1": _ct_prior_rec(job_id="job-unknown")}
+        entries = [
+            ManifestEntry("my-bucket", "private/key-a", "v1", task_status="other"),
+            ManifestEntry("my-bucket", "private/key-b", "v2", task_status=None),
+        ]
+        emitted, mock_store, _ = _run_completion_tracking_hook(
+            prior_submissions=prior,
+            describe_responses={"job-unknown": "Complete"},
+            read_bops_report_return_value=entries,
+            tasks_succeeded=2,
+        )
+
+        unknown_errors = [
+            event for event in emitted
+            if isinstance(event, dict)
+            and event.get("event") == "error"
+            and "mapped 2 row(s) to UNKNOWN" in event.get("cause", "")
+        ]
+        assert len(unknown_errors) == 1
+        assert "job-unknown" in unknown_errors[0]["cause"]
+        # `config` in that message is the bucket: the completion-report prefix is
+        # derived from the bucket name, so that is the identity the reader uses.
+        assert "my-bucket" in unknown_errors[0]["cause"]
+        assert "private/key-" not in unknown_errors[0]["cause"]
+        mock_store.merge_completion_report.assert_called_once()
+
+    def test_unknown_status_does_not_log_before_failed_report_write(self):
+        """A failed report write leaves the UNKNOWN diagnostic un-emitted."""
+        prior = {"rule-1": _ct_prior_rec(job_id="job-unknown-write-failed")}
+        emitted, mock_store, _ = _run_completion_tracking_hook(
+            prior_submissions=prior,
+            describe_responses={"job-unknown-write-failed": "Complete"},
+            read_bops_report_return_value=[
+                ManifestEntry("my-bucket", "private/key-a", "v1", task_status="other"),
+            ],
+            merge_completion_report_side_effect=RuntimeError("write failed"),
+        )
+
+        assert all(
+            "mapped" not in event.get("cause", "")
+            for event in emitted
+            if isinstance(event, dict) and event.get("event") == "error"
+        )
+        mock_store.merge_completion_report.assert_called_once()
 
     def test_legacy_multi_job_migration_keys_by_bucket_sentinel_not_config_id(self):
         """D4 formalization (task 5.1): a legacy migration scenario where
         TWO distinct legacy config_id-keyed prior records both terminate in
-        the SAME run must still call merge_completion_configs with
+        the SAME run must still call merge_completion_report with
         replication_config_id == bucket_name for EACH job, not the distinct
         legacy config_id keys — so both merges land under the SAME sentinel
         key in TrackedObject.configs (one entry per object), rather than
@@ -1520,8 +1649,8 @@ class TestCompletionRecordCreationHook:
             prior_submissions=prior,
             describe_responses={"job-a": "Complete", "job-b": "Complete"},
         )
-        assert mock_store.merge_completion_configs.call_count == 2
-        for call in mock_store.merge_completion_configs.call_args_list:
+        assert mock_store.merge_completion_report.call_count == 2
+        for call in mock_store.merge_completion_report.call_args_list:
             assert call.kwargs["replication_config_id"] == "my-bucket"
 
     def test_exception_in_read_bops_report_is_caught_and_logged(self):
@@ -1553,14 +1682,14 @@ class TestCompletionRecordCreationHook:
         assert len(readmits) == 1
         assert readmits[0]["job_id"] == "job-boom"
 
-    def test_exception_in_merge_completion_configs_isolated(self):
-        """An exception from store.merge_completion_configs itself is
+    def test_exception_in_merge_completion_report_isolated(self):
+        """An exception from store.merge_completion_report itself is
         isolated too."""
         prior = {"rule-1": _ct_prior_rec(job_id="job-storeboom")}
         emitted, mock_store, mock_read_report = _run_completion_tracking_hook(
             prior_submissions=prior,
             describe_responses={"job-storeboom": "Complete"},
-            merge_completion_configs_side_effect=RuntimeError("store boom"),
+            merge_completion_report_side_effect=RuntimeError("store boom"),
         )
         errors = [
             e for e in emitted
@@ -1588,7 +1717,7 @@ class TestCompletionRecordCreationHook:
         )
         # Diagnosis reads the report; the merge path does not.
         mock_read_report.assert_called_once()
-        mock_store.merge_completion_configs.assert_not_called()
+        mock_store.merge_completion_report.assert_not_called()
         mock_store.completion_job_exists.assert_not_called()
 
     def test_skipped_when_completion_job_already_exists(self):
@@ -1605,7 +1734,106 @@ class TestCompletionRecordCreationHook:
         mock_store.completion_job_exists.assert_called_once()
         # Diagnosis reads (its gate is independent); merge skipped.
         mock_read_report.assert_called_once()
-        mock_store.merge_completion_configs.assert_not_called()
+        mock_store.merge_completion_report.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "report_error",
+        [
+            CompletionReportNotReady("manifest not present"),
+            CompletionReportMalformed("row count mismatch"),
+        ],
+    )
+    def test_non_ready_or_malformed_report_leaves_tracking_and_diagnosis_retryable(
+        self, report_error
+    ):
+        """A report that is not ready or malformed updates neither state path."""
+        prior = {"rule-1": _ct_prior_rec(job_id="job-retryable")}
+        emitted, mock_store, mock_read_report = _run_completion_tracking_hook(
+            prior_submissions=prior,
+            describe_responses={"job-retryable": "Complete"},
+            read_bops_report_side_effect=report_error,
+        )
+
+        mock_read_report.assert_called_once()
+        mock_store.merge_completion_report.assert_not_called()
+        # Diagnosis stays retryable: report_diagnosed is not set. But the job is
+        # terminal and its outcome has now been scored, so recovery_scored IS set,
+        # or the same failure would be scored again on every later run.
+        assert _diagnosed_flags(mock_store) == {
+            "report_diagnosed": False, "recovery_scored": True,
+        }
+        assert any(
+            event.get("component") == "Completion_Tracker"
+            for event in emitted
+            if isinstance(event, dict) and event.get("event") == "error"
+        )
+
+    @pytest.mark.parametrize(
+        "report_error",
+        [
+            CompletionReportNotReady("manifest not present"),
+            CompletionReportMalformed("row count mismatch"),
+        ],
+    )
+    def test_non_ready_or_malformed_report_can_succeed_on_later_interval(
+        self, report_error
+    ):
+        """A failed read leaves the job retryable until a ready report arrives."""
+        prior = {"rule-1": _ct_prior_rec(job_id="job-later-ready")}
+        _, failed_store, failed_read = _run_completion_tracking_hook(
+            prior_submissions=prior,
+            describe_responses={"job-later-ready": "Complete"},
+            read_bops_report_side_effect=report_error,
+        )
+        failed_read.assert_called_once()
+        failed_store.merge_completion_report.assert_not_called()
+        assert _diagnosed_flags(failed_store)["report_diagnosed"] is False
+
+        _, successful_store, successful_read = _run_completion_tracking_hook(
+            prior_submissions=prior,
+            describe_responses={"job-later-ready": "Complete"},
+        )
+
+        successful_read.assert_called_once()
+        successful_store.merge_completion_report.assert_called_once()
+        successful_store.mark_report_diagnosed.assert_called_once()
+        assert _diagnosed_flags(successful_store)["report_diagnosed"] is True
+
+    def test_zero_invoked_tasks_uses_synthetic_empty_report(self):
+        """Zero invoked tasks need no S3 report but remain handled and diagnosed."""
+        prior = {"rule-1": _ct_prior_rec(job_id="job-zero-tasks")}
+        _, mock_store, mock_read_report = _run_completion_tracking_hook(
+            prior_submissions=prior,
+            describe_responses={"job-zero-tasks": "Complete"},
+            tasks_succeeded=0,
+            tasks_failed=0,
+        )
+
+        mock_read_report.assert_not_called()
+        report = mock_store.merge_completion_report.call_args.kwargs["report"]
+        assert report.entries == ()
+        assert report.created_at == _NOW
+        mock_store.mark_report_diagnosed.assert_called_once()
+
+    def test_repeated_terminal_delivery_skips_report_merge_after_processed_id_exists(self):
+        """A duplicate terminal notification leaves the ready report unread.
+
+        The processed-ID guard is the hook-level half of atomic report handling:
+        state-store persistence records the ID with the rows, then a repeated
+        terminal delivery cannot remap or rewrite those rows.
+        """
+        prior = {"rule-1": _ct_prior_rec(job_id="job-duplicate")}
+        _, mock_store, mock_read_report = _run_completion_tracking_hook(
+            prior_submissions=prior,
+            describe_responses={"job-duplicate": "Complete"},
+            completion_job_exists=True,
+        )
+
+        mock_store.completion_job_exists.assert_called_once()
+        mock_store.merge_completion_report.assert_not_called()
+        # The independent diagnostic read remains expected until task 3 removes
+        # the old diagnosis path; it does not mutate completion state.
+        mock_read_report.assert_called_once()
 
     def test_non_terminal_status_does_not_trigger_hook(self):
         """A non-terminal DescribeJob status never triggers config-context
@@ -1616,7 +1844,185 @@ class TestCompletionRecordCreationHook:
             describe_responses={"job-active": "Active"},
         )
         mock_read_report.assert_not_called()
-        mock_store.merge_completion_configs.assert_not_called()
+        mock_store.merge_completion_report.assert_not_called()
+
+
+class TestRunIntervalReportPublication:
+    """Full interval coverage for report-derived completion publication.
+
+    **Validates: Requirements 2.8, 8.3**
+    """
+
+    def test_ready_terminal_report_resolves_and_publishes_same_interval(self):
+        items: dict[str, TrackedObject] = {}
+        prior = {"rule-1": _ct_prior_rec(job_id="job-ready")}
+        scan_state = {
+            "my-bucket": ScanState(
+                last_scan_at=_NOW + timedelta(minutes=1),
+                last_scan_match_count=0,
+            )
+        }
+
+        with patch(
+            "src.orchestrator.sns_report_adapter.publish_completion_report",
+            return_value=PublishResult(success=True, message_id="message-1"),
+        ) as publish:
+            _, store, _ = _run_completion_tracking_hook(
+                prior_submissions=prior,
+                describe_responses={"job-ready": "Complete"},
+                read_bops_report_return_value=[
+                    ManifestEntry(
+                        "my-bucket", "private/report-row.txt", "v1", task_status="succeeded"
+                    )
+                ],
+                completion_items=items,
+                scan_state_by_config=scan_state,
+            )
+
+        resolved = items["private/report-row.txt:v1"]
+        assert resolved.state is CompletionState.RESOLVED
+        assert resolved.replication_outcome == "COMPLETE"
+        assert resolved.resolution_method == "bops_completion_report"
+        assert resolved.resolved_at == _NOW
+        publish.assert_called_once()
+        report = publish.call_args.args[2]
+        assert report["item_count"] == 1
+        assert report["outcome_counts"] == {"COMPLETE": 1}
+        store.delete_completion_items.assert_called_once()
+
+    def test_publish_success_delete_failure_retains_items_and_logs_duplicate_risk(self):
+        """A state-delete failure after SNS success preserves at-least-once delivery."""
+        items: dict[str, TrackedObject] = {}
+        prior = {"rule-1": _ct_prior_rec(job_id="job-delete-failure")}
+        scan_state = {
+            "my-bucket": ScanState(
+                last_scan_at=_NOW + timedelta(minutes=1),
+                last_scan_match_count=0,
+            )
+        }
+
+        with patch(
+            "src.orchestrator.sns_report_adapter.publish_completion_report",
+            return_value=PublishResult(success=True, message_id="message-1"),
+        ) as publish:
+            emitted, store, _ = _run_completion_tracking_hook(
+                prior_submissions=prior,
+                describe_responses={"job-delete-failure": "Complete"},
+                read_bops_report_return_value=[
+                    ManifestEntry(
+                        "my-bucket", "private/retry-row.txt", "v1", task_status="succeeded"
+                    )
+                ],
+                completion_items=items,
+                scan_state_by_config=scan_state,
+                delete_completion_items_side_effect=RuntimeError("conditional state write failed"),
+            )
+
+        publish.assert_called_once()
+        store.delete_completion_items.assert_called_once()
+        assert "private/retry-row.txt:v1" in items
+        assert any(
+            entry.get("component") == "Completion_Tracker"
+            and entry.get("bucket") == "my-bucket"
+            and "published but failed to delete covered items" in entry.get("cause", "")
+            and "risk of duplicate report next interval" in entry.get("cause", "")
+            for entry in emitted
+        )
+
+    def test_failed_report_row_keeps_error_code_in_diagnostics_not_email(self):
+        """A known report failure remains diagnosable without changing SNS v2."""
+        items: dict[str, TrackedObject] = {}
+        prior = {"rule-1": _ct_prior_rec(job_id="job-known-failure")}
+        scan_state = {
+            "my-bucket": ScanState(
+                last_scan_at=_NOW + timedelta(minutes=1),
+                last_scan_match_count=0,
+            )
+        }
+
+        with patch(
+            "src.orchestrator.sns_report_adapter.publish_completion_report",
+            return_value=PublishResult(success=True, message_id="message-1"),
+        ) as publish:
+            emitted, _, _ = _run_completion_tracking_hook(
+                prior_submissions=prior,
+                describe_responses={"job-known-failure": "Complete"},
+                read_bops_report_return_value=[
+                    ManifestEntry(
+                        "my-bucket",
+                        "private/failed-row.txt",
+                        "v1",
+                        task_status="failed",
+                        error_code="NoSuchKey",
+                        result_message="The specified key does not exist.",
+                    )
+                ],
+                completion_items=items,
+                scan_state_by_config=scan_state,
+                tasks_succeeded=0,
+                tasks_failed=1,
+            )
+
+        assert items["private/failed-row.txt:v1"].replication_outcome == "FAILED"
+        diagnostics = [
+            event for event in emitted
+            if isinstance(event, dict)
+            and event.get("event") == "error"
+            and event.get("component") == "Completion_Tracker"
+            and "NoSuchKey" in event.get("cause", "")
+        ]
+        assert len(diagnostics) == 1
+        assert "The specified key does not exist." in diagnostics[0]["cause"]
+
+        publish.assert_called_once()
+        report = publish.call_args.args[2]
+        assert report["format_version"] == 3
+        assert set(report) == {
+            "summary",
+            "format_version",
+            "source_bucket",
+            "item_count",
+            "outstanding_jobs",
+            "submission_deferred",
+            "outcome_counts",
+            "groups",
+        }
+        assert report["outcome_counts"] == {"FAILED": 1}
+        assert "NoSuchKey" not in str(report)
+        assert "error_code" not in str(report)
+
+    def test_nonzero_recovery_scan_defers_ready_report_publication(self):
+        items: dict[str, TrackedObject] = {}
+        prior = {"rule-1": _ct_prior_rec(job_id="job-recovery")}
+        scan_state = {
+            "my-bucket": ScanState(
+                last_scan_at=_NOW + timedelta(minutes=1),
+                last_scan_match_count=1,
+            )
+        }
+
+        with patch(
+            "src.orchestrator.sns_report_adapter.publish_completion_report"
+        ) as publish:
+            _, store, _ = _run_completion_tracking_hook(
+                prior_submissions=prior,
+                describe_responses={"job-recovery": "Complete"},
+                read_bops_report_return_value=[
+                    ManifestEntry(
+                        "my-bucket", "private/recovery-row.txt", "v2", task_status="failed"
+                    )
+                ],
+                completion_items=items,
+                scan_state_by_config=scan_state,
+                preflight_matches=1,
+            )
+
+        resolved = items["private/recovery-row.txt:v2"]
+        assert resolved.replication_outcome == "FAILED"
+        store.record_scan_result.assert_called_once()
+        assert store.record_scan_result.call_args.kwargs["match_count"] == 1
+        publish.assert_not_called()
+        store.delete_completion_items.assert_not_called()
 
 
 class TestPermissionShapedErrorCodeDiagnosis:
@@ -1652,7 +2058,7 @@ class TestPermissionShapedErrorCodeDiagnosis:
         assert "s3:InitiateReplication" in diagnostics[0]["cause"]
         # The ordinary merge still happens — this is additive, not a
         # replacement for the existing completion-tracking behavior.
-        mock_store.merge_completion_configs.assert_called_once()
+        mock_store.merge_completion_report.assert_called_once()
 
     def test_multiple_entries_with_same_code_counted_together(self):
         prior = {"rule-1": _ct_prior_rec(job_id="job-perm-multi")}
@@ -1685,7 +2091,12 @@ class TestPermissionShapedErrorCodeDiagnosis:
     def test_ordinary_succeeded_entries_emit_no_diagnostic(self):
         prior = {"rule-1": _ct_prior_rec(job_id="job-ok")}
         entries = [
-            ManifestEntry(source_bucket="my-bucket", object_key="key-a", version_id="v1"),
+            ManifestEntry(
+                source_bucket="my-bucket",
+                object_key="key-a",
+                version_id="v1",
+                task_status="succeeded",
+            ),
         ]
         emitted, _, _ = _run_completion_tracking_hook(
             prior_submissions=prior,
@@ -1714,6 +2125,7 @@ class TestPermissionShapedErrorCodeDiagnosis:
         entries = [
             ManifestEntry(
                 source_bucket="my-bucket", object_key="key-a", version_id="v1",
+                task_status="failed",
                 error_code="NoSuchKey",
                 result_message="The specified key does not exist.",
             ),
@@ -1785,19 +2197,23 @@ class TestPermissionShapedErrorCodeDiagnosis:
         entries = [
             ManifestEntry(
                 source_bucket="my-bucket", object_key="key-a", version_id="v1",
+                task_status="failed",
                 error_code="SrcObjectNotEligible",
             ),
             ManifestEntry(
                 source_bucket="my-bucket", object_key="key-b", version_id="v2",
+                task_status="failed",
                 error_code="SrcObjectNotEligible",
             ),
             ManifestEntry(
                 source_bucket="my-bucket", object_key="key-c", version_id="v3",
+                task_status="failed",
                 error_code="InitiateReplicationNotPermitted",
             ),
             # A succeeded task contributes no diagnostic.
             ManifestEntry(
                 source_bucket="my-bucket", object_key="key-d", version_id="v4",
+                task_status="succeeded",
             ),
         ]
         emitted, _, _ = _run_completion_tracking_hook(
@@ -1887,27 +2303,27 @@ class TestPermissionShapedErrorCodeDiagnosis:
 
     def test_calls_happen_in_order_read_then_merge(self):
         """The two calls fire in order: read_bops_completion_report, then
-        store.merge_completion_configs (Requirements 2.1, 2.2)."""
+        store.merge_completion_report (Requirements 2.1, 2.2)."""
         prior = {"rule-1": _ct_prior_rec(job_id="job-order")}
         call_order: list[str] = []
 
         def read_side_effect(*args, **kwargs):
             call_order.append("read_bops_completion_report")
-            return []
+            return BopsCompletionReport(created_at=_NOW, entries=())
 
         def merge_side_effect(*args, **kwargs):
-            call_order.append("merge_completion_configs")
+            call_order.append("merge_completion_report")
             return '"etag-completion"'
 
         emitted, mock_store, mock_read_report = _run_completion_tracking_hook(
             prior_submissions=prior,
             describe_responses={"job-order": "Complete"},
             read_bops_report_side_effect=read_side_effect,
-            merge_completion_configs_side_effect=merge_side_effect,
+            merge_completion_report_side_effect=merge_side_effect,
         )
         assert call_order == [
             "read_bops_completion_report",
-            "merge_completion_configs",
+            "merge_completion_report",
         ]
 
     def test_consecutive_failures_increments_when_read_report_raises(self):
@@ -1924,15 +2340,15 @@ class TestPermissionShapedErrorCodeDiagnosis:
         submitted_rec: SubmissionRecord = mock_store.record_submission.call_args[0][2]
         assert submitted_rec.consecutive_failures == 1
 
-    def test_consecutive_failures_increments_when_merge_completion_configs_raises(self):
+    def test_consecutive_failures_increments_when_merge_completion_report_raises(self):
         """For a Failed job, consecutive_failures still increments correctly
-        even when store.merge_completion_configs (the second of the two
+        even when store.merge_completion_report (the second of the two
         calls) raises (Requirement 6.1)."""
         prior = {"rule-1": _ct_prior_rec(job_id="job-storeboom-cb")}
         emitted, mock_store, _ = _run_completion_tracking_hook(
             prior_submissions=prior,
             describe_responses={"job-storeboom-cb": "Failed"},
-            merge_completion_configs_side_effect=RuntimeError("store boom"),
+            merge_completion_report_side_effect=RuntimeError("store boom"),
         )
         mock_store.record_submission.assert_called_once()
         submitted_rec: SubmissionRecord = mock_store.record_submission.call_args[0][2]
@@ -1956,7 +2372,7 @@ class TestPermissionShapedErrorCodeDiagnosis:
         else:
             # Non-terminal: no read at all.
             mock_read_report.assert_not_called()
-        mock_store.merge_completion_configs.assert_not_called()
+        mock_store.merge_completion_report.assert_not_called()
         mock_store.completion_job_exists.assert_not_called()
 
     def test_skip_when_job_exists_other_logic_continues_for_failed_status(self):
@@ -1972,7 +2388,7 @@ class TestPermissionShapedErrorCodeDiagnosis:
         )
         # Diagnosis reads (independent gate); merge skipped.
         mock_read_report.assert_called_once()
-        mock_store.merge_completion_configs.assert_not_called()
+        mock_store.merge_completion_report.assert_not_called()
 
         readmits = _audits(emitted, "batch_job_failure_readmit")
         assert len(readmits) == 1
@@ -1994,7 +2410,7 @@ class TestProperty12CreationMergeFailureIsolation:
 
     @given(
         status=st.sampled_from(["Complete", "Failed", "Cancelled"]),
-        inject_into=st.sampled_from(["read_bops_report", "merge_completion_configs"]),
+        inject_into=st.sampled_from(["read_bops_report", "merge_completion_report"]),
     )
     @settings(max_examples=100)
     def test_injected_failure_does_not_change_checkpoint_or_circuit_breaker(
@@ -2007,7 +2423,7 @@ class TestProperty12CreationMergeFailureIsolation:
         if inject_into == "read_bops_report":
             kwargs["read_bops_report_side_effect"] = RuntimeError("injected failure")
         else:
-            kwargs["merge_completion_configs_side_effect"] = RuntimeError("injected failure")
+            kwargs["merge_completion_report_side_effect"] = RuntimeError("injected failure")
 
         # Run WITHOUT injection (baseline).
         _, baseline_store, _ = _run_completion_tracking_hook(
@@ -2894,18 +3310,16 @@ class TestLegacyToSingleMigrationRecovery:
 
 
 class TestLegacyToSingleMigrationRecoveryRealStateStore:
-    """Exercises the arrival at state_store.py's collapse-to-one-record
-    behavior via a FULL ``run_interval`` call against the real
-    ``StateStore`` (not mocked) and a fake S3 client seeded with a legacy
-    per-config_id-keyed state object — complementing
-    ``tests/adapters/test_state_store.py``'s direct unit coverage of the
-    same collapse (``record_submission``'s migration-on-write) with an
-    orchestrator-level integration check.
+    """Exercises the re-keying of legacy records via a FULL ``run_interval``
+    call against the real ``StateStore`` (not mocked) and a fake S3 client
+    seeded with a legacy per-config_id-keyed state object — complementing
+    ``tests/adapters/test_state_store.py``'s direct unit coverage of the same
+    re-keying with an orchestrator-level integration check.
 
-    _Requirements: 2.4, 4.1_
+    _Requirements: 1.1, 1.2, 4.1_
     """
 
-    def test_full_run_interval_collapses_legacy_records_via_real_state_store(self):
+    def test_full_run_interval_re_keys_legacy_records_via_real_state_store(self):
         import json as _json
 
         from src.core.checkpoint_serializer import (
@@ -2997,11 +3411,13 @@ class TestLegacyToSingleMigrationRecoveryRealStateStore:
             run_interval(_config([bucket_name]), _BASE_RUNTIME)
 
         final_payload = _json.loads(state_holder["json"])
-        # The legacy rule-a/rule-b entries are gone; only the bucket-name
-        # sentinel entry survives — the real StateStore's collapse-on-write,
-        # reached via a full orchestrator run.
-        assert set(final_payload["submission_records"].keys()) == {bucket_name}
-        assert final_payload["submission_records"][bucket_name]["job_id"] == "job-abc-123"
+        # The legacy rule-a/rule-b entries are re-keyed by their own job_id and
+        # kept alongside this run's record. Dropping them is what discarded a
+        # running job's report, its report-missing check, and its rollback target.
+        records = final_payload["submission_records"]
+        assert set(records.keys()) == {"job-a", "job-b", "job-abc-123"}
+        assert records["job-abc-123"]["job_id"] == "job-abc-123"
+        assert records["job-a"]["job_id"] == "job-a"
 
 
 # ---------------------------------------------------------------------------
@@ -3310,6 +3726,83 @@ class TestJournalReadRowCap:
             and e.get("action") == "row_cap_overshoot"
         ]
         assert overshoots == []
+
+    def test_overshoot_is_measured_against_the_whole_cap_not_the_new_row_budget(self):
+        """row-cap-forward-progress splits the cap between the lookback tail and
+        the rows above the watermark, and the boundary query is given only the
+        new-row share. The overshoot audit still measures the whole read against
+        the whole cap, so its numbers keep meaning what they meant
+        (Requirement 2.5). With a tail of 5 against a cap of 4 the new-row budget
+        is 1, so an overshoot computed against the budget would report 4 rather
+        than 1.
+
+        Feature: row-cap-forward-progress
+        """
+        boundary = "2024-01-03T00:00:00.000000Z"
+        rt = {**_BASE_RUNTIME, "journal_read_row_cap": 4}
+        ops = [
+            TaggingOperation(
+                source_bucket="my-bucket",
+                object_key=f"path/obj-{i}.txt",
+                resulting_tag_set={"env": "prod"},
+                sequence_number=f"seq-{i:04d}",
+                operation="PutObjectTagging",
+                # Above the persisted watermark below, so every op stays
+                # eligible and the run reaches the overshoot check.
+                event_time=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            )
+            for i in range(5)
+        ]
+
+        (
+            mock_factory_cls, mock_store_cls,
+            mock_get_rules, mock_read_journal,
+            mock_submit_job,
+        ) = _make_mocks(["my-bucket"], ops_per_bucket={"my-bucket": ops})
+        # A non-epoch watermark, so the lookback tail exists and the budget
+        # split actually runs rather than short-circuiting to a zero tail.
+        mock_store_cls.return_value.get_checkpoint.side_effect = (
+            lambda s3, sb, src: (_checkpoint(src, _WM_CURRENT), '"etag-0"')
+        )
+
+        emitted: list = []
+        with (
+            patch("src.orchestrator.observability.emit", side_effect=emitted.append),
+            patch("src.orchestrator.ClientFactory", mock_factory_cls),
+            patch("src.orchestrator.state_store_module.StateStore", mock_store_cls),
+            patch("src.orchestrator.replication_config_adapter.get_replication_rules",
+                  mock_get_rules),
+            patch("src.orchestrator.athena_journal_adapter.read_journal",
+                  mock_read_journal),
+            patch("src.orchestrator.athena_journal_adapter.find_row_count_boundary",
+                  return_value=boundary) as mock_boundary,
+            patch("src.orchestrator.athena_journal_adapter.find_tail_row_count",
+                  return_value=5) as mock_tail_count,
+            patch("src.orchestrator.athena_journal_adapter.find_tail_floor",
+                  return_value="2024-01-01T00:01:00.000000Z"),
+            patch("src.orchestrator.write_in_memory_inventory_manifest",
+                  return_value=_written_manifest()),
+            patch("src.orchestrator.batch_operations_adapter.submit_batch_job",
+                  mock_submit_job),
+            patch("src.orchestrator.preflight_count", return_value=0),
+            patch("src.orchestrator.read_permanent_deletes", return_value=set()),
+        ):
+            run_interval(_config(["my-bucket"]), rt)
+
+        # The split really ran: the tail was counted and the boundary was given
+        # only the new-row share, so the assertions below are not vacuous.
+        mock_tail_count.assert_called_once()
+        assert mock_boundary.call_args.kwargs["row_cap"] == 1
+
+        overshoots = [
+            e for e in emitted
+            if isinstance(e, dict) and e.get("event") == "audit"
+            and e.get("action") == "row_cap_overshoot"
+        ]
+        assert len(overshoots) == 1
+        assert overshoots[0]["row_cap"] == 4
+        assert overshoots[0]["rows_read"] == 5
+        assert overshoots[0]["overshoot_rows"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -3938,7 +4431,7 @@ class TestDeletedVersionFilterAppliesToManifest:
 # min(failed_lows) to "", resetting the bucket to the epoch and re-admitting
 # the entire journal history as duplicate jobs. An empty watermark_low arises
 # legitimately for records written before the field existed
-# (_deserialize_submission_record defaults it to ""), and is also the shape an
+# (deserialize_submission_record defaults it to ""), and is also the shape an
 # attacker able to write the state object would use to force a full replay.
 # ---------------------------------------------------------------------------
 
@@ -3986,7 +4479,7 @@ class TestEmptyWatermarkLowDoesNotRollBackToEpoch:
         )
         readmits = _audits(emitted, "batch_job_failure_readmit")
         assert len(readmits) == 1
-        assert readmits[0]["config_id"] == "rule-a"
+        assert readmits[0]["job_id"] == "job-a"
 
 
 # ---------------------------------------------------------------------------
@@ -4245,7 +4738,7 @@ class TestAlwaysOnCompletionReport:
         a payload without the key deserialises to False (Requirement 3.3)."""
         from src.core.checkpoint_serializer import (
             serialize_submission_record,
-            _deserialize_submission_record,
+            deserialize_submission_record,
         )
 
         rec = SubmissionRecord(
@@ -4261,37 +4754,441 @@ class TestAlwaysOnCompletionReport:
             report_diagnosed=True,
         )
         data = serialize_submission_record(rec)
-        restored = _deserialize_submission_record(data)
+        restored = deserialize_submission_record(data)
         assert restored.report_diagnosed is True
 
         # A payload without the key deserialises to False
         data_without_key = dict(data)
         del data_without_key["report_diagnosed"]
-        restored_without = _deserialize_submission_record(data_without_key)
+        restored_without = deserialize_submission_record(data_without_key)
         assert restored_without.report_diagnosed is False
 
-    def test_missing_report_diagnoses_nothing_and_raises_nothing(self):
-        """An absent completion report diagnoses nothing and raises nothing.
-
-        Whatever the reason the report never arrived — the job wrote none, or
-        the write failed — the read finds nothing and
-        read_bops_completion_report returns an empty list. This must not break
-        anything."""
-        prior = {"rule-1": _ct_prior_rec(job_id="job-no-report")}
-        emitted, mock_store, mock_read_report = _run_completion_tracking_hook(
-            prior_submissions=prior,
-            describe_responses={"job-no-report": "Complete"},
-            read_bops_report_return_value=[],
-            completion_report_topic_arn=None,
+    def test_recovery_scored_round_trips_through_serialization(self):
+        """A record written by 1.0.1 carries no recovery_scored key, and must read
+        as False so its outcome is scored once on the first 1.1.0 run that sees
+        it. Reading absence as True would silently drop a failure the Solution
+        has not yet acted on."""
+        from src.core.checkpoint_serializer import (
+            serialize_submission_record,
+            deserialize_submission_record,
         )
-        # No diagnostic error, no Completion_Tracker error
-        diagnostics = [
-            e for e in emitted
-            if isinstance(e, dict) and e.get("event") == "error"
-            and e.get("component") == "Completion_Tracker"
+
+        rec = SubmissionRecord(
+            replication_config_id="cfg-1",
+            source_bucket="my-bucket",
+            job_id="job-scored",
+            manifest_key="manifests/cfg-1/ts.json",
+            submitted_at=_NOW,
+            status=SubmissionStatus.SUBMITTED,
+            recovery_scored=True,
+        )
+        data = serialize_submission_record(rec)
+        assert deserialize_submission_record(data).recovery_scored is True
+
+        data_without_key = dict(data)
+        del data_without_key["recovery_scored"]
+        assert (
+            deserialize_submission_record(data_without_key).recovery_scored is False
+        )
+
+    def test_the_two_flags_are_independent(self):
+        """A job whose report cannot be read is scored but not diagnosed, which is
+        the case that makes re-scoring reachable."""
+        from src.core.checkpoint_serializer import (
+            serialize_submission_record,
+            deserialize_submission_record,
+        )
+
+        rec = SubmissionRecord(
+            replication_config_id="cfg-1",
+            source_bucket="my-bucket",
+            job_id="job-split",
+            manifest_key="manifests/cfg-1/ts.json",
+            submitted_at=_NOW,
+            status=SubmissionStatus.SUBMITTED,
+            report_diagnosed=False,
+            recovery_scored=True,
+        )
+        restored = deserialize_submission_record(serialize_submission_record(rec))
+        assert restored.report_diagnosed is False
+        assert restored.recovery_scored is True
+
+
+# ---------------------------------------------------------------------------
+# Absent DescribeJob fields are not zero-valued
+# Feature: report-derived-completion
+# Requirements: 1.1.2, 1.1.3
+# ---------------------------------------------------------------------------
+class TestAbsentDescribeJobFieldsLeaveTheJobRetryable:
+    """An absent field means unknown, not zero.
+
+    Reading an absent ``ProgressSummary`` as zero invoked tasks took the
+    synthetic-empty-report branch and marked the job processed with no
+    outcomes, silently dropping every object in it. Indexing an absent
+    ``TerminationDate`` raised ``KeyError`` into the cached report error, so the
+    job retried every interval forever.
+    """
+
+    @staticmethod
+    def _report_errors(emitted: list) -> list[str]:
+        return [
+            entry.get("cause", "")
+            for entry in _errors(emitted)
+            if "BOPS_Completion_Report" in entry.get("cause", "")
         ]
-        assert len(diagnostics) == 0
-        # The run completes without raising (implied by reaching here)
-        # mark_report_diagnosed was still called (empty report = nothing to
-        # diagnose, but the flag should still be set to avoid re-reading)
-        mock_store.mark_report_diagnosed.assert_called_once()
+
+    def test_missing_progress_summary_is_not_read_as_zero_tasks(self):
+        emitted = _run_with_recovery_mocks(
+            prior_submissions={"rule-1": _prior_rec(job_id="job-nosummary")},
+            describe_responses={"job-nosummary": "Complete"},
+        )
+
+        causes = self._report_errors(emitted)
+        assert causes, "a job with no ProgressSummary must stay retryable"
+        assert any("carried no ProgressSummary" in cause for cause in causes), causes
+
+    def test_zero_task_job_falls_back_to_creation_time(self):
+        """A terminal job with no TerminationDate still resolves."""
+        emitted = _run_with_recovery_mocks(
+            prior_submissions={"rule-1": _prior_rec(job_id="job-zero")},
+            describe_responses={"job-zero": "Complete"},
+            progress_summaries={
+                "job-zero": {
+                    "NumberOfTasksSucceeded": 0,
+                    "NumberOfTasksFailed": 0,
+                }
+            },
+            job_extras={
+                "job-zero": {"CreationTime": datetime(2026, 8, 27, tzinfo=timezone.utc)}  # noqa: UP017
+            },
+        )
+
+        assert self._report_errors(emitted) == []
+
+    def test_zero_task_job_prefers_termination_date(self):
+        emitted = _run_with_recovery_mocks(
+            prior_submissions={"rule-1": _prior_rec(job_id="job-zero")},
+            describe_responses={"job-zero": "Complete"},
+            progress_summaries={
+                "job-zero": {
+                    "NumberOfTasksSucceeded": 0,
+                    "NumberOfTasksFailed": 0,
+                }
+            },
+            job_extras={
+                "job-zero": {
+                    "CreationTime": datetime(2026, 8, 27, tzinfo=timezone.utc),  # noqa: UP017
+                    "TerminationDate": datetime(2026, 8, 27, 1, tzinfo=timezone.utc),  # noqa: UP017
+                }
+            },
+        )
+
+        assert self._report_errors(emitted) == []
+
+    def test_zero_task_job_with_neither_timestamp_stays_retryable(self):
+        """Not a KeyError: a malformed DescribeJob response is retryable."""
+        emitted = _run_with_recovery_mocks(
+            prior_submissions={"rule-1": _prior_rec(job_id="job-zero")},
+            describe_responses={"job-zero": "Complete"},
+            progress_summaries={
+                "job-zero": {
+                    "NumberOfTasksSucceeded": 0,
+                    "NumberOfTasksFailed": 0,
+                }
+            },
+        )
+
+        causes = self._report_errors(emitted)
+        assert causes, "a job with no usable timestamp must stay retryable"
+        assert any(
+            "neither TerminationDate nor CreationTime" in cause for cause in causes
+        ), causes
+        assert not any("KeyError" in cause for cause in causes), causes
+
+
+# ---------------------------------------------------------------------------
+# Leftover 1.0.1 items drain through the ordinary publish path
+# Feature: report-derived-completion
+# Requirements: 4.2, 4.6
+# ---------------------------------------------------------------------------
+class TestLegacyItemsDrainOnUpgrade:
+    """An in-place update from 1.0.1 leaves no permanent residue.
+
+    1.1.0 has no way to resolve an item 1.0.1 left in lifecycle ``PENDING``, and
+    nothing prunes completion items other than the post-publish delete. Left
+    alone such an item would stay in the state object for the life of the stack,
+    growing it without bound, and the object it describes would never be reported
+    at all.
+
+    The publish phase normalizes it to ``UNKNOWN`` in memory, which makes it
+    publishable and so lets the existing delete path remove it. No migration
+    write, and nothing new on the critical path.
+    """
+
+    _ITEM_KEY = "legacy/stranded.txt:v0"
+
+    def _legacy_item(self) -> TrackedObject:
+        return TrackedObject(
+            source_bucket="my-bucket",
+            object_key="legacy/stranded.txt",
+            version_id="v0",
+            configs={
+                "my-bucket": ConfigContext(
+                    replication_config_id="my-bucket",
+                    job_id="job-from-1-0-1",
+                    manifest_generated_at=_NOW - timedelta(days=2),
+                    bops_confirmed=True,
+                )
+            },
+            state=CompletionState.PENDING,
+            replication_outcome=None,
+        )
+
+    def _scan_state(self):
+        return {
+            "my-bucket": ScanState(
+                last_scan_at=_NOW + timedelta(minutes=1),
+                last_scan_match_count=0,
+            )
+        }
+
+    def test_legacy_item_publishes_as_unknown_and_is_deleted(self):
+        items = {self._ITEM_KEY: self._legacy_item()}
+
+        with patch(
+            "src.orchestrator.sns_report_adapter.publish_completion_report",
+            return_value=PublishResult(success=True, message_id="message-legacy"),
+        ) as publish:
+            _, store, _ = _run_completion_tracking_hook(
+                prior_submissions={"rule-1": _ct_prior_rec(job_id="job-none")},
+                describe_responses={"job-none": "Active"},
+                completion_items=items,
+                scan_state_by_config=self._scan_state(),
+            )
+
+        publish.assert_called_once()
+        report = publish.call_args.args[2]
+        assert report["item_count"] == 1
+        assert report["outcome_counts"] == {"UNKNOWN": 1}
+        # The bucket's prior job is Active and this run submitted another, so the
+        # report must not read as an all-clear. The summary states the running
+        # jobs instead.
+        assert report["outstanding_jobs"] == 2
+        assert "remain outstanding" not in report["summary"]
+        assert report["summary"].endswith("2 replication jobs are still running.")
+
+        store.delete_completion_items.assert_called_once()
+        assert store.delete_completion_items.call_args.args[3] == [self._ITEM_KEY]
+
+    def test_the_stored_item_is_never_rewritten_to_resolve_it(self):
+        """Normalization is in memory: no migration-style state write occurs."""
+        items = {self._ITEM_KEY: self._legacy_item()}
+
+        with patch(
+            "src.orchestrator.sns_report_adapter.publish_completion_report",
+            return_value=PublishResult(success=True, message_id="message-legacy"),
+        ):
+            _, store, _ = _run_completion_tracking_hook(
+                prior_submissions={"rule-1": _ct_prior_rec(job_id="job-none")},
+                describe_responses={"job-none": "Active"},
+                completion_items=items,
+                scan_state_by_config=self._scan_state(),
+            )
+
+        # The only state write in the publish phase is the delete.
+        assert not hasattr(store, "migrate_legacy_completion_items") or not (
+            store.migrate_legacy_completion_items.called
+        )
+        # The in-memory object handed to the store was left in its stored shape.
+        assert items[self._ITEM_KEY].state is CompletionState.PENDING
+        assert items[self._ITEM_KEY].replication_outcome is None
+
+    def test_a_legacy_item_alongside_a_fresh_one_both_publish(self):
+        """Mixed state object: the legacy item does not distort the fresh count."""
+        items = {self._ITEM_KEY: self._legacy_item()}
+
+        with patch(
+            "src.orchestrator.sns_report_adapter.publish_completion_report",
+            return_value=PublishResult(success=True, message_id="message-mixed"),
+        ) as publish:
+            _run_completion_tracking_hook(
+                prior_submissions={"rule-1": _ct_prior_rec(job_id="job-ready")},
+                describe_responses={"job-ready": "Complete"},
+                read_bops_report_return_value=[
+                    ManifestEntry(
+                        "my-bucket", "fresh/row.txt", "v1", task_status="succeeded"
+                    )
+                ],
+                completion_items=items,
+                scan_state_by_config=self._scan_state(),
+            )
+
+        report = publish.call_args.args[2]
+        assert report["item_count"] == 2
+        assert report["outcome_counts"] == {"UNKNOWN": 1, "COMPLETE": 1}
+
+    def test_legacy_item_still_waits_for_quiescence(self):
+        """It drains on the first quiet interval, not unconditionally."""
+        items = {self._ITEM_KEY: self._legacy_item()}
+        busy = {
+            "my-bucket": ScanState(
+                last_scan_at=_NOW + timedelta(minutes=1),
+                last_scan_match_count=5,
+            )
+        }
+
+        with patch(
+            "src.orchestrator.sns_report_adapter.publish_completion_report",
+            return_value=PublishResult(success=True, message_id="unused"),
+        ) as publish:
+            _, store, _ = _run_completion_tracking_hook(
+                prior_submissions={"rule-1": _ct_prior_rec(job_id="job-none")},
+                describe_responses={"job-none": "Active"},
+                completion_items=items,
+                scan_state_by_config=busy,
+            )
+
+        publish.assert_not_called()
+        store.delete_completion_items.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The publish phase's three outstanding fields, threaded from bucket processing
+# bounded-concurrent-jobs tasks 5.3, 5.4 (Requirements 5.2, 5.4, 5.7)
+#
+# The publish phase reads only completion items and scan state from the state
+# object — it is isolated so a per-bucket processing failure cannot affect it.
+# The job count and the deferred flag are produced during processing and cannot
+# be re-derived there without another round trip, so they cross that boundary as
+# threaded values rather than the two phases being merged.
+# ---------------------------------------------------------------------------
+
+
+class TestOutstandingJobsReachThePublishedReport:
+    def _item(self, key: str) -> TrackedObject:
+        return TrackedObject(
+            source_bucket="my-bucket",
+            object_key=key,
+            version_id="v1",
+            configs={
+                "my-bucket": ConfigContext(
+                    replication_config_id="my-bucket",
+                    job_id="job-prior",
+                    manifest_generated_at=_NOW - timedelta(hours=1),
+                    bops_confirmed=True,
+                )
+            },
+            state=CompletionState.RESOLVED,
+            resolved_at=_NOW,
+            resolution_method="bops_completion_report",
+            replication_outcome="COMPLETE",
+        )
+
+    def _quiescent(self):
+        return {
+            "my-bucket": ScanState(
+                last_scan_at=_NOW + timedelta(minutes=1),
+                last_scan_match_count=0,
+            )
+        }
+
+    def _publish(self, describe_status: str, chunks: int = 1):
+        """Run one interval and return the list of published report payloads."""
+        items = {
+            f"key-{index}:v1": self._item(f"key-{index}")
+            for index in range(max(chunks, 1) * 2)
+        }
+
+        def two_batches(batch_items, max_group_bytes=None):  # noqa: ARG001
+            half = len(batch_items) // 2
+            return [batch_items[:half], batch_items[half:]]
+
+        stack = [
+            patch(
+                "src.orchestrator.sns_report_adapter.publish_completion_report",
+                return_value=PublishResult(success=True, message_id="m"),
+            )
+        ]
+        if chunks > 1:
+            stack.append(
+                patch(
+                    "src.orchestrator.completion_tracker.chunk_items_for_report",
+                    side_effect=two_batches,
+                )
+            )
+
+        with contextlib.ExitStack() as exits:
+            publish = exits.enter_context(stack[0])
+            for extra in stack[1:]:
+                exits.enter_context(extra)
+            _run_completion_tracking_hook(
+                prior_submissions={"job-prior": _ct_prior_rec(job_id="job-prior")},
+                describe_responses={"job-prior": describe_status},
+                completion_items=items,
+                scan_state_by_config=self._quiescent(),
+            )
+
+        return [call.args[2] for call in publish.call_args_list]
+
+    def test_a_running_prior_job_and_this_runs_job_are_both_counted(self):
+        """The count is what is outstanding when the report is built, so it
+        includes the job this run submitted as well as the one already running."""
+        reports = self._publish("Active")
+
+        assert len(reports) == 1
+        assert reports[0]["outstanding_jobs"] == 2
+        assert reports[0]["format_version"] == 3
+
+    def test_a_finished_prior_job_leaves_only_this_runs_job(self):
+        """Non-vacuous: the count is genuinely derived from job state rather than
+        being a constant."""
+        reports = self._publish("Complete")
+
+        assert reports[0]["outstanding_jobs"] == 1
+        assert reports[0]["submission_deferred"] is False
+
+    def test_a_bucket_that_never_checked_its_jobs_reports_an_unknown_count(self):
+        """The publish phase runs for every configured bucket, including one whose
+        processing failed before the DescribeJob loop. Reporting zero there would
+        be a false all-clear for a bucket that was never checked."""
+        items = {"key-0:v1": self._item("key-0")}
+
+        with (
+            patch(
+                "src.orchestrator.sns_report_adapter.publish_completion_report",
+                return_value=PublishResult(success=True, message_id="m"),
+            ) as publish,
+            # A rule-resolution failure returns before the job check runs.
+            patch("src.orchestrator._resolve_rules", return_value=None),
+        ):
+            _run_completion_tracking_hook(
+                prior_submissions={"job-prior": _ct_prior_rec(job_id="job-prior")},
+                describe_responses={"job-prior": "Active"},
+                completion_items=items,
+                scan_state_by_config=self._quiescent(),
+            )
+
+        report = publish.call_args.args[2]
+        assert report["outstanding_jobs"] is None
+        assert "remain outstanding" not in report["summary"]
+
+    def test_this_runs_submission_is_never_reported_as_nothing_outstanding(self):
+        """A report that said nothing remained in tracking while the job this very
+        run started was still replicating would be the false all-clear the
+        format_version bump exists to remove."""
+        reports = self._publish("Complete")
+
+        assert reports[0]["outstanding_jobs"] >= 1
+        assert "remain outstanding" not in reports[0]["summary"]
+
+    def test_every_message_of_a_split_report_carries_identical_values(self):
+        """The chunks are one logical report split only to fit the Amazon SNS
+        message limit, and they carry no ordering, so a per-chunk countdown would
+        imply a sequence that does not exist (Requirement 5.7)."""
+        reports = self._publish("Active", chunks=2)
+
+        assert len(reports) == 2
+        for field_name in ("outstanding_jobs", "submission_deferred"):
+            values = {report[field_name] for report in reports}
+            assert len(values) == 1, f"{field_name} differs across messages: {values}"
+        assert reports[0]["outstanding_jobs"] == 2

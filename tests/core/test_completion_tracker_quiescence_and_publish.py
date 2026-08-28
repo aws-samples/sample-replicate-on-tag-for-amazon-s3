@@ -97,6 +97,21 @@ class TestShouldPublish:
         }
         assert should_publish(obj, scan_state_by_config) is True
 
+    def test_legacy_unconfirmed_context_does_not_block_publication(self):
+        """bops_confirmed is serialized only for rollback compatibility."""
+        obj = make_obj(
+            state=CompletionState.RESOLVED,
+            configs={"cfg-1": make_config_context(bops_confirmed=False)},
+        )
+        scan_state_by_config = {
+            "cfg-1": make_scan_state(
+                last_scan_at=_MANIFEST_AT + timedelta(hours=1),
+                last_scan_match_count=0,
+            )
+        }
+
+        assert should_publish(obj, scan_state_by_config) is True
+
     def test_pending_returns_false(self):
         obj = make_obj(
             state=CompletionState.PENDING, replication_outcome=None, configs={"cfg-1": make_config_context()}

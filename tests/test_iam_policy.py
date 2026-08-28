@@ -375,34 +375,38 @@ class TestNoUnconditionalDestinationAccess:
         assert "*" not in all_actions
 
 
-class TestReadSourceObjectTagsGetObject:
-    """Validate s3:GetObject was added to ReadSourceObjectTags — task 23.1.
+class TestRemovedSourceObjectReadPermissions:
+    """Report-derived completion must not regain source-object read grants.
 
-    Feature: replication-completion-tracking
-    Requirements: 2.1, 3.1
+    State Bucket reads remain necessary and are checked elsewhere. This guard is
+    limited to statements whose resource names the source-bucket placeholder.
     """
 
-    @pytest.fixture
-    def read_source_object_tags_statement(self, policy):
-        for stmt in policy.get("Statement", []):
-            if stmt.get("Sid") == "ReadSourceObjectTags":
-                return stmt
-        pytest.fail("ReadSourceObjectTags statement not found in iam-policy.json")
+    _FORBIDDEN_ACTIONS = {
+        "s3:getobject",
+        "s3:getobjectversion",
+        "s3:listbucket",
+    }
 
-    def test_includes_get_object(self, read_source_object_tags_statement):
-        """s3:GetObject is required for the Source_Status_Check HeadObject call
-        against the source object version (Req 3.1)."""
-        actions = read_source_object_tags_statement.get("Action", [])
-        if isinstance(actions, str):
-            actions = [actions]
-        assert any(a.lower() == "s3:getobject" for a in actions), (
-            f"Expected s3:GetObject in ReadSourceObjectTags; got {actions}"
-        )
+    def test_source_bucket_statements_grant_no_completion_read_actions(self, policy):
+        source_statements = []
+        for statement in policy.get("Statement", []):
+            resources = statement.get("Resource", [])
+            if isinstance(resources, str):
+                resources = [resources]
+            if any(
+                isinstance(resource, str) and "SOURCE_BUCKET_NAME" in resource
+                for resource in resources
+            ):
+                source_statements.append(statement)
 
-    def test_scoped_to_source_bucket_objects(self, read_source_object_tags_statement):
-        """Resource remains scoped to source bucket objects only, no destination access."""
-        resources = read_source_object_tags_statement.get("Resource", [])
-        if isinstance(resources, str):
-            resources = [resources]
-        for r in resources:
-            assert "SOURCE_BUCKET_NAME" in r, f"Unexpected resource: {r}"
+        assert source_statements, "Expected a source-bucket replication-config grant"
+        for statement in source_statements:
+            actions = statement.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            action_set = {action.lower() for action in actions}
+            assert action_set.isdisjoint(self._FORBIDDEN_ACTIONS), (
+                f"Source-bucket statement {statement.get('Sid')!r} regained "
+                f"completion read permissions: {action_set & self._FORBIDDEN_ACTIONS}"
+            )

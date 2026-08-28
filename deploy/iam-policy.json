@@ -33,14 +33,11 @@
     "                            when metric publishing is enabled; otherwise remove the",
     "                            OptionalCloudWatchMetrics statement entirely.",
     "",
-    "  Completion tracking (per-object-version replication confirmation via the source object's",
-    "  native x-amz-replication-status header) never accesses the destination account or region —",
-    "  no sts:AssumeRole or destination-account statement is present anywhere in this policy.",
     "  Every job writes its completion report under completion-reports/ in SCRATCH_BUCKET_NAME as",
     "  the Batch Operations job role (BATCH_OPERATIONS_ROLE_NAME), which the stack grants",
-    "  s3:PutObject on that prefix in the role's own identity policy. That is not a grant on this",
-    "  ExecutionRole and needs no bucket policy. The ExecutionRole reads the report back via the",
-    "  existing ScratchBucketReadWrite statement below (s3:GetObject/s3:ListBucket already cover",
+    "  s3:PutObject on that prefix in the role's own identity policy. The Solution derives each",
+    "  tracked object's outcome from its report row. The ExecutionRole reads the report back via",
+    "  the existing ScratchBucketReadWrite statement below (s3:GetObject/s3:ListBucket already cover",
     "  it); no additional ExecutionRole statement is needed to read the report.",
     "",
     "  Inventory-report manifests (the sole manifest generation path — In_Memory_Generation)",
@@ -58,27 +55,13 @@
   "Statement": [
     {
       "Sid": "ReadSourceBucketReplicationConfig",
-      "_comment": "Required for Rule_Deriver: reads each source bucket's existing Replication_Configuration to derive tag-scoped rules. (Requirement 3.1, 12.1) ListBucket is required so that the completion-tracking Source_Status_Check's HeadObject on a deleted object version returns 404 rather than AccessDenied (403): S3 masks object existence from a caller without ListBucket, and a 403 is indistinguishable from a transient access failure, so the object would be re-checked every run forever and its Tracked_Object would never leave the state object. (Requirement 3.7)",
+      "_comment": "Required for Rule_Deriver: reads each source bucket's existing replication configuration to derive tag-scoped rules. (Requirement 3.1, 12.1)",
       "Effect": "Allow",
       "Action": [
-        "s3:GetReplicationConfiguration",
-        "s3:ListBucket"
+        "s3:GetReplicationConfiguration"
       ],
       "Resource": [
         "arn:aws:s3:::SOURCE_BUCKET_NAME"
-      ]
-    },
-    {
-      "Sid": "ReadSourceObjectTags",
-      "_comment": "Sid retained for continuity; this statement no longer grants tagging actions. It covers exactly one call: the completion-tracking Source_Status_Check's HeadObject against a source object version. Both actions are needed because S3 evaluates a version-qualified HeadObject (VersionId set) against GetObjectVersion and an unqualified one against GetObject. s3:GetObjectTagging and s3:InitiateReplication were removed as unreachable: nothing in src/ calls GetObjectTagging, because object tags reach this Solution through the S3 Metadata journal via Athena rather than by reading tags off the object; and InitiateReplication belongs to the S3 Batch Replication job role, which is the stack-created role passed as create_job's RoleArn, not to this role, which only submits the job (s3-batch-replication-policies.html). (Requirement 12.1, 12.4; replication-completion-tracking 3.1)",
-      "Effect": "Allow",
-      "Action": [
-
-        "s3:GetObject",
-        "s3:GetObjectVersion"
-      ],
-      "Resource": [
-        "arn:aws:s3:::SOURCE_BUCKET_NAME/*"
       ]
     },
     {
