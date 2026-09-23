@@ -133,7 +133,7 @@ The practical consequence: deleting an object in a source bucket is not propagat
 
 ## Objects That Are Not Replicated
 
-S3 does not replicate objects in an archived storage class. They must be restored and copied to another storage class first. This is a property of S3 Replication, not of this Solution: see [What isn't replicated with replication configurations?](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-what-is-isnot-replicated.html).
+S3 does not replicate objects in an archived storage class. They must be [restored and copied to another storage class first](https://docs.aws.amazon.com/solutions/automated-restore-and-copy-for-amazon-s3-glacier-objects/). This is a property of S3 Replication, not of this Solution: see [What isn't replicated with replication configurations?](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-what-is-isnot-replicated.html).
 
 Tagging such an object matches a rule as normal, so the Solution handles the object rather than ignoring it.
 
