@@ -139,9 +139,10 @@ Tagging such an object matches a rule as normal, so the Solution handles the obj
 
 | Storage class or tier | Replicated | Behavior |
 |---|---|---|
+| `INTELLIGENT_TIERING`, object in the Frequent Access, Infrequent Access, or Archive Instant Access tier | Yes | Replicated normally. An object stays in these tiers unless the optional asynchronous archive tiers have been enabled on the bucket |
+| `INTELLIGENT_TIERING`, object in the Archive Access or Deep Archive Access tier | No | Submitted, then the task fails at S3 with `SrcObjectNotEligible`. The journal reports `INTELLIGENT_TIERING` for every tier, so the Solution cannot tell this object apart from the row above. An object reaches either tier only on a bucket with an Intelligent-Tiering archive configuration: see [How S3 Intelligent-Tiering works](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intelligent-tiering-overview.html) |
 | `GLACIER` (S3 Glacier Flexible Retrieval) | No | Excluded before the manifest is written. No Batch Operations task is submitted and nothing is billed for it |
 | `DEEP_ARCHIVE` (S3 Glacier Deep Archive) | No | Excluded before the manifest is written, as above |
-| S3 Intelligent-Tiering Archive Access or Deep Archive Access tier | No | Submitted, then the task fails at S3 with `SrcObjectNotEligible`. The journal reports the storage class as `INTELLIGENT_TIERING` whatever tier the object occupies, so the Solution cannot tell this object apart from a replicable one |
 | `GLACIER_IR` (S3 Glacier Instant Retrieval) | Yes | Replicated normally. Despite the name this is not an asynchronous class and needs no restore |
 | Every other storage class | Yes | Replicated normally |
 
