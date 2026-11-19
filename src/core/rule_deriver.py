@@ -9,6 +9,14 @@ a ``Disabled`` rule fails with ``SrcObjectNotEligible`` and moves no data, so
 submitting one is a billed failure that also feeds the consecutive-failure
 circuit breaker.
 
+A rule's exclusion filter (``Filter.Not`` or ``Filter.And.Not``) is carried on
+the derived rule as ``exclude_prefixes`` and ``exclude_tags``. Batch
+Replication honors exclusions: an excluded object fails with
+``SrcObjectNotEligible``, so the matcher must leave it out of the manifest for
+the same reason a ``Disabled`` rule is excluded. Any filter element this module
+does not evaluate raises :class:`UnsupportedFilterError` instead of being
+ignored.
+
 Results are naturally grouped by ``(source_bucket, replication_config_id)``
 via the fields on each returned ``DerivedReplicationRule`` — the
 ``replication_config_id`` equals the rule's own ``ID``, giving downstream
@@ -57,6 +65,12 @@ def derive_rules(
 
         Results preserve the ordering of rules in the configuration and are
         grouped implicitly by ``(source_bucket, replication_config_id)``.
+
+    Raises
+    ------
+    UnsupportedFilterError
+        An ``Enabled`` rule's filter carries an element this module does not
+        evaluate. ``Disabled`` rules are not inspected.
     """
     rules: list[dict] = _inner_config(replication_config).get("Rules", [])
 
@@ -68,6 +82,10 @@ def derive_rules(
             continue
 
         rule_id: str = rule.get("ID", "")
+        # Validates every filter element first, so an element this module
+        # cannot evaluate raises even on a rule that would otherwise look
+        # untagged: the unknown element might be what scopes it.
+        exclude_prefixes, exclude_tags = _extract_exclusions_for_rule(rule)
         tag_filter, key_prefix = _extract_tag_filter_and_prefix(rule)
 
         if not tag_filter:
@@ -85,6 +103,8 @@ def derive_rules(
                 tag_filter=tag_filter,
                 destination=DestinationRef(bucket_arn=destination_bucket_arn),
                 key_prefix=key_prefix,
+                exclude_prefixes=exclude_prefixes,
+                exclude_tags=exclude_tags,
             )
         )
 
@@ -140,15 +160,91 @@ def is_rule_enabled(rule: dict) -> bool:
     return status.strip().upper() == "ENABLED"
 
 
+class UnsupportedFilterError(ValueError):
+    """An enabled rule's ``Filter`` carries an element this module cannot evaluate.
+
+    Raised rather than ignoring the element, because an ignored filter element
+    changes which objects the Solution submits: an ignored exclusion puts
+    objects S3 will refuse into the manifest, and an ignored inclusion could
+    drop objects S3 would replicate. The caller skips the bucket for the
+    interval with its checkpoint unchanged, so nothing is lost while the
+    configuration or the Solution is updated.
+    """
+
+    def __init__(self, rule_id: str, element: str) -> None:
+        super().__init__(
+            f"Replication rule {rule_id!r} has a filter element this version"
+            f" of the Solution cannot evaluate: {element}."
+        )
+        self.rule_id = rule_id
+        self.element = element
+
+
+# Child elements this module evaluates at each level of a replication filter.
+# Anything else is reported through UnsupportedFilterError.
+_FILTER_KEYS = frozenset({"Prefix", "Tag", "And", "Not"})
+_AND_KEYS = frozenset({"Prefix", "Tags", "Tag", "Not"})
+_NOT_KEYS = frozenset({"Prefix", "Tag", "Or"})
+_OR_KEYS = frozenset({"Prefixes", "Tags"})
+
+
+def _check_keys(rule_id: str, block: dict, allowed: frozenset[str], path: str) -> None:
+    for key in block:
+        if key not in allowed:
+            raise UnsupportedFilterError(rule_id, f"{path}.{key}")
+
+
+def _extract_exclusions(
+    rule_id: str, not_block: dict, path: str
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Return ``(exclude_prefixes, exclude_tags)`` from a ``Not`` block.
+
+    ``Not`` holds one ``Prefix``, one ``Tag``, or an ``Or`` of ``Prefixes`` and
+    ``Tags``; an object matching any of them is excluded from the rule.
+    """
+    _check_keys(rule_id, not_block, _NOT_KEYS, path)
+    prefixes: list[str] = []
+    tags: list[tuple[str, str]] = []
+    if "Prefix" in not_block:
+        prefixes.append(not_block["Prefix"])
+    if "Tag" in not_block:
+        tags.append((not_block["Tag"]["Key"], not_block["Tag"]["Value"]))
+    if "Or" in not_block:
+        or_block: dict = not_block["Or"]
+        _check_keys(rule_id, or_block, _OR_KEYS, f"{path}.Or")
+        prefixes.extend(or_block.get("Prefixes", []))
+        tags.extend((t["Key"], t["Value"]) for t in or_block.get("Tags", []))
+    return tuple(sorted(set(prefixes))), tuple(sorted(set(tags)))
+
+
+def _extract_exclusions_for_rule(
+    rule: dict,
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Return the rule's exclusions, raising for any filter element not evaluated."""
+    rule_id: str = rule.get("ID", "")
+    filter_block: dict = rule.get("Filter", {})
+    _check_keys(rule_id, filter_block, _FILTER_KEYS, "Filter")
+    if "Not" in filter_block:
+        return _extract_exclusions(rule_id, filter_block["Not"], "Filter.Not")
+    if "And" in filter_block:
+        and_block: dict = filter_block["And"]
+        _check_keys(rule_id, and_block, _AND_KEYS, "Filter.And")
+        if "Not" in and_block:
+            return _extract_exclusions(rule_id, and_block["Not"], "Filter.And.Not")
+    return (), ()
+
+
 def _extract_tag_filter_and_prefix(rule: dict) -> tuple[dict[str, str], str | None]:
     """Extract tag key-value pairs and optional key prefix from a replication rule.
 
-    Handles the three S3 filter shapes:
+    Handles these S3 filter shapes:
 
     * ``Filter.Tag`` — a single ``{"Key": ..., "Value": ...}`` tag; no prefix.
     * ``Filter.And`` — AND of an optional ``Prefix`` and one or more tags in
-      ``Tags`` (list) or ``Tag`` (singular, handled defensively).
+      ``Tags`` (list) or ``Tag`` (singular, handled defensively), plus an
+      optional ``Not`` read by :func:`_extract_exclusions_for_rule`.
     * ``Filter.Prefix`` — prefix-only; no tags.
+    * ``Filter.Not`` — exclusions only; no tags.
     * No ``Filter`` key / legacy top-level ``Prefix`` — no tags.
 
     Returns

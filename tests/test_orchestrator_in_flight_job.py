@@ -278,8 +278,12 @@ class TestEveryRecordIsVisited:
         s3control = MagicMock()
         s3control.describe_job.side_effect = describe_job
 
+        # Submitted relative to the real clock, not _NOW: a record whose
+        # DescribeJob fails is aged against datetime.now() and dropped past
+        # _UNDESCRIBABLE_JOB_MAX_AGE, so a fixed date fails once it is old.
+        now = datetime.now(tz=timezone.utc)  # noqa: UP017
         records = {
-            job_id: _prior(job_id, submitted_at=_NOW - timedelta(hours=index + 1))
+            job_id: _prior(job_id, submitted_at=now - timedelta(hours=index + 1))
             for index, job_id in enumerate(statuses)
         }
 

@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.0] — 2026-11-19
+
+- The Solution honors S3 Replication exclusions. An object that a rule excludes
+  by prefix or tag is left out of that rule's Batch Operations manifest, so it
+  is not billed as a task that fails with `SrcObjectNotEligible`. This holds
+  whatever SDK version the Lambda runtime provides. See
+  [Configuration](README.md#configuration).
+- A bucket whose enabled replication rule has a filter element the Solution
+  cannot evaluate is skipped each run with its checkpoint unchanged, and an
+  `error` log entry names the rule and the element.
+- The log entry for a task that fails with `SrcObjectNotEligible` names a rule's
+  exclusion filter as a third possible cause.
+
 ## [1.2.0] — 2026-08-28
 
 > **Behavior change.** The Solution no longer submits objects that are matched

@@ -109,6 +109,12 @@ class DerivedReplicationRule:
     tag_filter: dict[str, str]         # non-empty set of required tag key-value pairs (3.2)
     destination: DestinationRef        # implied by config; never accessed independently (12.2)
     key_prefix: str | None = None   # optional (3.2)
+    # The rule's exclusion filter (``Not``). An object whose key starts with any
+    # of ``exclude_prefixes``, or that carries any of ``exclude_tags``, is not
+    # replicated by S3 under this rule even though it satisfies ``tag_filter``
+    # and ``key_prefix``. Empty when the rule has no exclusions.
+    exclude_prefixes: tuple[str, ...] = ()
+    exclude_tags: tuple[tuple[str, str], ...] = ()
 
 
 # ---------------------------------------------------------------------------

@@ -224,7 +224,10 @@ _PERMISSION_SHAPED_ERROR_CODES = frozenset({
 # replication rule whose ``Status`` is ``Disabled`` fails with the identical
 # code and message. ``derive_rules`` now excludes such a rule, so the
 # Solution no longer submits those objects, but a job submitted before that
-# change can still report this. Treating the code as an archival signal
+# change can still report this. A third cause, measured in November 2026: an
+# object excluded by the matching rule's ``Not`` filter (S3 Replication
+# exclusions) fails the same way; ``rule_matcher`` now leaves such objects out
+# of the manifest. Treating the code as an archival signal
 # therefore points an operator at the wrong thing.
 #
 # Two properties of the archived case are worth recording, because both are
@@ -336,7 +339,11 @@ def _log_report_task_errors(
                 "are unaffected. Another is an object matched only by a "
                 "replication rule whose Status is Disabled; the Solution no "
                 "longer derives such a rule, so a job submitted before that "
-                "change can still report this. Other ineligibility "
+                "change can still report this. Another is an object excluded "
+                "by the matching rule's exclusion filter (Not), which the "
+                "Solution leaves out of new manifests, so this too is "
+                "reported only by a job submitted before that change. "
+                "Other ineligibility "
                 "conditions produce the same code. See README.md, Objects "
                 "That Are Not Replicated."
             )

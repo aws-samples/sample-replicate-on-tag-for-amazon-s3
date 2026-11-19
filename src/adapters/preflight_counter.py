@@ -57,6 +57,7 @@ def build_rule_predicate(rules: list[DerivedReplicationRule]) -> str:
       is more direct than CAST+json_extract_scalar and handles keys with
       special characters (hyphens, spaces) without JSONPath quoting issues.
     - Optional prefix:        ``key LIKE 'prefix%'``
+    - Optional exclusions:    ``NOT (key LIKE 'p%' OR COALESCE(element_at(...) = 'v', FALSE))``
     - Rules are OR-ed together; each rule's conjuncts are AND-ed.
 
     The generated predicate is semantically equivalent to the in-memory
@@ -104,6 +105,22 @@ def build_rule_predicate(rules: list[DerivedReplicationRule]) -> str:
             # INVALID_FUNCTION_ARGUMENT: Escape string must be a single
             # character.
             conjuncts.append(f"key LIKE '{escaped_prefix}%' ESCAPE '\\'")
+
+        # Exclusions: NOT (any excluded prefix OR any excluded tag). Each
+        # tag term is wrapped in COALESCE because element_at returns NULL
+        # for an absent key, and NOT (NULL OR FALSE) is NULL, which would
+        # drop an object that carries none of the excluded tags.
+        exclusion_terms: list[str] = []
+        for excluded_prefix in rule.exclude_prefixes:
+            escaped = _escape_like_pattern(excluded_prefix)
+            exclusion_terms.append(f"key LIKE '{escaped}%' ESCAPE '\\'")
+        for tag_key, tag_value in rule.exclude_tags:
+            exclusion_terms.append(
+                f"COALESCE(element_at(object_tags, '{_escape_sql_string(tag_key)}')"
+                f" = '{_escape_sql_string(tag_value)}', FALSE)"
+            )
+        if exclusion_terms:
+            conjuncts.append("NOT (" + " OR ".join(exclusion_terms) + ")")
 
         if conjuncts:
             rule_clauses.append("(" + " AND ".join(conjuncts) + ")")

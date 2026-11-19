@@ -48,7 +48,9 @@ def match(
     * Designates a :class:`~src.core.models.MatchedObject` for a rule iff
       every tag key-value pair in the rule's ``tag_filter`` is present in
       ``op.resulting_tag_set`` **and** (the rule has no ``key_prefix`` **or**
-      ``op.object_key`` begins with that prefix) (Req 5.2, 5.3).
+      ``op.object_key`` begins with that prefix) (Req 5.2, 5.3) **and** the
+      object matches none of the rule's ``exclude_prefixes`` or
+      ``exclude_tags``.
     * When several rules match, designates the object for each (Req 5.5).
     * When no rule is satisfied, returns an empty set (Req 5.4).
     * When ``op.resulting_tag_set`` is indeterminate (``None`` or not a
@@ -147,6 +149,7 @@ def _rule_satisfies(
 
     Req 5.2: every required tag key-value pair must be present in *tag_set*.
     Req 5.3: when ``rule.key_prefix`` is set, *object_key* must begin with it.
+    The object must also match none of the rule's exclusions.
     """
     # Tag filter: every required key-value pair must appear in the resulting tag set.
     for key, value in rule.tag_filter.items():
@@ -155,6 +158,14 @@ def _rule_satisfies(
 
     # Prefix filter: when specified, the object key must start with it.
     if rule.key_prefix is not None and not object_key.startswith(rule.key_prefix):
+        return False
+
+    # Exclusions: S3 does not replicate an object under this rule when its key
+    # starts with an excluded prefix or it carries an excluded tag, and Batch
+    # Replication fails such an object with SrcObjectNotEligible.
+    if any(object_key.startswith(p) for p in rule.exclude_prefixes):
+        return False
+    if any(tag_set.get(k) == v for k, v in rule.exclude_tags):
         return False
 
     return True
