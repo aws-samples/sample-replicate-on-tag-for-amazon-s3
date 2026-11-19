@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.1] — 2026-11-19
+
+- Installing the package locally uses setuptools 84.1.0. The deployed Lambda
+  code is unchanged from 1.3.0.
+
 ## [1.3.0] — 2026-11-19
 
 - The Solution honors S3 Replication exclusions. An object that a rule excludes
